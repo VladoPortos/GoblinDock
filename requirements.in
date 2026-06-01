@@ -1,0 +1,16 @@
+# Direct dependencies (intent). The pinned lock is requirements.txt.
+# Regenerate the lock with hashes:  uv pip compile requirements.in -o requirements.txt --generate-hashes
+fastapi
+uvicorn[standard]
+sqlmodel
+proxmoxer
+requests
+argon2-cffi
+cryptography
+python-multipart
+itsdangerous
+PyYAML
+paramiko
+ansible-core
+ansible-runner
+APScheduler

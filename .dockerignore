@@ -1,0 +1,15 @@
+.git
+.venv
+venv
+data
+*.sqlite
+*.sqlite3
+*.db
+__pycache__
+**/__pycache__
+*.pyc
+.secrets
+.playwright-mcp
+docs/design/goblindock/project/screenshots
+node_modules
+*.log

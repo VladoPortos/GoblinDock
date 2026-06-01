@@ -1,0 +1,50 @@
+# GoblinDock — production-leaning default.
+#   1. echo "GOBLINDOCK_SECRET_KEY=$(python -c 'import secrets;print(secrets.token_hex(32))')" > .env
+#   2. docker compose up --build         # serves on 127.0.0.1:8080 — front it with TLS
+#
+# Add a Proxmox connection from the UI (it persists in ./data). For a quick local
+# dev box with an auto-seeded test connection + http cookies, layer the dev override:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+services:
+  goblindock:
+    build: .
+    image: goblindock:latest
+    container_name: goblindock
+    # Run non-root as the host user so the bind-mounted ./data and SSH key are
+    # accessible. Set GD_UID/GD_GID in .env to your `id -u` / `id -g`.
+    user: "${GD_UID:-1000}:${GD_GID:-1000}"
+    # Bind to loopback only — expose it through a TLS-terminating reverse proxy,
+    # never straight to the internet. Override the bind in the dev file for LAN use.
+    ports:
+      - "127.0.0.1:8080:8080"
+    environment:
+      # REQUIRED. No default — a weak/empty key fails fast (see app/config.py). It
+      # signs sessions AND derives the at-rest encryption key, so it MUST be stable.
+      GOBLINDOCK_SECRET_KEY: "${GOBLINDOCK_SECRET_KEY:?set a strong GOBLINDOCK_SECRET_KEY in .env}"
+      # If GoblinDock runs behind a reverse proxy, set this to the proxy's source IP/CIDR
+      # so X-Forwarded-For is trusted for throttling + audit (empty = use the socket peer).
+      GOBLINDOCK_FORWARDED_ALLOW_IPS: "${GOBLINDOCK_FORWARDED_ALLOW_IPS:-}"
+      # Guard rails / per-VM sizing caps (GoblinDock only ever acts inside this VMID window).
+      GOBLINDOCK_VMID_MIN: "8000"
+      GOBLINDOCK_VMID_MAX: "8099"
+      GOBLINDOCK_MAX_CORES: "1"
+      GOBLINDOCK_MAX_RAM_MB: "2048"
+    volumes:
+      # SQLite DB + cloud-image cache live here (host-visible, easy to back up).
+      - ./data:/data
+      # Optional: node SSH key for recipe baking + IP detection. Remove if absent.
+      - ${PVE_SSH_KEY:-${HOME}/.ssh/pve_key}:/run/secrets/pve_key:ro
+    # Container hardening — drop all caps, forbid privilege escalation. The app only
+    # needs outbound TCP (Proxmox API/SSH) and to write /data, neither needs caps.
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+    restart: unless-stopped
+
+# To mount the Proxmox API token as a file secret instead of an env var (so it is
+# NOT visible via `docker inspect`), uncomment below + set PROXMOX_TOKEN_FILE:
+#   secrets:
+#     pve_token:
+#       file: ./.secrets/pve_token
+#   then under the service:  secrets: [pve_token]  and env  PROXMOX_TOKEN_FILE: /run/secrets/pve_token
