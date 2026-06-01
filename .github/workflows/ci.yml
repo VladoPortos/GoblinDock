@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: compile · unit tests · JS syntax
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Install dependencies (hash-locked)
+        run: |
+          uv venv
+          uv pip install --require-hashes -r requirements.txt
+
+      - name: Byte-compile
+        run: .venv/bin/python -m py_compile app/*.py
+
+      - name: Unit tests (all waves)
+        env:
+          GOBLINDOCK_DEV: "1"
+        run: |
+          for t in tests/test_wave*.py; do
+            echo "== $t =="
+            .venv/bin/python "$t"
+          done
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: JS syntax check
+        run: |
+          for f in web/*.js; do node --check "$f"; done

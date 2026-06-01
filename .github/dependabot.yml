@@ -1,0 +1,27 @@
+version: 2
+updates:
+  # Python deps. requirements.txt is the hash-locked lock generated from
+  # requirements.in (uv pip compile … --generate-hashes); see CONTRIBUTING.md.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ["*"]
+
+  # Base image in the Dockerfile (pinned by digest).
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+
+  # GitHub Actions used by the workflows below.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

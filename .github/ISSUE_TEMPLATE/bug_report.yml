@@ -1,0 +1,49 @@
+name: Bug report
+description: Something isn't working as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to file a bug! Please do **not** include secrets,
+        Proxmox API tokens, or private IPs in logs you paste below.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: A clear description of the bug, and what you expected instead.
+      placeholder: Deploying a VM fails at the "Configure" step with …
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      placeholder: |
+        1. Add a Proxmox connection …
+        2. Bake a golden image with …
+        3. Deploy …
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: GoblinDock version / commit
+      placeholder: "v1.0.0 or git SHA"
+    validations:
+      required: false
+  - type: input
+    id: proxmox
+    attributes:
+      label: Proxmox VE version
+      placeholder: "8.2"
+    validations:
+      required: false
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Container logs or the in-app job log. Redact secrets/IPs.
+      render: shell
+    validations:
+      required: false

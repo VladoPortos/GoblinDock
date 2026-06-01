@@ -6,6 +6,18 @@
 
 **A self-hosted, multi-user control panel for Proxmox VE.**
 
+[![CI](https://github.com/VladoPortos/GoblinDock/actions/workflows/ci.yml/badge.svg)](https://github.com/VladoPortos/GoblinDock/actions/workflows/ci.yml)
+[![CodeQL](https://github.com/VladoPortos/GoblinDock/actions/workflows/codeql.yml/badge.svg)](https://github.com/VladoPortos/GoblinDock/actions/workflows/codeql.yml)
+[![Trivy](https://github.com/VladoPortos/GoblinDock/actions/workflows/trivy.yml/badge.svg)](https://github.com/VladoPortos/GoblinDock/actions/workflows/trivy.yml)
+[![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/VladoPortos/GoblinDock/badge)](https://scorecard.dev/viewer/?uri=github.com/VladoPortos/GoblinDock)
+[![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
+[![Website](https://img.shields.io/badge/web-goblindock.com-6E56CF)](https://goblindock.com)
+
+<!-- OpenSSF Best Practices: register the project at https://www.bestpractices.dev/ then add:
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<ID>/badge)](https://www.bestpractices.dev/projects/<ID>) -->
+
+**[goblindock.com](https://goblindock.com)**
+
 Build golden images from Lego-style blocks, deploy fully-configured VMs in a click,
 and manage them — live metrics, deployment log, and a real **graphical console** —
 all from a single container backed by one SQLite file.
