@@ -1,6 +1,6 @@
 # GoblinDock — single-container Proxmox control panel (FastAPI + worker + SPA).
 # Base pinned by digest for reproducibility (python:3.12-slim at build time).
-FROM python:3.12-slim@sha256:804ddf3251a60bbf9c92e73b7566c40428d54d0e79d3428194edf40da6521286 AS base
+FROM python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dcf1ecbdfdfe203 AS base
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
