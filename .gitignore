@@ -13,12 +13,6 @@ __pycache__/
 .venv/
 venv/
 
-# node / svelte
-node_modules/
-.svelte-kit/
-build/
-dist/
-
 # data / runtime
 *.sqlite
 *.sqlite3

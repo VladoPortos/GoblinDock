@@ -12,11 +12,12 @@
 [![OpenSSF Scorecard](https://api.scorecard.dev/projects/github.com/VladoPortos/GoblinDock/badge)](https://scorecard.dev/viewer/?uri=github.com/VladoPortos/GoblinDock)
 [![License: Apache 2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](LICENSE)
 [![Website](https://img.shields.io/badge/web-goblindock.com-6E56CF)](https://goblindock.com)
+[![GHCR image](https://img.shields.io/badge/ghcr.io-goblindock-2496ED?logo=docker&logoColor=white)](https://github.com/VladoPortos/GoblinDock/pkgs/container/goblindock)
 
 <!-- OpenSSF Best Practices: register the project at https://www.bestpractices.dev/ then add:
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<ID>/badge)](https://www.bestpractices.dev/projects/<ID>) -->
 
-**[goblindock.com](https://goblindock.com)**
+**[goblindock.com](https://goblindock.com)** · `docker pull ghcr.io/vladoportos/goblindock:main`
 
 Build golden images from Lego-style blocks, deploy fully-configured VMs in a click,
 and manage them — live metrics, deployment log, and a real **graphical console** —
@@ -210,7 +211,7 @@ One Docker container, no external services:
   editor), xterm.js + noVNC (consoles) — all served from `web/`, SRI-pinned.
 
 ```
-backend:  app/{main,api,worker,proxmox,recipes,serialize,models,db,security,session,seed,config,deps}.py
+backend:  app/*.py + app/routers/   (FastAPI app · threaded job worker · APScheduler · Proxmox client · recipe compiler · SQLite models)
 frontend: web/{index.html,styles.css,*.js, vendor/}
 ```
 
