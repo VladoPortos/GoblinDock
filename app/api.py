@@ -1310,7 +1310,12 @@ def test_connection(conn_id: int, user: User = Depends(require_admin), session: 
         return {"ok": True, "status": "online", "version": v.get("version", "—"),
                 "nodes": [n["node"] for n in ns if n.get("status") == "online"]}
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "status": "offline", "error": str(e)}
+        # Don't echo the raw exception back (it can carry internal/connection detail) —
+        # log it server-side and return a generic, actionable message to the admin UI.
+        import logging
+        logging.getLogger("goblindock").warning("connection test failed for %s: %s", c.name, e)
+        return {"ok": False, "status": "offline",
+                "error": "could not reach the Proxmox API — check the host, port, token and TLS settings"}
 
 
 # --------------------------------------------------------------------------- #
