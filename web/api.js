@@ -83,6 +83,8 @@ window.API = (function () {
     profile: () => req('GET', '/api/profile'),
     updateProfile: (p) => req('PUT', '/api/profile', p),
     changePassword: (current, neu) => req('POST', '/api/profile/password', { current, new: neu }),
+    generateWidgetKey: () => req('POST', '/api/profile/widget-key'),
+    revokeWidgetKey: () => req('DELETE', '/api/profile/widget-key'),
 
     // deployments
     deploy: (p) => req('POST', '/api/deployments', p),

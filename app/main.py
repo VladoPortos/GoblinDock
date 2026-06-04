@@ -42,7 +42,7 @@ async def lifespan(app: FastAPI):
     stop_worker(join_timeout=30)
 
 
-app = FastAPI(title="GoblinDock", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="GoblinDock", version="1.1.0", lifespan=lifespan)
 
 
 async def csrf_and_security_headers(request: Request, call_next):
