@@ -481,4 +481,9 @@ def me_dict(u: User) -> dict:
     return {"id": u.id, "name": u.name, "email": u.email,
             "role": "Admin" if u.role == "admin" else "User", "initials": initials,
             "isAdmin": u.role == "admin",
-            "createdAt": _rel(u.created_at), "lastLogin": _rel(u.last_login)}
+            "createdAt": _rel(u.created_at), "lastLogin": _rel(u.last_login),
+            # Non-secret status of the Homepage widget key — never the hash/token.
+            "widgetKey": {"present": bool(u.widget_key_hash),
+                          "prefix": u.widget_key_prefix or "",
+                          "createdAt": _rel(u.widget_key_created_at),
+                          "lastUsed": _rel(u.widget_key_last_used)}}

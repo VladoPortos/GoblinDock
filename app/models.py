@@ -32,6 +32,13 @@ class User(SQLModel, table=True):
     # per-account lockout (survives restart, unlike the in-memory IP throttle).
     failed_logins: int = 0
     locked_until: Optional[datetime] = None
+    # Homepage widget API key — only the sha256 hash is stored; the plaintext is
+    # shown to the user exactly once at generation. NULL hash = no key. The prefix
+    # is a non-secret display tag (e.g. gdwk_AbCd). See app/deps.widget_key_user.
+    widget_key_hash: Optional[str] = Field(default=None, index=True)
+    widget_key_prefix: str = ""
+    widget_key_created_at: Optional[datetime] = None
+    widget_key_last_used: Optional[datetime] = None
 
 
 class Connection(SQLModel, table=True):

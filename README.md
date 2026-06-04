@@ -305,6 +305,42 @@ end). Among the guarantees it now makes:
 
 ---
 
+## Homepage widget
+
+GoblinDock exposes a small, read-only JSON endpoint for a
+[Homepage](https://gethomepage.dev) dashboard tile — counts of your VMs, active jobs and
+golden images, and nothing else. It needs **no plugin and no PR to Homepage**: the
+built-in `customapi` widget does it all from `services.yaml`.
+
+1. In GoblinDock, open **Profile → Homepage widget → Generate key** and copy the key — it
+   is shown **once** and stored only as a hash.
+2. Add it to Homepage's `services.yaml` (Homepage fetches the endpoint server-side, so the
+   key never reaches a browser):
+
+```yaml
+- GoblinDock:
+    href: https://goblindock.example.com
+    widget:
+      type: customapi
+      url: https://goblindock.example.com/api/widget/summary
+      refreshInterval: 15000
+      headers:
+        X-API-Key: "{{HOMEPAGE_VAR_GOBLINDOCK_KEY}}"
+      mappings:
+        - { field: vms_running,   label: Running, format: number }
+        - { field: vms_total,     label: VMs,     format: number }
+        - { field: jobs_active,   label: Jobs,    format: number }
+        - { field: golden_images, label: Goldens, format: number }
+```
+
+The key is **per-user and read-only** — it authenticates only `GET /api/widget/summary`
+(scoped to its owner: a User sees their own counts, an Admin sees all) and can never
+deploy, read, or change anything. **Regenerate** rotates it (the old key dies immediately)
+and **Revoke** disables it, both from the Profile page. Available fields: `vms_total`,
+`vms_running`, `vms_stopped`, `vms_working`, `vms_error`, `jobs_active`, `golden_images`.
+
+---
+
 ## Tech stack
 
 FastAPI · Uvicorn · SQLModel/SQLite (WAL) · proxmoxer · ansible-core + ansible-runner ·

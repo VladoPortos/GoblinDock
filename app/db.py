@@ -69,6 +69,10 @@ def _migrate() -> None:
             ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
             ("failed_logins", "INTEGER NOT NULL DEFAULT 0"),
             ("locked_until", "TIMESTAMP"),
+            ("widget_key_hash", "TEXT"),
+            ("widget_key_prefix", "TEXT NOT NULL DEFAULT ''"),
+            ("widget_key_created_at", "TIMESTAMP"),
+            ("widget_key_last_used", "TIMESTAMP"),
         ],
     }
     import logging
@@ -92,6 +96,12 @@ def _migrate() -> None:
                 if col.name not in existing and col.name not in covered:
                     log.warning("DB drift: model column %s.%s is missing from the table — "
                                 "add it to _migrate() in app/db.py", tname, col.name)
+        # Match the model's index=True on widget_key_hash for DBs upgraded via the
+        # ALTER path above (create_all only builds indexes for brand-new tables).
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_users_widget_key_hash "
+            "ON users(widget_key_hash)"
+        )
         # Backstop the static-IP allocator against a duplicate (network_id, ip) — a
         # second concurrent reservation of the same address fails at the DB rather than
         # silently double-booking. (Best-effort: skip if legacy rows already collide.)

@@ -27,3 +27,7 @@ data/
 *.png
 !web/assets/*.png
 !docs/**/*.png
+
+# LLM planning / spec / plan docs — local only, NEVER pushed (remote = finished code)
+docs/superpowers/
+.planning/
