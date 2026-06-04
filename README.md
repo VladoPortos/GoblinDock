@@ -17,7 +17,7 @@
 <!-- OpenSSF Best Practices: register the project at https://www.bestpractices.dev/ then add:
 [![OpenSSF Best Practices](https://www.bestpractices.dev/projects/<ID>/badge)](https://www.bestpractices.dev/projects/<ID>) -->
 
-**[goblindock.com](https://goblindock.com)** · `docker pull ghcr.io/vladoportos/goblindock:main`
+**[goblindock.com](https://goblindock.com)** · `docker pull ghcr.io/vladoportos/goblindock:latest`
 
 Build golden images from Lego-style blocks, deploy fully-configured VMs in a click,
 and manage them — live metrics, deployment log, and a real **graphical console** —
@@ -63,16 +63,21 @@ python3 -c "import secrets; print('GOBLINDOCK_SECRET_KEY='+secrets.token_hex(32)
 # 2. Proxmox API token in a gitignored env file:
 #    .secrets/proxmox-test.env  ->  PROXMOX_TOKEN_ID, PROXMOX_TOKEN
 
-# 3a. PRODUCTION default — binds 127.0.0.1, Secure cookies, no auto-seed.
-#     Front it with a TLS-terminating reverse proxy; add the Proxmox connection in the UI.
-docker compose up --build -d
+# 3a. PRODUCTION default — pulls the prebuilt image from GHCR, binds 127.0.0.1,
+#     Secure cookies, no auto-seed. Front it with a TLS-terminating reverse proxy;
+#     add the Proxmox connection in the UI. (Add `--build` to build from source instead.)
+docker compose up -d
 
 # 3b. LOCAL DEV — layer the dev override for http cookies + an auto-seeded test
 #     connection from .secrets/proxmox-test.env (publishes on all interfaces):
-docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build -d
+docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 
 open http://localhost:8080
 ```
+
+> The image is published at **`ghcr.io/vladoportos/goblindock`** — multi-arch
+> (amd64 · arm64). Tags: `latest` (newest release), `main` (rolling, from the default
+> branch), and semver (`1.0.0`, `1.0`). The compose files pull `:latest` by default.
 
 The first load shows **"Create the first admin account"**. With the dev override the
 Proxmox connection is auto-seeded from `PROXMOX_*` (`GOBLINDOCK_SEED_PROXMOX=true`); in

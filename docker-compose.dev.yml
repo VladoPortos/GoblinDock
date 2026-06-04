@@ -1,5 +1,7 @@
 # Dev override — layer ON TOP of docker-compose.yml for a local box:
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# (this inherits the base image ghcr.io/vladoportos/goblindock:latest; add `--build`
+#  to build from this source tree instead of pulling).
 #
 # Re-enables the conveniences that are intentionally OFF in the production default:
 #   • GOBLINDOCK_DEV=1   → allows an ephemeral key + non-Secure cookies (http://localhost)

@@ -1,14 +1,19 @@
 # GoblinDock — production-leaning default.
 #   1. echo "GOBLINDOCK_SECRET_KEY=$(python -c 'import secrets;print(secrets.token_hex(32))')" > .env
-#   2. docker compose up --build         # serves on 127.0.0.1:8080 — front it with TLS
+#   2. docker compose up -d              # pulls the prebuilt image, serves on 127.0.0.1:8080 — front it with TLS
+#
+# The published multi-arch image lives at ghcr.io/vladoportos/goblindock
+# (tags: latest, the rolling `main`, and semver e.g. 1.0.0 / 1.0). `docker compose up -d`
+# pulls it; add `--build` only if you want to build from this source tree instead.
 #
 # Add a Proxmox connection from the UI (it persists in ./data). For a quick local
 # dev box with an auto-seeded test connection + http cookies, layer the dev override:
-#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up --build
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
 services:
   goblindock:
+    # Pulled from GHCR by default; `docker compose build`/`up --build` rebuilds it locally.
+    image: ghcr.io/vladoportos/goblindock:latest
     build: .
-    image: goblindock:latest
     container_name: goblindock
     # Run non-root as the host user so the bind-mounted ./data and SSH key are
     # accessible. Set GD_UID/GD_GID in .env to your `id -u` / `id -g`.
