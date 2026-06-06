@@ -9,8 +9,8 @@ from __future__ import annotations
 
 import io
 import os
+import re
 import time
-from dataclasses import dataclass
 from typing import Any, Callable, Optional
 
 from proxmoxer import ProxmoxAPI
@@ -23,13 +23,6 @@ from .security import decrypt
 
 class ProxmoxError(RuntimeError):
     pass
-
-
-@dataclass
-class TaskResult:
-    upid: str
-    ok: bool
-    exitstatus: str
 
 
 def _split_token(token_id: str) -> tuple[str, str]:
@@ -114,7 +107,8 @@ class Proxmox:
         timeout: float = 900,
         on_poll: Optional[Callable[[dict], None]] = None,
         cancelled: Optional[Callable[[], bool]] = None,
-    ) -> TaskResult:
+    ) -> None:
+        """Block until the task finishes OK; raise ProxmoxError on failure/timeout/cancel."""
         node = node or self.pick_node()
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -136,7 +130,7 @@ class Proxmox:
                     # job's _execute() try/except marks it failed. Best-effort callers
                     # (download, pre-rebuild cleanup) already wrap this in try/except.
                     raise ProxmoxError(f"task {upid} failed: {exit_status or 'unknown error'}")
-                return TaskResult(upid=upid, ok=True, exitstatus=exit_status)
+                return
             time.sleep(1.5)
         raise ProxmoxError(f"task {upid} timed out")
 
@@ -292,14 +286,6 @@ class Proxmox:
         return ""
 
     # ---- detail view + console ----------------------------------------
-    def vm_rrddata(self, vmid: int, node: Optional[str] = None, timeframe: str = "hour") -> list[dict]:
-        """Time-series (cpu/mem/disk/net) for sparklines. Empty on any error."""
-        guard_vmid(vmid)
-        try:
-            return self.api.nodes(node or self.pick_node()).qemu(vmid).rrddata.get(timeframe=timeframe) or []
-        except ResourceException:
-            return []
-
     def agent_osinfo(self, vmid: int, node: Optional[str] = None) -> dict:
         guard_vmid(vmid)
         try:
@@ -348,16 +334,47 @@ class Proxmox:
                 f"/vncwebsocket?port={port}&vncticket={quote(str(ticket))}")
 
 
+def _load_ssh_key(path: str):
+    """Try the supported private-key types in turn; None if none load."""
+    import paramiko
+
+    for loader in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
+        try:
+            return loader.from_private_key_file(path)
+        except Exception:  # noqa: BLE001
+            continue
+    return None
+
+
+def _ssh_client(conn: Connection, key, timeout: int):
+    """Connected paramiko SSHClient for the node — shared by snippet write/delete.
+    Honours any known_hosts we have so a pinned node can't be MITM'd. Strict
+    mode rejects unknown hosts; the homelab default trusts-on-first-use."""
+    import paramiko
+
+    client = paramiko.SSHClient()
+    try:
+        client.load_system_host_keys()
+    except Exception:  # noqa: BLE001
+        pass
+    if settings.ssh_known_hosts and os.path.exists(settings.ssh_known_hosts):
+        try:
+            client.load_host_keys(settings.ssh_known_hosts)
+        except Exception:  # noqa: BLE001
+            pass
+    client.set_missing_host_key_policy(
+        paramiko.RejectPolicy() if settings.ssh_strict else paramiko.AutoAddPolicy()
+    )
+    client.connect(conn.ssh_host or conn.host, username=conn.ssh_user or "root", pkey=key, timeout=timeout)
+    return client
+
+
 def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str:
     """Drop a cloud-init snippet onto the node's snippet storage via SSH/SFTP.
 
     Returns the cicustom volume id (e.g. 'local:snippets/gd-8000.yml'). Requires
     conn.ssh_key_path to point at a usable private key inside the container.
     """
-    import re
-
-    import paramiko
-
     if not conn.ssh_key_path:
         raise ProxmoxError("no SSH key configured for snippet baking")
 
@@ -372,32 +389,11 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
     base = "/var/lib/vz/snippets" if store == "local" else f"/mnt/pve/{store}/snippets"
     remote = f"{base}/{filename}"
 
-    key = None
-    for loader in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
-        try:
-            key = loader.from_private_key_file(conn.ssh_key_path)
-            break
-        except Exception:  # noqa: BLE001
-            continue
+    key = _load_ssh_key(conn.ssh_key_path)
     if key is None:
         raise ProxmoxError(f"could not load SSH key {conn.ssh_key_path}")
 
-    client = paramiko.SSHClient()
-    # Honour any known_hosts we have so a pinned node can't be MITM'd. Strict
-    # mode rejects unknown hosts; the homelab default trusts-on-first-use.
-    try:
-        client.load_system_host_keys()
-    except Exception:  # noqa: BLE001
-        pass
-    if settings.ssh_known_hosts and os.path.exists(settings.ssh_known_hosts):
-        try:
-            client.load_host_keys(settings.ssh_known_hosts)
-        except Exception:  # noqa: BLE001
-            pass
-    client.set_missing_host_key_policy(
-        paramiko.RejectPolicy() if settings.ssh_strict else paramiko.AutoAddPolicy()
-    )
-    client.connect(conn.ssh_host or conn.host, username=conn.ssh_user or "root", pkey=key, timeout=20)
+    client = _ssh_client(conn, key, timeout=20)
     try:
         # Pure SFTP — no shell exec, so nothing user-influenced reaches a shell.
         sftp = client.open_sftp()
@@ -418,40 +414,20 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
 
 def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:
     """Best-effort removal of a cloud-init snippet from the node (cleanup)."""
-    import re
-
-    import paramiko
-
     if not conn.ssh_key_path or not re.fullmatch(r"[A-Za-z0-9_.-]+", filename or ""):
         return
     store = conn.snippet_storage or "local"
     if not re.fullmatch(r"[A-Za-z0-9_.-]+", store):
         return
     base = "/var/lib/vz/snippets" if store == "local" else f"/mnt/pve/{store}/snippets"
-    key = None
-    for loader in (paramiko.Ed25519Key, paramiko.RSAKey, paramiko.ECDSAKey):
-        try:
-            key = loader.from_private_key_file(conn.ssh_key_path)
-            break
-        except Exception:  # noqa: BLE001
-            continue
+    key = _load_ssh_key(conn.ssh_key_path)
     if key is None:
         return
-    client = paramiko.SSHClient()
     try:
-        client.load_system_host_keys()
+        client = _ssh_client(conn, key, timeout=15)
     except Exception:  # noqa: BLE001
-        pass
-    if settings.ssh_known_hosts and os.path.exists(settings.ssh_known_hosts):
-        try:
-            client.load_host_keys(settings.ssh_known_hosts)
-        except Exception:  # noqa: BLE001
-            pass
-    client.set_missing_host_key_policy(
-        paramiko.RejectPolicy() if settings.ssh_strict else paramiko.AutoAddPolicy()
-    )
+        return
     try:
-        client.connect(conn.ssh_host or conn.host, username=conn.ssh_user or "root", pkey=key, timeout=15)
         sftp = client.open_sftp()
         try:
             sftp.remove(f"{base}/{filename}")

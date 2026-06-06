@@ -63,6 +63,9 @@ def run_playbook(
             project_dir=proj,
             playbook="play.yml",
             inventory=inventory,
+            # Hard wall-clock cap on the whole run (status becomes 'timeout') — without
+            # it a hung SSH/ansible session would block the single worker thread forever.
+            timeout=timeout,
             envvars={
                 "HOME": home,
                 "ANSIBLE_LOCAL_TEMP": local_tmp,

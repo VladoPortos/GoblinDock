@@ -3,7 +3,7 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { OSGlyph, Menu, ConfirmModal, Field } = window.UI;
+  const { Menu, ConfirmModal, Field } = window.UI;
   const h = React.createElement;
 
   /* ============ PROFILE ============ */

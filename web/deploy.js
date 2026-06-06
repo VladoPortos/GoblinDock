@@ -82,7 +82,7 @@
         const r = await window.API.deploy({
           goldenImageId: gold.imgId, recipeId: recipeId || null,
           networkId: netObj.netId || null, name: name.trim(), cpu, ram: mem, disk,
-          networkMode: (netObj.rawMode || 'dhcp'), tags,
+          tags,
         });
         go('job', { jobId: r.jobId });
       } catch (e) { window.GDStore.toast(e.message || 'deploy failed', 'err'); setBusy(false); busyRef.current = false; }

@@ -160,7 +160,7 @@
         h('div', { className: 'meter' + (statusBadge === 'error' ? ' err' : statusBadge === 'done' ? ' ok' : ''), style: { height: 9 } },
           h('i', { style: { width: pct + '%', background: statusBadge === 'working' ? 'linear-gradient(90deg, var(--accent-lo), var(--accent-hi))' : undefined } })),
         h('div', { className: 'phase-row' },
-          (job.phases || []).map((p, i) => h('div', { key: i, className: 'phase' + (i < pIdx ? ' done' : i === pIdx && live ? ' active' : i < pIdx ? ' done' : '') },
+          (job.phases || []).map((p, i) => h('div', { key: i, className: 'phase' + (i < pIdx ? ' done' : i === pIdx && live ? ' active' : '') },
             h('span', { className: 'dot ' + (i < pIdx ? 'running' : i === pIdx ? (live ? 'working' : 'running') : 'stopped') }), p)))),
 
       h('div', { className: 'row', style: { marginBottom: 14, gap: 10 } },

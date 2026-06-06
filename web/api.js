@@ -80,7 +80,6 @@ window.API = (function () {
     state: () => req('GET', '/api/state'),
 
     // profile
-    profile: () => req('GET', '/api/profile'),
     updateProfile: (p) => req('PUT', '/api/profile', p),
     changePassword: (current, neu) => req('POST', '/api/profile/password', { current, new: neu }),
 

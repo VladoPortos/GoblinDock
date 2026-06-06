@@ -3,7 +3,7 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { Menu, Modal, ConfirmModal, FormModal, Field, TextArea, SelectField, Toggle } = window.UI;
+  const { Menu, ConfirmModal, FormModal, Field, TextArea, SelectField, Toggle } = window.UI;
   const h = React.createElement;
 
   const refresh = () => window.GDStore.refresh().catch(() => {});

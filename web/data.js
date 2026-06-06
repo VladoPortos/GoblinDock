@@ -21,7 +21,6 @@
     GOLDEN_IMAGES: [],
     RECIPES: [],
     PALETTE: [],
-    BLOCK_CATS: [],
     SECRETS: [],
     VARIABLES: [],
     CONNECTIONS: [],

@@ -42,7 +42,7 @@
             React.createElement('button', { className: 'icon-btn', title: 'Delete view', onClick: () => onDelete(v.name) }, React.createElement(Icon, { name: 'trash', size: 14 })))))));
   }
 
-  function ActionCluster({ vm, go, onAct }) {
+  function ActionCluster({ vm, onAct }) {
     const running = vm.status === 'running';
     return React.createElement('div', { className: 'row', style: { gap: 2, justifyContent: 'flex-end' } },
       running
@@ -112,7 +112,7 @@
                   React.createElement('div', { style: { width: 50 } }, React.createElement(Meter, { value: vm.ram })),
                   React.createElement('span', { className: 'mono hint', style: { fontSize: 11, minWidth: 28 } }, vm.ram, '%'))),
               React.createElement('td', { className: 'mono hint', style: { fontSize: 12 } }, vm.uptime),
-              React.createElement('td', null, React.createElement(ActionCluster, { vm, go, onAct }))
+              React.createElement('td', null, React.createElement(ActionCluster, { vm, onAct }))
             )))
         )
       )
@@ -145,7 +145,7 @@
         React.createElement('div', { className: 'divider' }),
         React.createElement('div', { className: 'row' },
           React.createElement('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
-          React.createElement('div', { style: { marginLeft: 'auto' } }, React.createElement(ActionCluster, { vm, go, onAct }))
+          React.createElement('div', { style: { marginLeft: 'auto' } }, React.createElement(ActionCluster, { vm, onAct }))
         )
       ))
     );

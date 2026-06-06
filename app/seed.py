@@ -539,7 +539,6 @@ def seed_blocks() -> None:
                     cur.input_schema_json = json.dumps(spec.get("input_schema", []))
                     cur.ansible_template = spec.get("ansible", "")
                     cur.cloudinit_template = spec.get("cloudinit", "")
-                    cur.editable = False   # built-ins are not editable via the API
                     s.add(cur)
                 continue
             s.add(Block(
@@ -551,9 +550,6 @@ def seed_blocks() -> None:
                 cloudinit_template=spec.get("cloudinit", ""),
                 builtin=spec.get("builtin", True),
                 kind="builtin" if spec.get("builtin", True) else "custom",
-                # built-ins can't be edited via the API (edit_block 403s them), so the
-                # flag must reflect that; only custom/forked blocks are editable.
-                editable=not spec.get("builtin", True),
             ))
 
 

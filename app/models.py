@@ -100,7 +100,6 @@ class Block(SQLModel, table=True):
     cloudinit_template: str = ""             # shell lines — used when phase=cloudinit
     owner_id: Optional[int] = None
     builtin: bool = True
-    editable: bool = True
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -122,7 +121,6 @@ class Image(SQLModel, table=True):
     build_status: str = "none"  # none | building | ready | failed | importing
     progress: int = 0
     size: str = ""
-    audit_log_json: str = "[]"
     created_by: Optional[int] = None
     created_at: datetime = Field(default_factory=utcnow)
     built_at: Optional[datetime] = None
@@ -166,13 +164,12 @@ class Deployment(SQLModel, table=True):
     notes: str = ""
     error: str = ""
     created_at: datetime = Field(default_factory=utcnow)
-    last_action: Optional[datetime] = None
 
 
 class Job(SQLModel, table=True):
     __tablename__ = "jobs"
     id: Optional[int] = Field(default=None, primary_key=True)
-    type: str = "deploy"   # deploy | image_build | rebuild | destroy | action
+    type: str = "deploy"   # deploy | image_build | rebuild | destroy
     title: str = ""
     deployment_id: Optional[int] = None
     image_id: Optional[int] = None
@@ -180,7 +177,6 @@ class Job(SQLModel, table=True):
     status: str = "queued"  # queued | running | succeeded | failed | canceled
     pct: int = 0
     phase: str = ""
-    total_phases: int = 4
     created_by: Optional[int] = None
     cancel_requested: bool = False
     error: str = ""
@@ -236,7 +232,7 @@ class IpAllocation(SQLModel, table=True):
     network_id: int = Field(index=True)
     ip: str = Field(index=True)
     deployment_id: Optional[int] = None
-    state: str = "reserved"     # reserved | free
+    state: str = "reserved"     # always "reserved" — a freed allocation row is deleted
     created_at: datetime = Field(default_factory=utcnow)
 
 

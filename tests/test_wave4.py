@@ -43,21 +43,18 @@ def test_network_redaction():
 
 
 def test_image_state_mapping():
+    # Base images are always created build_status="ready" (add_base_image + the seed
+    # catalog), so base_image_dict no longer serializes a state — only goldens have one.
     with session_scope() as s:
         for st in ("building", "importing", "ready", "failed", "none"):
             s.add(Image(kind="golden", name=f"g-{st}", build_status=st))
-            s.add(Image(kind="base", name=f"b-{st}", build_status=st))
     from sqlmodel import select
     with session_scope() as s:
         gmap = {i.name: S.golden_image_dict(s, i)["state"]
                 for i in s.exec(select(Image).where(Image.kind == "golden")).all()}
-        bmap = {i.name: S.base_image_dict(i)["state"]
-                for i in s.exec(select(Image).where(Image.kind == "base")).all()}
+        assert "state" not in S.base_image_dict(Image(kind="base", name="b", build_status="ready"))
     assert gmap == {"g-building": "building", "g-importing": "building", "g-ready": "ready",
                     "g-failed": "failed", "g-none": "none"}, gmap
-    # the bug fix: a failed base shows 'failed', not perpetual 'importing'
-    assert bmap["b-failed"] == "failed", bmap
-    assert bmap["b-ready"] == "ready" and bmap["b-none"] == "importing", bmap
     print("test_image_state_mapping OK")
 
 

@@ -10,6 +10,7 @@ from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.middleware.base import BaseHTTPMiddleware
 
+from . import __version__
 from .api import router as api_router
 from .config import settings
 from .db import init_db
@@ -42,7 +43,7 @@ async def lifespan(app: FastAPI):
     stop_worker(join_timeout=30)
 
 
-app = FastAPI(title="GoblinDock", version="1.0.0", lifespan=lifespan)
+app = FastAPI(title="GoblinDock", version=__version__, lifespan=lifespan)
 
 
 async def csrf_and_security_headers(request: Request, call_next):

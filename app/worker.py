@@ -45,7 +45,6 @@ from .recipes import (
     compile_cloudinit,
     has_ansible_blocks,
     load_recipe,
-    recipe_block_chips,
 )
 from .security import decrypt, encrypt
 
@@ -80,13 +79,12 @@ class JobCtx:
             job = s.get(Job, self.job_id)
             return bool(job and job.cancel_requested)
 
-    def progress(self, pct: int, phase: str, total_phases: int = 4) -> None:
+    def progress(self, pct: int, phase: str) -> None:
         with session_scope() as s:
             job = s.get(Job, self.job_id)
             if job:
                 job.pct = max(0, min(100, pct))
                 job.phase = phase
-                job.total_phases = total_phases
                 s.add(job)
         self._tick()
 
@@ -375,14 +373,14 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
     if not src_vmid:
         raise RuntimeError("template has no built image to clone from")
 
-    ctx.progress(2, f"Phase {_ph(1)} of {phase_total} · Allocate", phase_total)
+    ctx.progress(2, f"Phase {_ph(1)} of {phase_total} · Allocate")
     st = ctx.add_step(f"Acquire lock on {conn.name}")
     t = ctx.start_step(st)
     new_vmid = dep.vmid or px.next_free_vmid(settings.vmid_min, settings.vmid_max, node)
     ctx.log(f"[{_ts()}] goblindock: allocated VMID {new_vmid} on {node}", "l-dim")
     ctx.finish_step(st, t)
 
-    ctx.progress(12, f"Phase {_ph(2)} of {phase_total} · Clone", phase_total)
+    ctx.progress(12, f"Phase {_ph(2)} of {phase_total} · Clone")
     st = ctx.add_step(f"Clone from template (vmid {src_vmid}) → {dep.name}")
     t = ctx.start_step(st)
     ctx.log(f"[{_ts()}] clone: {src_vmid} → {new_vmid} ({dep.name})", "l-acc")
@@ -396,7 +394,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         d.node = node
         s.add(d)
 
-    ctx.progress(40, f"Phase {_ph(3)} of {phase_total} · Configure", phase_total)
+    ctx.progress(40, f"Phase {_ph(3)} of {phase_total} · Configure")
     st = ctx.add_step("Apply cloud-init (name, SSH key, network, size)")
     t = ctx.start_step(st)
     # Clamp to the TARGET connection's per-VM ceilings (0 = inherit the global default),
@@ -470,13 +468,13 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         ctx.log(f"[{_ts()}] resize skipped: {e}", "l-warn")
     ctx.finish_step(st, t)
 
-    ctx.progress(60, f"Phase {_ph(4)} of {phase_total} · Boot", phase_total)
+    ctx.progress(60, f"Phase {_ph(4)} of {phase_total} · Boot")
     st = ctx.add_step("Start VM & wait for guest agent")
     t = ctx.start_step(st)
     ctx.log(f"[{_ts()}] boot: starting {dep.name}", "l-dim")
     upid = px.start(new_vmid, node=node)
     px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=120)
-    ip = ip_static = cfg.get("static_ip")
+    ip_static = cfg.get("static_ip")
     ip = _wait_for_ip(ctx, px, new_vmid, node, timeout=260) or ip_static
     ctx.finish_step(st, t)
 
@@ -487,7 +485,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         try:
             _run_ansible_phase(ctx, recipe, job.created_by, ip, managed_priv, dep.name)
             ctx.finish_step(st, t)
-        except Exception as e:  # noqa: BLE001
+        except Exception:  # noqa: BLE001
             ctx.finish_step(st, t, state="failed")
             raise
 
@@ -500,10 +498,9 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         d.disk = disk_gb
         d.status = "running"
         d.error = ""
-        d.last_action = utcnow()
         s.add(d)
 
-    ctx.progress(100, "Complete", phase_total)
+    ctx.progress(100, "Complete")
     if ip:
         ctx.log(f"[{_ts()}] ✓ {dep.name} ready at {ip}", "l-ok")
     else:
@@ -551,7 +548,7 @@ def _run_image_build(ctx: JobCtx, job: Job) -> None:
         disk_gb = min(disk_gb, eff_disk_gb)
     disk_gb = max(1, disk_gb)
 
-    ctx.progress(3, "Phase 1 of 4 · Acquire", 4)
+    ctx.progress(3, "Phase 1 of 4 · Acquire")
     st = ctx.add_step(f"Allocate template VMID on {conn.name}")
     t = ctx.start_step(st)
     vmid = img.template_vmid or px.next_free_vmid(settings.vmid_min, settings.vmid_max, node)
@@ -565,7 +562,7 @@ def _run_image_build(ctx: JobCtx, job: Job) -> None:
             s.add(i)
     ctx.finish_step(st, t)
 
-    ctx.progress(10, "Phase 2 of 4 · Download base", 4)
+    ctx.progress(10, "Phase 2 of 4 · Download base")
     st = ctx.add_step("Download cloud image to node storage")
     t = ctx.start_step(st)
     # 'import' content type requires a recognised image extension; Ubuntu/Debian
@@ -605,7 +602,7 @@ def _run_image_build(ctx: JobCtx, job: Job) -> None:
                 raise RuntimeError(f"image download/verification failed: {e}") from e
     ctx.finish_step(st, t)
 
-    ctx.progress(35, "Phase 3 of 4 · Import & configure", 4)
+    ctx.progress(35, "Phase 3 of 4 · Import & configure")
 
     # Rebuild: if this vmid already hosts a VM/template from a previous build of this
     # image, destroy it first — Proxmox can't create a VM over an existing id (the
@@ -676,7 +673,7 @@ def _run_image_build(ctx: JobCtx, job: Job) -> None:
         ctx.log(f"[{_ts()}] resize skipped: {e}", "l-warn")
     ctx.finish_step(st, t)
 
-    ctx.progress(60, "Phase 4 of 4 · Finalize", 4)
+    ctx.progress(60, "Phase 4 of 4 · Finalize")
     if bake:
         st = ctx.add_step("Boot & apply blocks (cloud-init + ansible)")
         t = ctx.start_step(st)
@@ -728,7 +725,6 @@ def _run_image_build(ctx: JobCtx, job: Job) -> None:
         i.progress = 100
         i.node = node
         i.built_at = utcnow()
-        i.audit_log_json = json.dumps([{"block": c} for c in recipe_block_chips(recipe)] or [{"step": "clean cloud-init base"}])
         s.add(i)
     if bake and conn.ssh_key_path:
         try:
@@ -736,12 +732,11 @@ def _run_image_build(ctx: JobCtx, job: Job) -> None:
         except Exception:  # noqa: BLE001
             pass
 
-    ctx.progress(100, "Complete", 4)
+    ctx.progress(100, "Complete")
     ctx.log(f"[{_ts()}] ✓ golden image '{img.name}' ready", "l-ok")
 
 
 def _run_rebuild(ctx: JobCtx, job: Job) -> None:
-    cfg = json.loads(job.context_json or "{}")
     with session_scope() as s:
         conn = s.get(Connection, job.connection_id)
         dep = s.get(Deployment, job.deployment_id)
@@ -755,7 +750,7 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     px = Proxmox(conn)
     node = dep.node or conn.node or px.pick_node()
 
-    ctx.progress(1, "Phase 1 of 5 · Destroy", 5)
+    ctx.progress(1, "Phase 1 of 5 · Destroy")
     st = ctx.add_step(f"Stop & destroy old disk for {dep.name}")
     t = ctx.start_step(st)
     old_vmid = dep.vmid
@@ -773,10 +768,9 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     ctx.log(f"[{_ts()}] keeping identity: name={dep.name} ip={dep.ip or 'dhcp'}", "l-dim")
     ctx.finish_step(st, t)
 
-    # Re-run a deploy keeping the same name (and ip if static) by reusing context.
-    # phase_base=1/total=5 so progress continues (Phase 2..5 of 5) instead of jumping
-    # back to "Phase 1 of 4".
-    job.context_json = json.dumps({**cfg, "src_vmid": cfg.get("src_vmid")})
+    # Re-run a deploy keeping the same name (and ip if static) by reusing the job's
+    # existing context. phase_base=1/total=5 so progress continues (Phase 2..5 of 5)
+    # instead of jumping back to "Phase 1 of 4".
     _run_deploy(ctx, job, phase_base=1, phase_total=5)
 
 
@@ -795,7 +789,7 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
     px = Proxmox(conn)
     node = dep.node or conn.node or px.pick_node()
 
-    ctx.progress(10, "Stopping", 2)
+    ctx.progress(10, "Stopping")
     st = ctx.add_step(f"Stop {dep.name}")
     t = ctx.start_step(st)
     if dep.vmid:
@@ -806,7 +800,7 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
             pass
     ctx.finish_step(st, t)
 
-    ctx.progress(50, "Destroying", 2)
+    ctx.progress(50, "Destroying")
     st = ctx.add_step(f"Destroy {dep.name} (purge disk)")
     t = ctx.start_step(st)
     if dep.vmid:
@@ -828,7 +822,7 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
         d = s.get(Deployment, dep.id)
         if d:
             s.delete(d)
-    ctx.progress(100, "Complete", 2)
+    ctx.progress(100, "Complete")
 
 
 _DISPATCH = {

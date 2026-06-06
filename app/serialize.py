@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import time
-from collections import defaultdict, deque
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -32,15 +31,11 @@ from .proxmox import Proxmox
 from .recipes import recipe_block_chips
 from .security import mask
 
-# rolling CPU history for sparklines (in-memory). Keyed by (connection_id, node, vmid)
-# — NOT vmid alone — so two Proxmox clusters that reuse the same VMID don't collide.
-_spark: dict[tuple, deque] = defaultdict(lambda: deque(maxlen=7))
-# cache live status briefly to avoid hammering Proxmox on every poll (same composite key)
+# cache live status briefly to avoid hammering Proxmox on every poll. Keyed by
+# (connection_id, node, vmid) — NOT vmid alone — so two Proxmox clusters that
+# reuse the same VMID don't collide.
 _status_cache: dict[tuple, tuple[float, dict]] = {}
 _STATUS_TTL = 3.0
-
-OS_LABEL = {"ubuntu": "Ubuntu", "debian": "Debian", "alpine": "Alpine",
-            "rocky": "Rocky", "windows": "Windows", "generic": "Linux"}
 
 
 def _fmt_uptime(seconds: int) -> str:
@@ -98,7 +93,6 @@ def _live_status(px: Proxmox, vmid: int, node: str) -> dict:
             "mem": cur.get("mem", 0),
             "maxmem": cur.get("maxmem", 1) or 1,
             "uptime": cur.get("uptime", 0),
-            "qmpstatus": cur.get("qmpstatus", ""),
         }
     except Exception:  # noqa: BLE001
         out = {"status": "unknown", "cpu_pct": 0, "mem": 0, "maxmem": 1, "uptime": 0}
@@ -108,9 +102,6 @@ def _live_status(px: Proxmox, vmid: int, node: str) -> dict:
 
 def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: dict, conns: dict) -> dict:
     conn = conns.get(dep.connection_id)
-    # composite sparkline key (connection + node + vmid) so a VMID reused across
-    # clusters keeps separate history
-    spark_key = (dep.connection_id, dep.node or (conn.node if conn else ""), dep.vmid)
     os_family = "generic"
     image_name = ""
     recipe_name = ""
@@ -128,8 +119,6 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     cpu_pct = 0
     ram_pct = 0
     uptime = "—"
-    cores = dep.cpu
-    mem = dep.ram
     if conn and dep.vmid and dep.status not in ("working", "error"):
         px = px_cache.get(conn.id)
         if px:
@@ -138,11 +127,6 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
             cpu_pct = live["cpu_pct"]
             ram_pct = round(live["mem"] / max(1, live["maxmem"]) * 100)
             uptime = _fmt_uptime(live["uptime"]) if status == "running" else "—"
-            if status == "running":
-                _spark[spark_key].append(cpu_pct)
-    spark = list(_spark[spark_key]) or [0] * 7
-    if len(spark) < 7:
-        spark = [0] * (7 - len(spark)) + spark
 
     # active job → inline chip
     job_chip = None
@@ -161,25 +145,18 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     return {
         "id": f"vm-{dep.id}",
         "depId": dep.id,
-        "vmid": dep.vmid,
         "name": dep.name,
         "status": status,
         "ip": dep.ip or "—",
         "owner": "you" if dep.owner_id == me.id else "other",
         "ownerName": owner.name if owner else "—",
         "conn": conn.name if conn else "—",
-        "node": dep.node or (conn.node if conn else ""),
         "os": os_family,
         "image": image_name or "—",
         "template": recipe_name or image_name or "—",
-        "recipe": recipe_name or "—",
         "cpu": cpu_pct,
         "ram": ram_pct,
-        "disk": dep.disk,
-        "cores": cores,
-        "mem": mem,
         "uptime": uptime,
-        "spark": spark,
         "tags": dep.tags or "",
         "notes": dep.notes or "",
         **({"job": job_chip} if job_chip else {}),
@@ -193,12 +170,9 @@ def job_brief(session: Session, job: Job) -> dict:
     total = max(len(steps), 1)
     status_map = {"running": "working", "queued": "working", "succeeded": "done",
                   "failed": "error", "canceled": "error"}
-    kind_map = {"deploy": "deploy", "image_build": "build", "rebuild": "rebuild",
-                "destroy": "destroy", "action": "action"}
     return {
         "id": f"j-{job.id}",
         "jobId": job.id,
-        "kind": kind_map.get(job.type, job.type),
         "title": job.title,
         "status": status_map.get(job.status, "working"),
         "pct": job.pct,
@@ -241,7 +215,6 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
         "pct": job.pct,
         "phase": job.phase or job.status.title(),
         "phases": phases,
-        "totalPhases": job.total_phases,
         "elapsed": _elapsed(job.started_at, job.finished_at),
         "error": job.error,
         "steps": [
@@ -269,7 +242,6 @@ def golden_image_dict(session: Session, img: Image) -> dict:
         "built": _rel(img.built_at) if img.built_at else "—",
         "state": state,
         "blocks": chips,
-        "builds": 1,
         "vmid": img.template_vmid,
         "deployable": bool(img.template_vmid and img.build_status == "ready"),
         "progress": img.progress,
@@ -277,8 +249,6 @@ def golden_image_dict(session: Session, img: Image) -> dict:
         "recipe": recipe,
         "connId": img.connection_id,
         "location": (conn.name if conn else "—") + (" · " + img.node if img.node else ""),
-        "node": img.node,
-        "storage": img.storage,
     }
 
 
@@ -297,9 +267,6 @@ def base_image_dict(img: Image) -> dict:
         "name": img.name,
         "os": img.os_family,
         "size": img.size or "—",
-        # a failed base import must show as "failed", not perpetually "importing"
-        "state": {"ready": "ready", "failed": "failed"}.get(img.build_status, "importing"),
-        "conns": 1,
         "checksum": img.checksum or "cloud-init ready",
         "source_url": img.source_url,
     }
@@ -343,7 +310,6 @@ def block_dict(b: Block) -> dict:
 
 def secret_dict(s: Secret, users: dict, reveal: bool = False) -> dict:
     from .security import decrypt
-    owner = users.get(s.owner_id)
     return {
         "id": f"sec-{s.id}",
         "secId": s.id,
@@ -376,21 +342,17 @@ def connection_dict(session: Session, c: Connection, status: Optional[dict] = No
         "url": f"https://{c.host}:{c.port}",
         "status": (status or {}).get("status", "unknown"),
         "version": (status or {}).get("version", "—"),
-        "nodes": (status or {}).get("nodes", 1),
         "storage": c.storage or "—",
         "bridge": c.bridge,
         "vms": len(vms),
         "node": c.node,
-        # round-trippable config for the edit form (token secret is NEVER sent)
+        # round-trippable config for the edit form (token secret is NEVER sent; the
+        # SSH/TLS settings are env/API-managed and not exposed to the form)
         "host": c.host,
         "port": c.port,
         "tokenId": c.token_id,
         "isoStorage": c.iso_storage,
         "snippetStorage": c.snippet_storage,
-        "verifyTls": c.verify_tls,
-        "sshHost": c.ssh_host,
-        "sshUser": c.ssh_user,
-        "sshKeyPath": c.ssh_key_path,
         # per-target VM ceilings (0 = inherit the global default; UI falls back to it)
         "maxCores": c.max_cores,
         "maxRamGb": c.max_ram_mb // 1024,
@@ -410,7 +372,6 @@ def connection_public_dict(session: Session, c: Connection, status: Optional[dic
         "name": c.name,
         "status": (status or {}).get("status", "unknown"),
         "version": (status or {}).get("version", "—"),
-        "nodes": (status or {}).get("nodes", 1),
         "node": c.node,
         "vms": len(vms),
         # per-target VM ceilings (used to size the deploy/build sliders; 0 = inherit global)

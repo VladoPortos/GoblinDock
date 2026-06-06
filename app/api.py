@@ -40,7 +40,7 @@ from .models import (
     utcnow,
 )
 from .proxmox import Proxmox
-from .recipes import compile_playbook, lint_block, load_recipe
+from .recipes import compile_playbook, lint_block
 from . import backup
 from .security import (
     encrypt,
@@ -247,6 +247,14 @@ def _job_owned(job: Job, user: User) -> bool:
     return user.role == "admin" or job.created_by == user.id
 
 
+def _scoped_owned(obj, user: User) -> bool:
+    """Shared ownership rule for scoped items (secrets, variables):
+    global-scoped => admin only; user-scoped => owner or admin."""
+    if obj.scope == "global":
+        return user.role == "admin"
+    return obj.owner_id == user.id or user.role == "admin"
+
+
 # --------------------------------------------------------------------------- #
 # auth                                                                          #
 # --------------------------------------------------------------------------- #
@@ -418,9 +426,7 @@ def state(request: Request, user: User = Depends(current_user), session: Session
         if px:
             try:
                 v = px.version()
-                ns = px.nodes()
-                st = {"status": "online", "version": v.get("version", "—"),
-                      "nodes": len([n for n in ns if n.get("status") == "online"])}
+                st = {"status": "online", "version": v.get("version", "—")}
             except Exception:  # noqa: BLE001
                 st = {"status": "offline"}
         # Non-admins get a REDACTED connection (target name + node + sizing only) — never
@@ -439,11 +445,6 @@ def state(request: Request, user: User = Depends(current_user), session: Session
         jobs_q = select(Job).where(Job.created_by == user.id).order_by(Job.id.desc()).limit(20)
     jobs = [S.job_brief(session, j) for j in session.exec(jobs_q).all()]
 
-    cats = []
-    for b in blocks:
-        if b["cat"] not in cats:
-            cats.append(b["cat"])
-
     return {
         "me": S.me_dict(user),
         "csrf": ensure_csrf(request),
@@ -454,7 +455,6 @@ def state(request: Request, user: User = Depends(current_user), session: Session
         "GOLDEN_IMAGES": golden,
         "RECIPES": recipes,
         "PALETTE": blocks,
-        "BLOCK_CATS": cats,
         "SECRETS": secrets,
         "VARIABLES": variables,
         "CONNECTIONS": connections,
@@ -476,7 +476,6 @@ class DeployBody(BaseModel):
     cpu: int = Field(default=1, ge=1, le=256)
     ram: int = Field(default=2, ge=1, le=1024)        # GB
     disk: int = Field(default=20, ge=1, le=16384)     # GB
-    networkMode: str = "dhcp"
     tags: str = ""
     notes: str = ""
 
@@ -580,9 +579,6 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"proxmox: {e}")
-    dep.last_action = utcnow()
-    session.add(dep)
-    session.commit()
     return {"ok": True}
 
 
@@ -606,7 +602,7 @@ def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session
     ctx.update(_network_ctx(session, net, dep.id) if net else {"network_mode": "dhcp"})
     job = Job(type="rebuild", title=f"Rebuilding {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
-              total_phases=3, context_json=json.dumps(ctx))
+              context_json=json.dumps(ctx))
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -624,7 +620,7 @@ def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session
     session.add(dep)
     job = Job(type="destroy", title=f"Destroying {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
-              total_phases=2, context_json="{}")
+              context_json="{}")
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -656,16 +652,16 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
     owner = session.get(User, dep.owner_id) if dep.owner_id else None
     job = session.exec(select(Job).where(Job.deployment_id == dep.id).order_by(Job.id.desc())).first()
     out = {
-        "depId": dep.id, "name": dep.name, "vmid": dep.vmid,
+        "name": dep.name, "vmid": dep.vmid,
         "node": dep.node or (conn.node if conn else ""),
-        "status": dep.status, "ip": dep.ip, "mac": dep.mac, "tags": dep.tags, "notes": dep.notes,
+        "status": dep.status, "ip": dep.ip, "mac": dep.mac, "tags": dep.tags,
         "created": S._rel(dep.created_at), "owner": owner.name if owner else "—",
-        "connection": conn.name if conn else "—", "connId": conn.id if conn else None,
+        "connection": conn.name if conn else "—",
         "golden": img.name if img else "—", "recipe": rc.name if rc else None,
         "os": img.os_family if img else "generic",
         "reqCpu": dep.cpu, "reqRam": dep.ram, "reqDisk": dep.disk,
         "jobId": job.id if job else None,
-        "live": None, "config": None, "agent": None, "rrd": [], "consoleReady": False,
+        "live": None, "config": None, "agent": None, "consoleReady": False,
     }
     if conn and dep.vmid and dep.status not in ("working", "error"):
         try:
@@ -678,25 +674,19 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
                 "cpuPct": round((cur.get("cpu") or 0) * 100, 1),
                 "memUsed": int(cur.get("mem") or 0), "memMax": int(cur.get("maxmem") or 0),
                 "diskUsed": int(cur.get("disk") or 0), "diskMax": int(cur.get("maxdisk") or 0),
-                "netin": int(cur.get("netin") or 0), "netout": int(cur.get("netout") or 0),
                 "agentRunning": bool(cur.get("agent")),
             }
             cfg = px.vm_config(dep.vmid, node)
             out["config"] = {
                 "cores": cfg.get("cores"), "memoryMb": cfg.get("memory"),
                 "ostype": cfg.get("ostype", ""), "net0": cfg.get("net0", ""),
-                "scsi0": cfg.get("scsi0", ""), "boot": cfg.get("boot", ""),
+                "scsi0": cfg.get("scsi0", ""),
                 "agent": cfg.get("agent", ""), "serial0": cfg.get("serial0", ""),
             }
             out["consoleReady"] = running
             if running and cur.get("agent"):
                 out["agent"] = {"os": px.agent_osinfo(dep.vmid, node),
                                 "interfaces": _iface_summary(px.agent_interfaces(dep.vmid, node))}
-                out["rrd"] = [
-                    {"t": int(r.get("time") or 0), "cpu": round((r.get("cpu") or 0) * 100, 1),
-                     "mem": int(r.get("mem") or 0), "maxmem": int(r.get("maxmem") or 0)}
-                    for r in px.vm_rrddata(dep.vmid, node, "hour") if r.get("time")
-                ]
         except Exception:  # noqa: BLE001
             pass
     return out
@@ -721,6 +711,43 @@ def _ws_origin_ok(ws: WebSocket) -> bool:
         return True
     allow = {a.rstrip("/").lower() for a in settings.cors_origins}
     return origin.rstrip("/").lower() in allow
+
+
+async def _pump_ws(websocket: WebSocket, pve, prefer_bytes: bool) -> None:
+    """Pipe frames both ways between the browser WS and the Proxmox WS until either
+    side closes. `prefer_bytes` picks which field of a Starlette message wins when
+    both are present (the serial console is text-first, VNC is binary-first).
+    Shared by vm_console and vm_vnc."""
+
+    async def browser_to_pve():
+        first, second = ("bytes", "text") if prefer_bytes else ("text", "bytes")
+        try:
+            while True:
+                m = await websocket.receive()
+                if m.get("type") == "websocket.disconnect":
+                    break
+                payload = m.get(first) if m.get(first) is not None else m.get(second)
+                if payload is not None:
+                    await pve.send(payload)
+        except Exception:  # noqa: BLE001
+            pass
+        finally:
+            try:
+                await pve.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+    async def pve_to_browser():
+        try:
+            async for data in pve:
+                if isinstance(data, (bytes, bytearray)):
+                    await websocket.send_bytes(bytes(data))
+                else:
+                    await websocket.send_text(data)
+        except Exception:  # noqa: BLE001
+            pass
+
+    await asyncio.gather(browser_to_pve(), pve_to_browser())
 
 
 @router.websocket("/vms/{dep_id}/console")
@@ -751,7 +778,6 @@ async def vm_console(websocket: WebSocket, dep_id: int):
     _subs = websocket.scope.get("subprotocols") or []
     await websocket.accept(subprotocol="binary" if "binary" in _subs else None)
 
-    import asyncio
     import ssl as _ssl
     import websockets as _ws
 
@@ -771,35 +797,7 @@ async def vm_console(websocket: WebSocket, dep_id: int):
             ssl=ctx, subprotocols=["binary"], max_size=None, open_timeout=15,
         ) as pve:
             await pve.send(f"{puser}:{ticket}\n")
-
-            async def browser_to_pve():
-                try:
-                    while True:
-                        m = await websocket.receive()
-                        if m.get("type") == "websocket.disconnect":
-                            break
-                        payload = m.get("text") if m.get("text") is not None else m.get("bytes")
-                        if payload is not None:
-                            await pve.send(payload)
-                except Exception:  # noqa: BLE001
-                    pass
-                finally:
-                    try:
-                        await pve.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-
-            async def pve_to_browser():
-                try:
-                    async for data in pve:
-                        if isinstance(data, (bytes, bytearray)):
-                            await websocket.send_bytes(bytes(data))
-                        else:
-                            await websocket.send_text(data)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            await asyncio.gather(browser_to_pve(), pve_to_browser())
+            await _pump_ws(websocket, pve, prefer_bytes=False)
     except Exception as e:  # noqa: BLE001
         try:
             await websocket.send_text(f"\r\n[goblindock] console unavailable: {e}\r\n")
@@ -871,7 +869,6 @@ async def vm_vnc(websocket: WebSocket, dep_id: int):
     _subs = websocket.scope.get("subprotocols") or []
     await websocket.accept(subprotocol="binary" if "binary" in _subs else None)
 
-    import asyncio
     import ssl as _ssl
     import websockets as _ws
 
@@ -886,34 +883,7 @@ async def vm_vnc(websocket: WebSocket, dep_id: int):
             additional_headers={"Authorization": px.token_auth_header()},
             ssl=ctx, subprotocols=["binary"], max_size=None, open_timeout=15,
         ) as pve:
-            async def browser_to_pve():
-                try:
-                    while True:
-                        m = await websocket.receive()
-                        if m.get("type") == "websocket.disconnect":
-                            break
-                        payload = m.get("bytes") if m.get("bytes") is not None else m.get("text")
-                        if payload is not None:
-                            await pve.send(payload)
-                except Exception:  # noqa: BLE001
-                    pass
-                finally:
-                    try:
-                        await pve.close()
-                    except Exception:  # noqa: BLE001
-                        pass
-
-            async def pve_to_browser():
-                try:
-                    async for data in pve:
-                        if isinstance(data, (bytes, bytearray)):
-                            await websocket.send_bytes(bytes(data))
-                        else:
-                            await websocket.send_text(data)
-                except Exception:  # noqa: BLE001
-                    pass
-
-            await asyncio.gather(browser_to_pve(), pve_to_browser())
+            await _pump_ws(websocket, pve, prefer_bytes=True)
     except Exception:  # noqa: BLE001
         pass
     finally:
@@ -1199,12 +1169,6 @@ class VariableBody(BaseModel):
     scope: str = "global"  # global | user
 
 
-def _variable_owned(v: Variable, user: User) -> bool:
-    if v.scope == "global":
-        return user.role == "admin"
-    return v.owner_id == user.id or user.role == "admin"
-
-
 @router.post("/variables")
 def add_variable(body: VariableBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     scope = body.scope if body.scope in ("global", "user") else "global"
@@ -1228,7 +1192,7 @@ def edit_variable(var_id: int, body: VariableBody, user: User = Depends(current_
     v = session.get(Variable, var_id)
     if not v:
         raise HTTPException(404, "not found")
-    if not _variable_owned(v, user):
+    if not _scoped_owned(v, user):
         raise HTTPException(403, "not yours")
     if body.name is not None and body.name.strip():
         newname = body.name.strip()
@@ -1249,7 +1213,7 @@ def del_variable(var_id: int, user: User = Depends(current_user), session: Sessi
     v = session.get(Variable, var_id)
     if not v:
         raise HTTPException(404, "not found")
-    if not _variable_owned(v, user):
+    if not _scoped_owned(v, user):
         raise HTTPException(403, "not yours")
     session.delete(v)
     record_audit(session, user, "variable.delete", "variable", v.id, v.name)
@@ -1487,16 +1451,6 @@ class ProfileBody(BaseModel):
 class PasswordChangeBody(BaseModel):
     current: str
     new: str
-
-
-@router.get("/profile")
-def get_profile(request: Request, user: User = Depends(current_user),
-                session: Session = Depends(get_session)):
-    vms = session.exec(select(Deployment).where(Deployment.owner_id == user.id)).all()
-    me = S.me_dict(user)
-    me["vms"] = len(vms)
-    me["csrf"] = ensure_csrf(request)
-    return me
 
 
 @router.put("/profile")
@@ -1787,19 +1741,13 @@ class SecretEditBody(BaseModel):
     value: Optional[str] = None
 
 
-def _secret_owned(s: Secret, user: User) -> bool:
-    if s.scope == "global":
-        return user.role == "admin"
-    return s.owner_id == user.id or user.role == "admin"
-
-
 @router.put("/secrets/{sec_id}")
 def edit_secret(sec_id: int, body: SecretEditBody, user: User = Depends(current_user),
                 session: Session = Depends(get_session)):
     s = session.get(Secret, sec_id)
     if not s:
         raise HTTPException(404, "not found")
-    if not _secret_owned(s, user):
+    if not _scoped_owned(s, user):
         raise HTTPException(403, "not yours")
     if body.name is not None and body.name.strip():
         newname = body.name.strip()
@@ -1846,7 +1794,7 @@ def create_block(body: BlockBody, user: User = Depends(current_user),
                           body.ansible_template, body.cloudinit_template)
     if problems:
         raise HTTPException(400, "Block validation failed: " + "; ".join(problems))
-    b = Block(key=_new_block_key(session), kind="custom", builtin=False, editable=True,
+    b = Block(key=_new_block_key(session), kind="custom", builtin=False,
               name=body.name.strip() or "Custom block", category=body.category, icon=body.icon,
               section=body.section, phase="cloudinit" if body.phase == "cloudinit" else "ansible",
               description=body.description,
@@ -1868,7 +1816,7 @@ def fork_block(key: str, user: User = Depends(current_user), session: Session = 
     # copyable by key. 404 (not 403) so keys can't be probed.
     if not (src.builtin or src.owner_id == user.id or user.role == "admin"):
         raise HTTPException(404, "not found")
-    b = Block(key=_new_block_key(session), kind="custom", builtin=False, editable=True,
+    b = Block(key=_new_block_key(session), kind="custom", builtin=False,
               name=src.name + " (copy)", category=src.category, icon=src.icon,
               section=src.section, phase=src.phase, description=src.description,
               input_schema_json=src.input_schema_json, ansible_template=src.ansible_template,
@@ -1923,9 +1871,6 @@ def delete_block(key: str, user: User = Depends(current_user), session: Session 
     return {"ok": True}
 
 
-# =========================================================================== #
-# CRUD: templates (edit/delete)                                               #
-# =========================================================================== #
 # =========================================================================== #
 # CRUD: images (edit base, delete base+golden)                               #
 # =========================================================================== #
