@@ -75,6 +75,16 @@ def _migrate() -> None:
             ("widget_key_last_used", "TIMESTAMP"),
         ],
     }
+    # Columns REMOVED from the models (2026-06 dead-code cleanup). They must be
+    # dropped from upgraded DBs, not just left orphaned: create_all made them
+    # NOT NULL with no server default, so an INSERT from the new (column-less)
+    # model would violate the constraint and crash startup/seeding.
+    drops = {
+        "images": ["audit_log_json"],
+        "deployments": ["last_action"],
+        "blocks": ["editable"],
+        "jobs": ["total_phases"],
+    }
     import logging
     log = logging.getLogger("goblindock")
     with engine.begin() as conn:
@@ -83,6 +93,16 @@ def _migrate() -> None:
             for name, ddl in cols:
                 if name not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        for table, names in drops.items():
+            existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
+            for name in names:
+                if name in existing:
+                    try:  # DROP COLUMN needs SQLite >= 3.35 — warn loudly if absent
+                        conn.exec_driver_sql(f"ALTER TABLE {table} DROP COLUMN {name}")
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("could not drop removed column %s.%s — inserts into "
+                                    "%s may fail (legacy NOT NULL column): %s",
+                                    table, name, table, e)
         # Drift check across ALL tables: a model column missing from an existing table
         # and NOT covered by `adds` above means a migration was forgotten — surface it
         # loudly (it would otherwise be a "no such column" at runtime) instead of only
