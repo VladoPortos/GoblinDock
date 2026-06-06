@@ -21,7 +21,7 @@ from sqlmodel import Session, select
 
 from .config import settings
 from .db import engine, get_session
-from .deps import current_user, require_admin
+from .deps import current_user, require_admin, widget_key_user
 from .netutil import client_ip, current_request_ip
 from .models import (
     Audit,
@@ -45,7 +45,9 @@ from . import backup
 from .security import (
     encrypt,
     hash_password,
+    hash_widget_key,
     new_csrf_token,
+    new_widget_key,
     password_problem,
     verify_password,
 )
@@ -461,6 +463,50 @@ def state(request: Request, user: User = Depends(current_user), session: Session
         "NETWORKS": networks,
         "USERS": users_list,
         "JOBS": jobs,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Homepage widget — read-only, API-key-authed summary counts                   #
+# --------------------------------------------------------------------------- #
+@router.get("/widget/summary")
+def widget_summary(user: User = Depends(widget_key_user),
+                   session: Session = Depends(get_session)):
+    """Counts for the Homepage ``customapi`` widget.
+
+    Authenticated by the per-user widget API key (``X-API-Key``), tenant-scoped
+    like ``/state`` (a non-admin sees only their own VMs/jobs), and PROBE-FREE:
+    every number is read from SQLite — this frequently-polled path never calls
+    Proxmox.
+    """
+    is_admin = user.role == "admin"
+
+    vm_q = select(Deployment.status)
+    if not is_admin:
+        vm_q = vm_q.where(Deployment.owner_id == user.id)
+    statuses = list(session.exec(vm_q).all())
+
+    def _count(*names: str) -> int:
+        return sum(1 for st in statuses if st in names)
+
+    job_q = select(Job.id).where(Job.status.in_(("queued", "running")))
+    if not is_admin:
+        job_q = job_q.where(Job.created_by == user.id)
+    jobs_active = len(session.exec(job_q).all())
+
+    golden = session.exec(
+        select(Image.id).where(Image.kind == "golden",
+                               Image.template_vmid.is_not(None))
+    ).all()
+
+    return {
+        "vms_total": len(statuses),
+        "vms_running": _count("running"),
+        "vms_stopped": _count("stopped"),
+        "vms_working": _count("working"),
+        "vms_error": _count("error"),
+        "jobs_active": jobs_active,
+        "golden_images": len(golden),
     }
 
 
@@ -1485,6 +1531,40 @@ def change_password(body: PasswordChangeBody, request: Request,
     session.commit()
     # keep THIS session valid by re-stamping it with the new epoch
     request.session["sv"] = u.session_epoch
+    return {"ok": True}
+
+
+@router.post("/profile/widget-key")
+def gen_widget_key(user: User = Depends(current_user),
+                   session: Session = Depends(get_session)):
+    """Generate (or regenerate) this user's Homepage widget key.
+
+    Returns the plaintext token EXACTLY once — only its sha256 hash is stored, so
+    it can never be shown again. Regenerating invalidates the previous key."""
+    token = new_widget_key()
+    u = session.get(User, user.id)
+    u.widget_key_hash = hash_widget_key(token)
+    u.widget_key_prefix = token[:9]
+    u.widget_key_created_at = utcnow()
+    u.widget_key_last_used = None
+    session.add(u)
+    record_audit(session, user, "profile.widget_key.generate", "user", u.id)
+    session.commit()
+    return {"ok": True, "key": token, "prefix": u.widget_key_prefix}
+
+
+@router.delete("/profile/widget-key")
+def revoke_widget_key(user: User = Depends(current_user),
+                      session: Session = Depends(get_session)):
+    """Revoke this user's widget key — the token immediately stops working."""
+    u = session.get(User, user.id)
+    u.widget_key_hash = None
+    u.widget_key_prefix = ""
+    u.widget_key_created_at = None
+    u.widget_key_last_used = None
+    session.add(u)
+    record_audit(session, user, "profile.widget_key.revoke", "user", u.id)
+    session.commit()
     return {"ok": True}
 
 
