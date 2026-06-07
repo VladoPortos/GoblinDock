@@ -100,6 +100,8 @@ def _ansible_flat(inputs: dict, types: dict,
       {k}        raw — for ansible MODULE args, where ansible itself quotes
       {k_q}      shell-quoted via shlex — for a value inside an ansible.builtin.shell cmd
       {k_yamlq}  JSON-encoded — a safe double-quoted YAML scalar
+      {k_set}    'true' if the scalar value is non-empty/non-false, 'false' otherwise —
+                 safe for ansible ``when:`` clauses without embedding the value in YAML
     'code'-typed fields stay raw in {k_q} (a Run Script body is intentionally shell)."""
     def _res(x) -> str:
         return resolve_secrets(str(x), secret_lookup) if secret_lookup else str(x)
@@ -114,11 +116,13 @@ def _ansible_flat(inputs: dict, types: dict,
             flat[f"{k}_q"] = " ".join(shlex.quote(x) for x in items)
         elif isinstance(v, bool):
             flat[k] = flat[f"{k}_q"] = flat[f"{k}_yamlq"] = "true" if v else "false"
+            flat[f"{k}_set"] = "true" if v else "false"
         else:
             sval = _res(v)
             flat[k] = sval
             flat[f"{k}_q"] = sval if t == "code" else shlex.quote(sval)
             flat[f"{k}_yamlq"] = json.dumps(sval)
+            flat[f"{k}_set"] = "true" if sval else "false"
     return flat
 
 

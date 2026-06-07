@@ -388,6 +388,78 @@ def test_job_detail_waiting_for():
     print("test_job_detail_waiting_for OK")
 
 
+def test_user_block_passwords():
+    import yaml
+    from app.seed import seed_blocks
+    from app.models import Block
+    from app.recipes import compile_cloudinit, compile_playbook, load_recipe
+    from sqlmodel import select
+    seed_blocks()
+    with session_scope() as s:
+        blocks = {b.key: b for b in s.exec(select(Block)).all()}
+        bu = blocks["b-user"]
+        bs = blocks["b-ssh"]
+        bu_schema = json.loads(bu.input_schema_json)
+        assert any(f["name"] == "password" and f["type"] == "secret" for f in bu_schema), \
+            "b-user must have a 'password' secret field"
+        assert any(f["name"] == "ssh_password_login" and f["type"] == "bool" for f in bu_schema), \
+            "b-user must have ssh_password_login bool field"
+        bs_schema = json.loads(bs.input_schema_json)
+        pw = next(f for f in bs_schema if f["name"] == "password")
+        assert pw.get("optional") is True, "b-ssh password field must be optional"
+
+        # --- b-ssh cloudinit rendering with password + ssh_password_login ---
+        recipe = [{"id": "s-conf", "name": "Configure", "blocks": [
+            {"ref": "b-ssh", "name": "User & SSH Key",
+             "inputs": {"user": "goblin", "public_key": "ssh-ed25519 AAA", "sudo": True,
+                        "password": "s3cr:et's", "ssh_password_login": True}},
+        ]}]
+        cmds = compile_cloudinit(recipe, blocks, lambda ns, n: "")
+        joined = "\n".join(cmds)
+        assert "chpasswd" in joined, "chpasswd must appear when password given"
+        assert "00-goblindock.conf" in joined, "SSH password login conf must appear when flag is True"
+
+        # empty password + ssh_password_login False → guard renders inert
+        recipe[0]["blocks"][0]["inputs"]["password"] = ""
+        recipe[0]["blocks"][0]["inputs"]["ssh_password_login"] = False
+        joined2 = "\n".join(compile_cloudinit(recipe, blocks, lambda ns, n: ""))
+        # render_shell shlex-quotes empty string to '' so [ -n '' ] is in output
+        assert "[ -n '' ]" in joined2 or '[ -n "" ]' in joined2, \
+            f"empty password guard must render inert; got: {joined2!r}"
+        assert "if false" in joined2, \
+            f"ssh_password_login=False must render as 'if false'; got: {joined2!r}"
+
+        # --- b-user ansible playbook with a nasty password ---
+        recipe_u = [{"id": "s-conf", "name": "Configure", "blocks": [
+            {"ref": "b-user", "name": "Create User",
+             "inputs": {"user": "deploy", "groups": ["sudo"], "shell": "/bin/bash",
+                        "password": "o'br\"ien:x", "ssh_password_login": True}},
+        ]}]
+        play = compile_playbook(load_recipe(json.dumps(recipe_u)), blocks, "t")
+        parsed = yaml.safe_load(play)
+        assert parsed, "playbook must parse as valid YAML"
+        text = play
+        assert "chpasswd" in text, "chpasswd must appear in ansible playbook"
+        assert "00-goblindock.conf" in text, "SSH login conf must appear in ansible playbook"
+    print("test_user_block_passwords OK")
+
+
+def test_seed_blocks_resync():
+    from app.seed import seed_blocks
+    from app.models import Block
+    from sqlmodel import select
+    with session_scope() as s:
+        b = s.exec(select(Block).where(Block.key == "b-user")).first()
+        b.input_schema_json = "[]"
+        s.add(b)
+    seed_blocks()
+    with session_scope() as s:
+        b = s.exec(select(Block).where(Block.key == "b-user")).first()
+        assert any(f["name"] == "password" for f in json.loads(b.input_schema_json)), \
+            "seed_blocks must resync b-user schema including password field"
+    print("test_seed_blocks_resync OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
@@ -398,4 +470,6 @@ if __name__ == "__main__":
     test_sync_endpoint()
     test_wait_task_timeout_stops_task()
     test_job_detail_waiting_for()
+    test_user_block_passwords()
+    test_seed_blocks_resync()
     print("\nALL WAVE 10 UNIT TESTS PASSED")

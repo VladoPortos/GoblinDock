@@ -33,7 +33,7 @@
   }
   function warnOf(b) {
     const sc = paletteByKey(b.ref).schema || [];
-    return sc.some((f) => (f.type === 'text' || f.type === 'secret') && !(b.inputs || {})[f.name] && !((b.ask || []).includes(f.name)));
+    return sc.some((f) => (f.type === 'text' || f.type === 'secret') && !f.optional && !(b.inputs || {})[f.name] && !((b.ask || []).includes(f.name)));
   }
 
   // ---------- Palette ----------

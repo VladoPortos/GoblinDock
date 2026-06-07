@@ -39,14 +39,25 @@ BUILTIN_BLOCKS = [
     ),
     dict(
         key="b-ssh", name="User & SSH Key", category="Users / SSH", icon="key",
-        section="Configure", description="create user, push key, sudo",
+        section="Configure", description="create user, push key, sudo, optional password",
         input_schema=[
             {"name": "user", "type": "text", "default": "goblin", "label": "Username"},
             {"name": "public_key", "type": "secret", "default": "{{ secrets.TEAM_SSH_PUBKEY }}", "label": "Public key"},
             {"name": "sudo", "type": "bool", "default": True, "label": "Passwordless sudo"},
+            {"name": "password", "type": "secret", "default": "", "label": "Password · optional", "optional": True},
+            {"name": "ssh_password_login", "type": "bool", "default": False, "label": "Allow SSH password login"},
         ],
         ansible="- name: User & SSH Key\n  ansible.builtin.user:\n    name: {user}\n    groups: [sudo]\n    shell: /bin/bash",
-        cloudinit="id {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}\nusermod -aG sudo {user} || true\ninstall -d -m700 /home/{user}/.ssh\nprintf '%s\\n' {public_key} >> /home/{user}/.ssh/authorized_keys\nchown -R {user}:{user} /home/{user}/.ssh\nchmod 600 /home/{user}/.ssh/authorized_keys",
+        cloudinit=(
+            "id {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}\n"
+            "usermod -aG sudo {user} || true\n"
+            "install -d -m700 /home/{user}/.ssh\n"
+            "printf '%s\\n' {public_key} >> /home/{user}/.ssh/authorized_keys\n"
+            "chown -R {user}:{user} /home/{user}/.ssh\n"
+            "chmod 600 /home/{user}/.ssh/authorized_keys\n"
+            "if [ -n {password} ]; then echo {user}:{password} | chpasswd; fi\n"
+            "if {ssh_password_login}; then printf 'PasswordAuthentication yes\\n' > /etc/ssh/sshd_config.d/00-goblindock.conf; systemctl restart ssh || systemctl restart sshd; fi"
+        ),
     ),
     dict(
         key="b-script", name="Run Script", category="Scripts", icon="code",
@@ -88,11 +99,13 @@ BUILTIN_BLOCKS = [
     # ---- extended pre-built blocks (Ansible-module backed, simple inputs) ----
     dict(
         key="b-user", name="Create User", category="Users / SSH", icon="key",
-        section="Configure", description="create a Linux user + groups",
+        section="Configure", description="create a Linux user + groups + password",
         input_schema=[
             {"name": "user", "type": "text", "default": "deploy", "label": "Username"},
             {"name": "groups", "type": "tags", "default": ["sudo"], "label": "Groups"},
             {"name": "shell", "type": "text", "default": "/bin/bash", "label": "Login shell"},
+            {"name": "password", "type": "secret", "default": "", "label": "Password"},
+            {"name": "ssh_password_login", "type": "bool", "default": False, "label": "Allow SSH password login"},
         ],
         ansible=(
             "- name: Create User\n"
@@ -101,7 +114,15 @@ BUILTIN_BLOCKS = [
             "    groups: {groups_yamlq}\n"
             "    append: true\n"
             "    create_home: true\n"
-            "    shell: {shell}"
+            "    shell: {shell}\n"
+            "- name: Set login password\n"
+            "  ansible.builtin.shell: echo {user_q}:{password_q} | chpasswd\n"
+            "  when: {password_set}\n"
+            "- name: Allow SSH password login\n"
+            "  ansible.builtin.shell: |\n"
+            "    printf 'PasswordAuthentication yes\\n' > /etc/ssh/sshd_config.d/00-goblindock.conf\n"
+            "    systemctl restart ssh || systemctl restart sshd\n"
+            "  when: {ssh_password_login}"
         ),
         cloudinit="id {user} >/dev/null 2>&1 || useradd -m -s {shell} {user}",
     ),
