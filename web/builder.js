@@ -350,9 +350,11 @@
     } else {
       const goldens = (GD.GOLDEN_IMAGES || []).filter((g) => g.deployable);
       const selGold = goldens.find((g) => g.imgId === selGoldenId) || null;
+      const goldenStale = selGoldenId && !selGold;
       metaBase = selGold ? selGold.name : ''; metaOs = selGold ? selGold.os : (loadedTpl ? loadedTpl.os : 'ubuntu');
       imageSelect = { label: 'Golden image', icon: 'package', value: selGoldenId, set: (v) => { setSelGoldenId(v); setSelNetId(null); },
         options: [{ value: '', label: '— pick an image to enable deploy —' },
+          ...(goldenStale ? [{ value: selGoldenId, label: '⚠ image #' + selGoldenId + ' (not deployable)' }] : []),
           ...goldens.map((g) => ({ value: g.imgId, label: g.name + ' · ' + (g.location || '') }))] };
       const tplNets = selGold ? (GD.NETWORKS || []).filter((n) => n.connId === selGold.connId) : [];
       if (selGold) {
@@ -422,10 +424,10 @@
           });
           go('job', { jobId: r.jobId });
         } else if (loadedTpl) {
-          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public, goldenImageId: selGoldenId || null, networkId: selNetId || null });
+          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public, goldenImageId: selGoldenId || null, networkId: selNetId || null, os_family: selGold ? selGold.os : ((loadedTpl && loadedTpl.os) || 'ubuntu') });
           window.GDStore.toast('Template updated', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         } else {
-          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), goldenImageId: selGoldenId || null, networkId: selNetId || null });
+          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), goldenImageId: selGoldenId || null, networkId: selNetId || null, os_family: selGold ? selGold.os : ((loadedTpl && loadedTpl.os) || 'ubuntu') });
           window.GDStore.toast('Template saved', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         }
       } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); setBusy(false); busyRef.current = false; }

@@ -1071,7 +1071,7 @@ class TemplateBody(BaseModel):
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int]]:
     """Resolve goldenImageId/networkId or 400. The network must belong to the
     golden image's connection — quick-deploy uses both together."""
-    if body.networkId and not body.goldenImageId:
+    if body.networkId is not None and not body.goldenImageId:
         raise HTTPException(400, "networkId requires goldenImageId")
     gid = nid = None
     if body.goldenImageId:
@@ -1115,6 +1115,7 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
         raise HTTPException(403, "not yours")
     rc.name = body.name.strip() or rc.name
     rc.description = body.description
+    rc.os_family = body.os_family
     rc.recipe_json = json.dumps(body.recipe or [])
     rc.default_cpu = min(body.cpu, settings.max_cores)
     rc.default_ram = min(body.ram, settings.max_ram_mb // 1024)

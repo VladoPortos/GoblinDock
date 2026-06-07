@@ -161,20 +161,47 @@ def test_template_crud_with_refs():
         _expect_http(400, lambda: api.save_template(api.TemplateBody(
             name="bad2", recipe=[], networkId=net_id), user=user, session=s))
     # network on a DIFFERENT connection than the image → 400
-    from app.models import Network
-    with session_scope() as s:
-        other = Network(connection_id=999, name="other", mode="dhcp")
-        s.add(other); s.flush(); other_id = other.id
+    _conn2, _img2, other_net = _mk_conn_golden_net()
     with session_scope() as s:
         user = s.get(User, uid)
         _expect_http(400, lambda: api.save_template(api.TemplateBody(
-            name="bad3", recipe=[], goldenImageId=img_id, networkId=other_id),
+            name="bad3", recipe=[], goldenImageId=img_id, networkId=other_net),
             user=user, session=s))
     print("test_template_crud_with_refs OK")
+
+
+def test_template_edit_refs():
+    from app import api
+    from app.models import Template, User
+    from sqlmodel import select
+    uid = _mk_user("tpl-edit@example.com")
+    conn_id, img_id, net_id = _mk_conn_golden_net()
+    with session_scope() as s:
+        user = s.get(User, uid)
+        api.save_template(api.TemplateBody(name="edit-me", recipe=[]), user=user, session=s)
+    with session_scope() as s:
+        tid = s.exec(select(Template).where(Template.name == "edit-me")).first().id
+    # set refs via edit
+    with session_scope() as s:
+        user = s.get(User, uid)
+        api.edit_template_ep(tid, api.TemplateBody(
+            name="edit-me", recipe=[], goldenImageId=img_id, networkId=net_id,
+            os_family="debian"), user=user, session=s)
+    with session_scope() as s:
+        t = s.get(Template, tid)
+        assert t.golden_image_id == img_id and t.network_id == net_id, (t.golden_image_id, t.network_id)
+        assert t.os_family == "debian", t.os_family
+    # bad image id on edit → 400
+    with session_scope() as s:
+        user = s.get(User, uid)
+        _expect_http(400, lambda: api.edit_template_ep(tid, api.TemplateBody(
+            name="edit-me", recipe=[], goldenImageId=999999), user=user, session=s))
+    print("test_template_edit_refs OK")
 
 
 if __name__ == "__main__":
     test_migration_renames_and_extends()
     test_migration_idempotent()
     test_template_crud_with_refs()
+    test_template_edit_refs()
     print("\nALL WAVE 9 UNIT TESTS PASSED")
