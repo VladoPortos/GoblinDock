@@ -215,8 +215,52 @@
       children, dropdown);
   }
 
+  // ---- ask-on-deploy helpers (shared by the quick-deploy modal + deploy page) ----
+  function collectAsks(tpl) {
+    const GDx = window.GD;
+    const asks = [];
+    (tpl.recipe || []).forEach((sec, si) => (sec.blocks || []).forEach((b, bi) => {
+      (Array.isArray(b.ask) ? b.ask : []).forEach((n) => {
+        const pal = (GDx.PALETTE || []).find((p) => p.id === b.ref) || {};
+        const field = (pal.schema || []).find((x) => x.name === n);
+        if (!field) return;  // ask references an input the block no longer has — no prompt
+        asks.push({ addr: si + '.' + bi, blockName: b.name || pal.name || b.ref, field, def: (b.inputs || {})[n] });
+      });
+    }));
+    return asks;
+  }
+  function initAskAnswers(asks) {
+    const out = {};
+    asks.forEach((a) => {
+      out[a.addr] = out[a.addr] || {};
+      out[a.addr][a.field.name] = a.def != null && a.def !== '' ? a.def
+        : a.field.type === 'bool' ? false : (a.field.type === 'tags' || a.field.type === 'list') ? [] : '';
+    });
+    return out;
+  }
+  function asksMissing(asks, answers) {
+    return asks.filter((a) => {
+      const t = a.field.type || 'text';
+      if (t === 'bool' || t === 'tags' || t === 'list' || t === 'select') return false;
+      const v = (answers[a.addr] || {})[a.field.name];
+      return !(v && String(v).trim());
+    }).map((a) => a.field.label || a.field.name);
+  }
+  function AskInputs({ asks, answers, setAnswers }) {
+    const SchemaField = window.SchemaField;  // exported by builder.js (load order safe: render-time)
+    if (!asks.length || !SchemaField) return null;
+    return React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 12 } },
+      asks.map((a) => React.createElement('div', { key: a.addr + ':' + a.field.name },
+        React.createElement('div', { className: 'hint mono', style: { fontSize: 10.5, marginBottom: 3 } }, a.blockName),
+        React.createElement(SchemaField, {
+          field: a.field, value: (answers[a.addr] || {})[a.field.name],
+          onChange: (v) => setAnswers((prev) => ({ ...prev, [a.addr]: { ...(prev[a.addr] || {}), [a.field.name]: v } })),
+        }))));
+  }
+
   window.UI = {
     OSGlyph, StatusBadge, CopyField, Meter, Modal, ConfirmModal, Menu,
     Field, TextArea, SelectField, Toggle, TagInput, FormModal,
+    collectAsks, initAskAnswers, asksMissing, AskInputs,
   };
 })();

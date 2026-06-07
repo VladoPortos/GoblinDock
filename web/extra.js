@@ -3,7 +3,7 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { Menu, ConfirmModal, Field, CopyField } = window.UI;
+  const { Menu, ConfirmModal, Field, FormModal, CopyField, OSGlyph, AskInputs, collectAsks, initAskAnswers, asksMissing } = window.UI;
   const h = React.createElement;
 
   /* ============ PROFILE ============ */
@@ -156,24 +156,74 @@
   }
 
   /* ============ TEMPLATES LIST ============ */
-  function TemplateCard({ r, go, onDelete }) {
+  function QuickDeployModal({ tpl, go, onClose }) {
+    const gold = (GD.GOLDEN_IMAGES || []).find((g) => g.imgId === tpl.goldenImageId) || {};
+    const net = (GD.NETWORKS || []).find((n) => n.netId === tpl.networkId);
+    const asks = collectAsks(tpl);
+    const [name, setName] = useState('gd-' + ((GD.VMS || []).length + 1));
+    const [answers, setAnswers] = useState(() => initAskAnswers(asks));
+    const [busy, setBusy] = useState(false);
+    const busyRef = React.useRef(false);
+    const missing = (name.trim() ? [] : ['VM name']).concat(asksMissing(asks, answers));
+    const submit = async () => {
+      if (busyRef.current) return;
+      if (missing.length) { window.GDStore.toast('Required: ' + missing.join(', '), 'warn'); return; }
+      busyRef.current = true; setBusy(true);
+      try {
+        const r = await window.API.deploy({
+          goldenImageId: tpl.goldenImageId, templateId: tpl.templateId,
+          networkId: tpl.networkId || null, name: name.trim(),
+          cpu: tpl.cpu, ram: tpl.mem, disk: tpl.disk, deployInputs: answers, tags: '',
+        });
+        onClose(); go('job', { jobId: r.jobId });
+      } catch (e) { window.GDStore.toast(e.message || 'deploy failed', 'err'); setBusy(false); busyRef.current = false; }
+    };
+    return h(FormModal, { title: 'Deploy from ' + tpl.name, icon: 'play', onClose, onSubmit: submit, busy, submitLabel: 'Deploy ' + (name.trim() || 'VM') },
+      h(Field, { label: 'VM name', value: name, onChange: setName, mono: true }),
+      asks.length > 0 && h('div', null,
+        h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Required inputs'),
+        h(AskInputs, { asks, answers, setAnswers })),
+      h('div', { className: 'divider' }),
+      h('div', { className: 'row', style: { gap: 10 } },
+        h(OSGlyph, { os: gold.os || tpl.os, size: 26 }),
+        h('div', { style: { minWidth: 0 } },
+          h('div', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, gold.name || '—'),
+          h('div', { className: 'hint mono', style: { fontSize: 11 } },
+            tpl.cpu + ' vCPU · ' + tpl.mem + ' GB · ' + tpl.disk + ' GB · ' + (net ? net.name : 'default network') + ' · ' + (tpl.blocks || []).length + ' blocks'))),
+      h('p', { className: 'hint', style: { fontSize: 11 } }, 'Clones ' + (gold.name || 'the image') + ', applies the blocks, takes you straight to live progress.'));
+  }
+
+  function TemplateCard({ r, go, onDelete, onDeploy }) {
+    const gold = (GD.GOLDEN_IMAGES || []).find((g) => g.imgId === r.goldenImageId);
+    const deployable = !!(gold && gold.deployable);
     return h('div', { className: 'card', style: { overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
       h('div', { className: 'card-pad', style: { display: 'flex', flexDirection: 'column', gap: 12, flex: 1 } },
         h('div', { className: 'row', style: { gap: 10 } },
           h('span', { className: 'placed-ico', style: { width: 32, height: 32 } }, h(Icon, { name: 'template', size: 16 })),
           h('div', { style: { minWidth: 0 } },
             h('div', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, r.name),
-            h('div', { className: 'hint', style: { fontSize: 11 } }, (r.blocks || []).length, ' block', (r.blocks || []).length === 1 ? '' : 's')),
+            h('div', { className: 'hint', style: { fontSize: 11 } }, (r.blocks || []).length, ' block', (r.blocks || []).length === 1 ? '' : 's',
+              ' · ', r.cpu, ' vCPU · ', r.mem, ' GB · ', r.disk, ' GB')),
           h('div', { style: { marginLeft: 'auto' } },
             r.public ? h('span', { className: 'badge accent' }, h(Icon, { name: 'globe', size: 12 }), 'Public')
               : h('span', { className: 'badge' }, h(Icon, { name: 'user', size: 12 }), 'Private'))),
-        h('p', { className: 'hint', style: { fontSize: 12.5, lineHeight: 1.5, minHeight: 34 } }, r.desc || 'A reusable deployment preset.'),
+        gold
+          ? h('div', { className: 'row mono', style: { gap: 8, fontSize: 11.5 } },
+              h(OSGlyph, { os: gold.os, size: 15 }),
+              h('span', { style: { fontWeight: 600 } }, gold.name),
+              h('span', { className: 'hint' }, gold.location || ''),
+              !deployable && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, 'image not ready'))
+          : h('div', { className: 'row', style: { gap: 6 } },
+              h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } },
+                h(Icon, { name: 'warn', size: 11 }), 'no image set — edit to enable deploy')),
+        h('p', { className: 'hint', style: { fontSize: 12.5, lineHeight: 1.5, minHeight: 20 } }, r.desc || 'A reusable deployment preset.'),
         (r.blocks || []).length > 0 && h('div', { className: 'row wrap', style: { gap: 5 } },
           r.blocks.slice(0, 6).map((b, i) => h('span', { key: i, className: 'chip', style: { fontSize: 10.5, padding: '3px 7px' } }, b))),
         h('div', { className: 'row mono', style: { gap: 10, fontSize: 11, color: 'var(--text-faint)', marginTop: 'auto', paddingTop: 4 } },
           h('span', null, r.used, ' deploys'))),
       h('div', { style: { display: 'flex', borderTop: '1px solid var(--border-soft)' } },
-        h('button', { className: 'card-act', onClick: () => go('newtemplate', { templateId: r.templateId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit template'),
+        h('button', { className: 'card-act', disabled: !deployable, title: deployable ? 'One-click deploy from this template' : 'Set a built golden image first (Edit)', onClick: () => onDeploy(r) }, h(Icon, { name: 'play', size: 14 }), 'Deploy'),
+        h('button', { className: 'card-act', onClick: () => go('newtemplate', { templateId: r.templateId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
         h(Menu, { align: 'right', items: [
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onDelete(r) },
         ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' } }, h(Icon, { name: 'more', size: 16 })))));
@@ -181,13 +231,14 @@
 
   function TemplatesList({ go }) {
     const [confirm, setConfirm] = useState(null);
+    const [deploying, setDeploying] = useState(null);
     const templates = GD.TEMPLATES || [];
-    const del = async (r) => { await window.API.deleteTemplate(r.templateId); window.GDStore.toast('Template deleted', 'ok'); window.GDStore.refresh().catch(() => {}); };
+    const del = async (t) => { await window.API.deleteTemplate(t.templateId); window.GDStore.toast('Template deleted', 'ok'); window.GDStore.refresh().catch(() => {}); };
     return h('div', { className: 'page fadein' },
       h('div', { className: 'page-head' },
         h('div', null,
           h('h1', { className: 'page-title' }, 'Templates'),
-          h('div', { className: 'page-sub' }, 'Reusable deployment presets — a golden image + blocks + defaults, ready to deploy.')),
+          h('div', { className: 'page-sub' }, 'Deployment presets — a golden image + blocks + defaults. Deploy in one click.')),
         h('div', { className: 'spacer' }),
         h('button', { className: 'btn primary', onClick: () => go('newtemplate') }, h(Icon, { name: 'plus', size: 16 }), 'New template')),
       templates.length === 0
@@ -197,7 +248,8 @@
             h('p', null, 'Save a golden image + blocks + sizing under a name — then deploy it again and again.'),
             h('button', { className: 'btn primary', onClick: () => go('newtemplate') }, h(Icon, { name: 'plus', size: 16 }), 'New template')))
         : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 } },
-            templates.map((r) => h(TemplateCard, { key: r.id, r, go, onDelete: (x) => setConfirm(x) }))),
+            templates.map((t) => h(TemplateCard, { key: t.id, r: t, go, onDelete: (x) => setConfirm(x), onDeploy: (x) => setDeploying(x) }))),
+      deploying && h(QuickDeployModal, { tpl: deploying, go, onClose: () => setDeploying(null) }),
       confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null), tone: 'danger', icon: 'trash',
         title: 'Delete ' + confirm.name + '?',

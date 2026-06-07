@@ -491,4 +491,5 @@
 
   window.Builder = Builder;
   window.BlockEditorModal = BlockEditorModal;
+  window.SchemaField = SchemaField;
 })();
