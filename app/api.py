@@ -568,13 +568,14 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                     raise HTTPException(400, f"deployInputs: {name!r} must be a list")
                 if ftype not in ("bool", "tags") and not isinstance(v, str):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a string")
+                if ftype in ("text", "secret") and not v.strip():
+                    raise HTTPException(400, f"template requires input {name!r}")
                 out[name] = v
-            if ftype in ("text", "secret") and not str(out.get(name) or "").strip():
-                # fall back to the template's stored value before failing
+            elif ftype in ("text", "secret"):
+                # unanswered: the template's stored value must carry it
                 stored = (placed.get("inputs") or {}).get(name)
-                if stored and str(stored).strip():
-                    continue
-                raise HTTPException(400, f"template requires input {name!r}")
+                if not (stored and str(stored).strip()):
+                    raise HTTPException(400, f"template requires input {name!r}")
         if out:
             cleaned[addr] = out
     return json.dumps(cleaned)

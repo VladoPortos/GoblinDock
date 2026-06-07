@@ -287,6 +287,25 @@ def test_deploy_with_inputs():
     priv = _mk_template(img_id, owner=other, public=False)
     _expect_http(404, lambda: _deploy(templateId=priv, name="vm-g",
                  deployInputs={"0.0": {"hostname": "h"}}))
+    # whitespace-only supplied answer → 400 even though a stored value exists
+    tid2 = _mk_template(img_id)
+    with session_scope() as s:
+        from app.models import Template
+        t = s.get(Template, tid2)
+        rec = json.loads(t.recipe_json)
+        rec[0]["blocks"][0]["inputs"]["hostname"] = "stored-host"
+        t.recipe_json = json.dumps(rec)
+        s.add(t)
+    _expect_http(400, lambda: _deploy(templateId=tid2, name="vm-h",
+                 deployInputs={"0.0": {"hostname": "   "}}))
+    # unanswered with a non-empty stored value → OK, and nothing persisted as override
+    r2 = _deploy(templateId=tid2, name="vm-i", deployInputs={})
+    assert r2["ok"]
+    with session_scope() as s:
+        from app.models import Deployment
+        from sqlmodel import select
+        d2 = s.exec(select(Deployment).where(Deployment.name == "vm-i")).first()
+        assert json.loads(d2.deploy_inputs_json) == {}, d2.deploy_inputs_json
     print("test_deploy_with_inputs OK")
 
 
