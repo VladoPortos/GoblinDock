@@ -8,10 +8,8 @@
   const NAV = [
     { group: 'Operate', items: [
       { id: 'dashboard', label: 'Dashboard', icon: 'server' },
-      { id: 'deploy',    label: 'Deploy',    icon: 'plus', primary: true },
     ]},
     { group: 'Build', items: [
-      { id: 'golden',    label: 'Golden Images', icon: 'package' },
       { id: 'templates', label: 'Templates',   icon: 'template' },
       { id: 'blocks',    label: 'Blocks',     icon: 'blocks' },
     ]},
@@ -57,9 +55,9 @@
   }
 
   const TITLES = {
-    dashboard: ['Operate', 'Virtual Machines'], vmdetail: ['Operate', 'Virtual Machine'], deploy: ['Operate', 'Deploy VM'],
-    job: ['Operate', 'Job Progress'], golden: ['Build', 'Golden Images'],
-    builder: ['Build', 'Golden Image'], templates: ['Build', 'Templates'],
+    dashboard: ['Operate', 'Virtual Machines'], vmdetail: ['Operate', 'Virtual Machine'],
+    job: ['Operate', 'Job Progress'],
+    templates: ['Build', 'Templates'],
     newtemplate: ['Build', 'Template'], blocks: ['Build', 'Blocks'],
     isos: ['Manage', 'ISOs / Base Images'], secrets: ['Manage', 'Secrets'],
     variables: ['Manage', 'Variables'],

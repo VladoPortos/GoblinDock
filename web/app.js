@@ -55,14 +55,14 @@
       setRoute(r);
       localStorage.setItem('gd-route', r);
       const c = document.querySelector('.content'); if (c) c.scrollTo(0, 0);
-      if (r !== 'login' && r !== 'job' && r !== 'builder') window.GDStore.refresh().catch(() => {});
+      if (r !== 'login' && r !== 'job' && r !== 'newtemplate') window.GDStore.refresh().catch(() => {});
     };
 
     // background poll for live VM/job state
     useEffect(() => {
       if (route === 'login') return undefined;
       const id = setInterval(() => {
-        if (route !== 'builder' && route !== 'job') window.GDStore.refresh().catch(() => {});
+        if (route !== 'newtemplate' && route !== 'job') window.GDStore.refresh().catch(() => {});
       }, 5000);
       return () => clearInterval(id);
     }, [route]);
@@ -78,11 +78,8 @@
     const SCREENS = {
       dashboard: () => h(window.Dashboard, { go }),
       vmdetail: () => h(window.VmDetail, { go }),
-      deploy: () => h(window.Deploy, { go }),
       job: () => h(window.JobProgress, { go }),
-      builder: () => h(window.Builder, { go, mode: 'golden' }),
       newtemplate: () => h(window.Builder, { go }),
-      golden: () => h(window.GoldenImages, { go }),
       templates: () => h(window.TemplatesList, { go }),
       isos: () => h(window.Isos, { go }),
       blocks: () => h(window.BlocksLib, { go }),
@@ -92,7 +89,7 @@
       profile: () => h(window.Profile, { go, theme, setTheme }),
     };
     const Screen = SCREENS[route] || SCREENS.dashboard;
-    const fullBleed = route === 'builder' || route === 'newtemplate';
+    const fullBleed = route === 'newtemplate';
 
     return h('div', { className: 'app' },
       h(Sidebar, { route, go, collapsed, setCollapsed, runningJobs }),

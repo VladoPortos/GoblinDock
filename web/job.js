@@ -144,8 +144,8 @@
             h(Icon, { name: 'clock', size: 14, style: { verticalAlign: '-2px', marginRight: 5 } }), job.elapsed),
           live && h('button', { className: 'btn danger', onClick: async () => { try { await window.API.cancelJob(jobId); window.GDStore.toast('Cancel requested', 'warn'); } catch (e) { window.GDStore.toast(e.message || 'cancel failed', 'err'); } } },
             h(Icon, { name: 'cancel', size: 15 }), 'Cancel'),
-          !live && h('button', { className: 'btn primary', onClick: () => go(job.type === 'image_build' ? 'golden' : 'dashboard') },
-            h(Icon, { name: 'arrowRight', size: 15 }), job.type === 'image_build' ? 'View golden images' : 'Go to VMs'))),
+          !live && h('button', { className: 'btn primary', onClick: () => go('dashboard') },
+            h(Icon, { name: 'arrowRight', size: 15 }), 'Go to VMs'))),
 
       job.status === 'error' && job.error && h('div', { className: 'card', style: { padding: 14, marginBottom: 16, background: 'var(--err-ghost)', borderColor: 'transparent', display: 'flex', gap: 10, alignItems: 'center' } },
         h(Icon, { name: 'warn', size: 17, style: { color: 'var(--err)', flexShrink: 0 } }),

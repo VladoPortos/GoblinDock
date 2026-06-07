@@ -95,12 +95,9 @@ window.API = (function () {
     vncProxy: (id) => req('POST', `/api/vms/${id}/vncproxy`),
 
     // images
-    buildGolden: (p) => req('POST', '/api/images/golden', p),
-    rebuildGolden: (id) => req('POST', `/api/images/${id}/rebuild`),
     addBaseImage: (p) => req('POST', '/api/images/base', p),
     editImage: (id, p) => req('PUT', `/api/images/${id}`, p),
     deleteImage: (id) => req('DELETE', `/api/images/${id}`),
-    staleImages: () => req('GET', '/api/images/stale'),
 
     // templates (deployment presets: golden image + blocks + defaults)
     saveTemplate: (p) => req('POST', '/api/templates', p),

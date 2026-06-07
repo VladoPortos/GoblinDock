@@ -18,7 +18,6 @@
     // dynamic collections (filled from /api/state)
     VMS: [],
     BASE_IMAGES: [],
-    GOLDEN_IMAGES: [],
     TEMPLATES: [],
     PALETTE: [],
     SECRETS: [],
