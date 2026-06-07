@@ -3,7 +3,7 @@
   const { useState, useEffect } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { Modal, OSGlyph, Field, TextArea, SelectField, Toggle, TagInput, FormModal, ConfirmModal } = window.UI;
+  const { Modal, OSGlyph, Field, TextArea, SelectField, Toggle, TagInput, FormModal } = window.UI;
   const h = React.createElement;
 
   let UID = 100;
