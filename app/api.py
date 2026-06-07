@@ -557,10 +557,10 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                     raise HTTPException(400, f"deployInputs: {name!r} must be a list")
                 if ftype not in ("bool", "tags", "list") and not isinstance(v, str):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a string")
-                if ftype in ("text", "secret") and not v.strip():
+                if ftype in ("text", "secret", "password") and not v.strip():
                     raise HTTPException(400, f"template requires input {name!r}")
                 out[name] = v
-            elif ftype in ("text", "secret"):
+            elif ftype in ("text", "secret", "password"):
                 # unanswered: the template's stored value must carry it
                 stored = (placed.get("inputs") or {}).get(name)
                 if not (stored and str(stored).strip()):
@@ -1167,7 +1167,28 @@ def compile_template(body: CompileBody, user: User = Depends(current_user), sess
     # private block template. Unknown/forbidden keys simply render as no-ops.
     blocks = {b.key: b for b in session.exec(select(Block)).all()
               if user.role == "admin" or b.builtin or b.owner_id == user.id}
-    yaml = compile_playbook(body.recipe or [], blocks, body.name)
+    recipe = body.recipe or []
+    # PREVIEW-ONLY masking: password-typed inputs must not appear in the YAML
+    # preview (the worker compiles the real values at deploy time).
+    masked = json.loads(json.dumps(recipe))
+    for sec in masked:
+        for b in (sec.get("blocks") or []) if isinstance(sec, dict) else []:
+            if not isinstance(b, dict):
+                continue
+            blk = blocks.get(b.get("ref"))
+            if not blk:
+                continue
+            try:
+                schema = json.loads(blk.input_schema_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            pw_fields = {f.get("name") for f in schema if isinstance(f, dict) and f.get("type") == "password"}
+            inputs = b.get("inputs") or {}
+            for name in pw_fields:
+                if inputs.get(name):
+                    inputs[name] = "********"
+            b["inputs"] = inputs
+    yaml = compile_playbook(masked, blocks, body.name)
     return {"yaml": yaml}
 
 

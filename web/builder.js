@@ -27,13 +27,14 @@
       if (v == null || v === '') return;
       if (f.type === 'bool') { if (v) parts.push(f.label || f.name); }
       else if (Array.isArray(v)) { if (v.length) parts.push(v.slice(0, 4).join(', ')); }
+      else if (f.type === 'password') { parts.push('••••••'); }
       else parts.push(String(v).length > 28 ? String(v).slice(0, 28) + '…' : String(v));
     });
     return parts.join(' · ') || paletteByKey(b.ref).desc || '';
   }
   function warnOf(b) {
     const sc = paletteByKey(b.ref).schema || [];
-    return sc.some((f) => (f.type === 'text' || f.type === 'secret') && !f.optional && !(b.inputs || {})[f.name] && !((b.ask || []).includes(f.name)));
+    return sc.some((f) => (f.type === 'text' || f.type === 'secret' || f.type === 'password') && !f.optional && !(b.inputs || {})[f.name] && !((b.ask || []).includes(f.name)));
   }
 
   // ---------- Palette ----------
@@ -118,6 +119,26 @@
   }
 
   // ---------- schema-driven field ----------
+  function PasswordField({ label, value, onChange }) {
+    const [pw, setPw] = useState(value == null ? '' : String(value));
+    const [confirm, setConfirm] = useState(value == null ? '' : String(value));
+    const [show, setShow] = useState(false);
+    const commit = (a, b) => onChange(a === b ? a : '');
+    const mismatch = confirm !== '' && pw !== confirm;
+    return h('div', null,
+      h('label', { className: 'field-label' }, label),
+      h('div', { className: 'row', style: { gap: 6 } },
+        h('input', { className: 'input mono', type: show ? 'text' : 'password', value: pw, placeholder: 'password',
+          autoComplete: 'new-password',
+          onChange: (e) => { const v = e.target.value; setPw(v); commit(v, confirm); } }),
+        h('button', { type: 'button', className: 'icon-btn', title: show ? 'Hide' : 'Show',
+          onClick: () => setShow(!show) }, h(Icon, { name: show ? 'eyeOff' : 'eye', size: 14 }))),
+      h('input', { className: 'input mono', type: show ? 'text' : 'password', value: confirm, placeholder: 'confirm password',
+        autoComplete: 'new-password', style: { marginTop: 6 },
+        onChange: (e) => { const v = e.target.value; setConfirm(v); commit(pw, v); } }),
+      mismatch && h('div', { className: 'hint', style: { color: 'var(--warn)', fontSize: 11, marginTop: 4 } }, "passwords don't match"));
+  }
+
   function SecretPicker({ value, onChange }) {
     const secrets = GD.SECRETS || [];
     return h('div', { className: 'row', style: { gap: 6 } },
@@ -186,6 +207,7 @@
     if (field.type === 'tags') return h(TagInput, { label, tags: Array.isArray(value) ? value : [], onChange });
     if (field.type === 'code') return h(CodeField, { label, value, onChange });
     if (field.type === 'select') return h(SelectField, { label, value, onChange, options: field.options || [] });
+    if (field.type === 'password') return h(PasswordField, { label, value, onChange });
     if (field.type === 'secret') return h('div', null, h('label', { className: 'field-label' }, label), h(SecretPicker, { value, onChange }));
     return h(Field, { label, value, onChange, mono: field.type === 'text' });
   }
@@ -236,7 +258,7 @@
         h('div', { className: 'chip', style: { width: 'fit-content' } }, refCat(block.ref)),
         schema.length === 0
           ? h('p', { className: 'hint', style: { fontSize: 12 } }, 'This block has no inputs.')
-          : schema.map((f) => h('div', { key: f.name },
+          : schema.map((f) => h('div', { key: block.uid + ':' + f.name },
               h(SchemaField, { field: f, value: (block.inputs || {})[f.name], onChange: (v) => setInput(block.uid, f.name, v) }),
               h('div', { style: { marginTop: 6, padding: '4px 8px', background: 'var(--inset)', borderRadius: 7 } },
                 h(Toggle, { label: 'Ask on deployment', on: (block.ask || []).includes(f.name), onChange: (on) => setAsk(block.uid, f.name, on) }))))));
@@ -283,7 +305,7 @@
         f.schema.map((fld, i) => h('div', { key: i, className: 'row', style: { gap: 6, marginBottom: 6 } },
           h('input', { className: 'input mono', style: { flex: 1 }, value: fld.name, placeholder: 'name', onChange: (e) => setField(i, 'name', e.target.value) }),
           h('select', { className: 'select', style: { width: 100 }, value: fld.type, onChange: (e) => setField(i, 'type', e.target.value) },
-            ['text', 'tags', 'bool', 'select', 'code', 'secret'].map((t) => h('option', { key: t, value: t }, t))),
+            ['text', 'tags', 'bool', 'select', 'code', 'secret', 'password'].map((t) => h('option', { key: t, value: t }, t))),
           h('input', { className: 'input mono', style: { flex: 1 }, value: fld.default == null ? '' : fld.default, placeholder: 'default', onChange: (e) => setField(i, 'default', e.target.value) }),
           h('button', { className: 'icon-btn danger', onClick: () => set('schema', f.schema.filter((_, j) => j !== i)) }, h(Icon, { name: 'trash', size: 14 })))),
         f.schema.length === 0 && h('div', { className: 'hint', style: { fontSize: 11.5 } }, 'No inputs — the block runs as-is.')));

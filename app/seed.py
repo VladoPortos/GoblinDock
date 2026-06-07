@@ -44,7 +44,7 @@ BUILTIN_BLOCKS = [
             {"name": "user", "type": "text", "default": "goblin", "label": "Username"},
             {"name": "public_key", "type": "secret", "default": "{{ secrets.TEAM_SSH_PUBKEY }}", "label": "Public key"},
             {"name": "sudo", "type": "bool", "default": True, "label": "Passwordless sudo"},
-            {"name": "password", "type": "secret", "default": "", "label": "Password · optional", "optional": True},
+            {"name": "password", "type": "password", "default": "", "label": "Password · optional", "optional": True},
             {"name": "ssh_password_login", "type": "bool", "default": False, "label": "Allow SSH password login"},
         ],
         ansible="- name: User & SSH Key\n  ansible.builtin.user:\n    name: {user}\n    groups: [sudo]\n    shell: /bin/bash",
@@ -104,7 +104,7 @@ BUILTIN_BLOCKS = [
             {"name": "user", "type": "text", "default": "deploy", "label": "Username"},
             {"name": "groups", "type": "tags", "default": ["sudo"], "label": "Groups"},
             {"name": "shell", "type": "text", "default": "/bin/bash", "label": "Login shell"},
-            {"name": "password", "type": "secret", "default": "", "label": "Password"},
+            {"name": "password", "type": "password", "default": "", "label": "Password"},
             {"name": "ssh_password_login", "type": "bool", "default": False, "label": "Allow SSH password login"},
         ],
         ansible=(

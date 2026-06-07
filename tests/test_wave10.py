@@ -400,8 +400,8 @@ def test_user_block_passwords():
         bu = blocks["b-user"]
         bs = blocks["b-ssh"]
         bu_schema = json.loads(bu.input_schema_json)
-        assert any(f["name"] == "password" and f["type"] == "secret" for f in bu_schema), \
-            "b-user must have a 'password' secret field"
+        assert any(f["name"] == "password" and f["type"] == "password" for f in bu_schema), \
+            "b-user must have a 'password' password field"
         assert any(f["name"] == "ssh_password_login" and f["type"] == "bool" for f in bu_schema), \
             "b-user must have ssh_password_login bool field"
         bs_schema = json.loads(bs.input_schema_json)
@@ -460,6 +460,63 @@ def test_seed_blocks_resync():
     print("test_seed_blocks_resync OK")
 
 
+def test_password_input_type():
+    import yaml as _yaml
+    from app import api
+    from app.models import Block, User
+    from app.recipes import compile_playbook, load_recipe
+    from app.seed import seed_blocks
+    from sqlmodel import select
+    seed_blocks()
+    with session_scope() as s:
+        blocks = {b.key: b for b in s.exec(select(Block)).all()}
+        bu_schema = json.loads(blocks["b-user"].input_schema_json)
+        assert next(f for f in bu_schema if f["name"] == "password")["type"] == "password"
+        bs_schema = json.loads(blocks["b-ssh"].input_schema_json)
+        pw = next(f for f in bs_schema if f["name"] == "password")
+        assert pw["type"] == "password" and pw.get("optional") is True
+
+    recipe = [{"id": "s-conf", "name": "Configure", "blocks": [
+        {"ref": "b-user", "name": "Create User",
+         "inputs": {"user": "deploy", "groups": ["sudo"], "shell": "/bin/bash",
+                    "password": "SuperSecret9", "ssh_password_login": False}},
+    ]}]
+    # preview endpoint masks the literal
+    uid = _mk_user("t10-pwmask@example.com")
+    with session_scope() as s:
+        user = s.get(User, uid)
+        out = api.compile_template(api.CompileBody(recipe=recipe, name="t"), user=user, session=s)
+    assert "SuperSecret9" not in out["yaml"], "preview must mask password literals"
+    assert "********" in out["yaml"]
+    # the real compile path (worker-side) still renders the actual value
+    with session_scope() as s:
+        blocks = {b.key: b for b in s.exec(select(Block)).all()}
+        play = compile_playbook(load_recipe(json.dumps(recipe)), blocks, "t")
+    assert "SuperSecret9" in play
+    # ask-flagged password must arrive non-empty at deploy
+    conn_id, base_id, net_id = _mk_conn_base_net()
+    from app.models import Template
+    rec2 = [{"id": "s-conf", "name": "Configure", "blocks": [
+        {"ref": "b-user", "name": "Create User",
+         "inputs": {"user": "deploy", "groups": ["sudo"], "shell": "/bin/bash",
+                    "password": "", "ssh_password_login": False}, "ask": ["password"]},
+    ]}]
+    with session_scope() as s:
+        t = Template(name="t10-pw-" + os.urandom(2).hex(), recipe_json=json.dumps(rec2),
+                     base_image_id=base_id, connection_id=conn_id, public=True)
+        s.add(t); s.flush(); tid = t.id
+    with session_scope() as s:
+        user = s.get(User, uid)
+        _expect_http(400, lambda: api.deploy(api.DeployBody(
+            templateId=tid, name="pw-vm", deployInputs={"0.0": {"password": ""}}),
+            user=user, session=s))
+        r = api.deploy(api.DeployBody(
+            templateId=tid, name="pw-vm2", deployInputs={"0.0": {"password": "Abc12345"}}),
+            user=user, session=s)
+        assert r["ok"]
+    print("test_password_input_type OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
@@ -472,4 +529,5 @@ if __name__ == "__main__":
     test_job_detail_waiting_for()
     test_user_block_passwords()
     test_seed_blocks_resync()
+    test_password_input_type()
     print("\nALL WAVE 10 UNIT TESTS PASSED")
