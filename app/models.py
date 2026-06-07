@@ -184,7 +184,7 @@ class Deployment(SQLModel, table=True):
 class Job(SQLModel, table=True):
     __tablename__ = "jobs"
     id: Optional[int] = Field(default=None, primary_key=True)
-    type: str = "deploy"   # deploy | image_build | rebuild | destroy
+    type: str = "deploy"   # deploy | rebuild | destroy
     title: str = ""
     deployment_id: Optional[int] = None
     image_id: Optional[int] = None

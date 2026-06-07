@@ -205,7 +205,7 @@ One Docker container, no external services:
 - **FastAPI + Uvicorn** — REST API, SSE job streams, WebSocket console proxies, and the
   static SPA.
 - **Worker** — a daemon thread that claims queued jobs from SQLite and drives Proxmox
-  (download/import, clone, cloud-init, ansible, lifecycle), writing step/log events.
+  (download/import, VM create, cloud-init, ansible, lifecycle), writing step/log events.
 - **SQLite (WAL)** — the *entire* data store **and** the job/event log. No Redis, no Postgres.
 - **SPA** — vendored React (`React.createElement`, no build step), CodeMirror (script
   editor), xterm.js + noVNC (consoles) — all served from `web/`, SRI-pinned.
@@ -215,7 +215,7 @@ backend:  app/*.py + app/routers/   (FastAPI app · threaded job worker · APSch
 frontend: web/{index.html,styles.css,*.js, vendor/}
 ```
 
-Proxmox work is **pure API** (download, import, clone, lifecycle, vnc/term proxy); a node
+Proxmox work is **pure API** (download, import, VM create, lifecycle, vnc/term proxy); a node
 **SSH key** is used only to drop cloud-init snippets. Without SSH the app still deploys —
 it falls back to native cloud-init.
 
@@ -283,7 +283,7 @@ it falls back to native cloud-init.
 GoblinDock went through a security + correctness review (independently verified end to
 end). Among the guarantees it now makes:
 
-- **Jobs fail loudly** — a failed Proxmox task (clone / import / start / destroy) fails
+- **Jobs fail loudly** — a failed Proxmox task (import / VM create / start / destroy) fails
   the job instead of being logged as success, so the DB never advances past a VM that
   wasn't actually created or destroyed.
 - **Per-target ceilings are enforced end-to-end** — requested vCPU / RAM / disk is clamped

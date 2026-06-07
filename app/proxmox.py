@@ -171,20 +171,6 @@ class Proxmox:
                 return vmid
         raise ProxmoxError(f"no free VMID in range {lo}-{hi}")
 
-    # ---- clone (deploy) -----------------------------------------------
-    def clone(
-        self, src_vmid: int, new_vmid: int, name: str, node: Optional[str] = None,
-        full: bool = True,
-    ) -> str:
-        node = node or self.pick_node()
-        guard_vmid(src_vmid)
-        guard_vmid(new_vmid)
-        return (
-            self.api.nodes(node)
-            .qemu(src_vmid)
-            .clone.post(newid=new_vmid, name=name, full=1 if full else 0)
-        )
-
     def set_config(self, vmid: int, node: Optional[str] = None, **params) -> None:
         guard_vmid(vmid)
         self.api.nodes(node or self.pick_node()).qemu(vmid).config.post(**params)
@@ -193,11 +179,7 @@ class Proxmox:
         guard_vmid(vmid)
         self.api.nodes(node or self.pick_node()).qemu(vmid).resize.put(disk=disk, size=size)
 
-    def templatize(self, vmid: int, node: Optional[str] = None) -> None:
-        guard_vmid(vmid)
-        self.api.nodes(node or self.pick_node()).qemu(vmid).template.post()
-
-    # ---- golden image build -------------------------------------------
+    # ---- base image download / import helpers -------------------------
     def download_url(
         self, filename: str, url: str, node: Optional[str] = None,
         checksum: str = "", checksum_algorithm: str = "",

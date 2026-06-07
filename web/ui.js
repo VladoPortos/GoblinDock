@@ -217,7 +217,7 @@
       children, dropdown);
   }
 
-  // ---- ask-on-deploy helpers (shared by the quick-deploy modal + deploy page) ----
+  // ---- ask-on-deploy helpers (shared by the Deploy modal and anything that prompts for template inputs) ----
   function collectAsks(tpl) {
     const GDx = window.GD;
     const asks = [];

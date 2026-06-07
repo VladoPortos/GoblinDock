@@ -99,7 +99,7 @@ window.API = (function () {
     editImage: (id, p) => req('PUT', `/api/images/${id}`, p),
     deleteImage: (id) => req('DELETE', `/api/images/${id}`),
 
-    // templates (deployment presets: golden image + blocks + defaults)
+    // templates (deployment presets: base image + blocks + defaults)
     saveTemplate: (p) => req('POST', '/api/templates', p),
     editTemplate: (id, p) => req('PUT', `/api/templates/${id}`, p),
     deleteTemplate: (id) => req('DELETE', `/api/templates/${id}`),

@@ -435,8 +435,8 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         "serial0": "socket",   # serial console (xterm); Ubuntu cloud images use ttyS0
         "vga": "std",          # real VGA framebuffer so the GRAPHICAL console = the display
     }
-    # Apply the chosen network's bridge + VLAN tag (the clone otherwise inherits the
-    # template's net0) and DNS, so the operator-configured network is actually honoured
+    # Apply the chosen network's bridge + VLAN tag (the imported VM otherwise keeps the
+    # create-time net0) and DNS, so the operator-configured network is actually honoured
     # rather than silently dropped. NOTE: exercise on real Proxmox hardware.
     _bridge = cfg.get("bridge")
     if _bridge:
