@@ -160,7 +160,12 @@
     const gold = (GD.GOLDEN_IMAGES || []).find((g) => g.imgId === tpl.goldenImageId) || {};
     const net = (GD.NETWORKS || []).find((n) => n.netId === tpl.networkId);
     const asks = collectAsks(tpl);
-    const [name, setName] = useState('gd-' + ((GD.VMS || []).length + 1));
+    const [name, setName] = useState(() => {
+      const used = new Set((GD.VMS || []).map((v) => v.name));
+      let n = (GD.VMS || []).length + 1;
+      while (used.has('gd-' + n)) n++;
+      return 'gd-' + n;
+    });
     const [answers, setAnswers] = useState(() => initAskAnswers(asks));
     const [busy, setBusy] = useState(false);
     const busyRef = React.useRef(false);

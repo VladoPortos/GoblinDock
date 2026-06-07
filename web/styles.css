@@ -530,6 +530,7 @@ a { color: var(--accent); text-decoration: none; }
   border-right: 1px solid var(--border-soft); transition: background .1s, color .1s; }
 .card-act:last-child { border-right: none; }
 .card-act:hover { background: var(--surface-2); color: var(--text); }
+.card-act:disabled { opacity: .4; cursor: not-allowed; pointer-events: none; }
 
 /* login */
 .login-stage { height: 100%; display: grid; place-items: center; position: relative;

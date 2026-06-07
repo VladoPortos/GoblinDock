@@ -52,7 +52,12 @@
     const [cpu, setCpu] = useState(maxCpu);
     const [mem, setMem] = useState(maxMem);
     const [disk, setDisk] = useState(Math.min(20, maxDisk));
-    const [name, setName] = useState('gd-' + ((GD.VMS || []).length + 1));
+    const [name, setName] = useState(() => {
+      const used = new Set((GD.VMS || []).map((v) => v.name));
+      let n = (GD.VMS || []).length + 1;
+      while (used.has('gd-' + n)) n++;
+      return 'gd-' + n;
+    });
     const [tags, setTags] = useState('');
     const [busy, setBusy] = useState(false);
     const busyRef = React.useRef(false);
