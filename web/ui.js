@@ -198,7 +198,9 @@
           ? React.createElement('div', { key: i, className: 'divider', style: { margin: '5px 4px' } })
           : React.createElement('button', {
               key: i, className: 'menu-item' + (it.danger ? ' danger' : ''),
-              onClick: (e) => { e.stopPropagation(); setOpen(false); it.onClick && it.onClick(); },
+              disabled: !!it.disabled,
+              title: it.title || null,
+              onClick: (e) => { e.stopPropagation(); if (it.disabled) return; setOpen(false); it.onClick && it.onClick(); },
               style: {
                 display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left',
                 padding: '8px 9px', borderRadius: 7, border: 'none', cursor: 'pointer',

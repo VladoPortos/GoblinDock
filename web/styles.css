@@ -538,3 +538,6 @@ a { color: var(--accent); text-decoration: none; }
 .login-card { width: min(380px, 92vw); padding: 34px 32px; border-radius: 18px;
   background: var(--surface); border: 1px solid var(--border); box-shadow: var(--shadow-lg); }
 .login-logo { width: 92px; height: 92px; object-fit: contain; display: block; margin: 0 auto 10px; filter: drop-shadow(0 4px 14px rgba(0,0,0,.35)); }
+
+/* menu item disabled state */
+.menu-item:disabled { opacity: .4; cursor: not-allowed; }

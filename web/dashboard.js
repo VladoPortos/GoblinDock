@@ -168,7 +168,7 @@
     const [q, setQ] = useState('');
     const [confirm, setConfirm] = useState(null);
     const [edit, setEdit] = useState(null);
-    const [deploying, setDeploying] = React.useState(false);
+    const [deploying, setDeploying] = useState(false);
     const [sel, setSel] = useState(() => new Set());
     const [bulkBusy, setBulkBusy] = useState(false);
     const [bulkDel, setBulkDel] = useState(false);
