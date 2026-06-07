@@ -133,15 +133,19 @@ class Image(SQLModel, table=True):
     built_at: Optional[datetime] = None
 
 
-class Recipe(SQLModel, table=True):
-    """A named, reusable RUNTIME customization (lego blocks) applied on top of a
-    deployed VM — independent of any golden image. e.g. 'MySQL', 'k8s-node'."""
-    __tablename__ = "recipes"
+class Template(SQLModel, table=True):
+    """A named, reusable DEPLOYMENT PRESET: a golden image + runtime blocks +
+    size/network defaults. Deploying clones the golden image and applies the
+    blocks; per-block inputs can be flagged ask-on-deploy inside recipe_json
+    (block key ``ask: ["inputName"]``). Evolved from the v1 Recipe."""
+    __tablename__ = "templates"
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(index=True)
     description: str = ""
     os_family: str = "ubuntu"
     recipe_json: str = "[]"
+    golden_image_id: Optional[int] = None   # images.id (kind=golden) — nullable
+    network_id: Optional[int] = None        # default network for one-click deploy
     default_cpu: int = 1
     default_ram: int = 2       # GB
     default_disk: int = 20     # GB
@@ -157,7 +161,10 @@ class Deployment(SQLModel, table=True):
     owner_id: Optional[int] = None
     connection_id: Optional[int] = None
     image_id: Optional[int] = None        # the golden image deployed from
-    recipe_id: Optional[int] = None       # optional runtime recipe applied on top
+    template_id: Optional[int] = None     # optional template applied on top
+    # ask-on-deploy answers, {"<si>.<bi>": {"<input>": value}} — kept on the row
+    # (not just the job) so a VM rebuild re-applies them.
+    deploy_inputs_json: str = "{}"
     vmid: Optional[int] = None
     node: str = ""
     network_id: Optional[int] = None

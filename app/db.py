@@ -45,8 +45,33 @@ def init_db() -> None:
     # Import models so they register with SQLModel.metadata before create_all.
     from . import models  # noqa: F401
 
+    _rename_legacy()   # MUST run before create_all — see docstring
     SQLModel.metadata.create_all(engine)
     _migrate()
+
+
+def _rename_legacy() -> None:
+    """recipes→templates rename (2026-06 templates rework). Must run BEFORE
+    create_all: otherwise create_all sees no `templates` table, creates an empty
+    one, and the populated legacy `recipes` table is orphaned next to it."""
+    import logging
+    log = logging.getLogger("goblindock")
+    with engine.begin() as conn:
+        tables = {r[0] for r in conn.exec_driver_sql(
+            "SELECT name FROM sqlite_master WHERE type='table'")}
+        if "recipes" in tables and "templates" not in tables:
+            conn.exec_driver_sql("ALTER TABLE recipes RENAME TO templates")
+            log.info("migrated: table recipes → templates")
+        if "deployments" in tables:
+            cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(deployments)")}
+            if "recipe_id" in cols and "template_id" not in cols:
+                try:  # RENAME COLUMN needs SQLite >= 3.25 — warn loudly if absent
+                    conn.exec_driver_sql(
+                        "ALTER TABLE deployments RENAME COLUMN recipe_id TO template_id")
+                    log.info("migrated: deployments.recipe_id → template_id")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("could not rename deployments.recipe_id — applied "
+                                "templates will not resolve on upgraded DBs: %s", e)
 
 
 def _migrate() -> None:
@@ -73,6 +98,13 @@ def _migrate() -> None:
             ("widget_key_prefix", "TEXT NOT NULL DEFAULT ''"),
             ("widget_key_created_at", "TIMESTAMP"),
             ("widget_key_last_used", "TIMESTAMP"),
+        ],
+        "templates": [
+            ("golden_image_id", "INTEGER"),
+            ("network_id", "INTEGER"),
+        ],
+        "deployments": [
+            ("deploy_inputs_json", "TEXT NOT NULL DEFAULT '{}'"),
         ],
     }
     # Columns REMOVED from the models (2026-06 dead-code cleanup). They must be
@@ -121,6 +153,11 @@ def _migrate() -> None:
         conn.exec_driver_sql(
             "CREATE INDEX IF NOT EXISTS ix_users_widget_key_hash "
             "ON users(widget_key_hash)"
+        )
+        # The renamed table keeps its old auto-index names; match the model's
+        # index=True on templates.name for upgraded DBs.
+        conn.exec_driver_sql(
+            "CREATE INDEX IF NOT EXISTS ix_templates_name ON templates(name)"
         )
         # Backstop the static-IP allocator against a duplicate (network_id, ip) — a
         # second concurrent reservation of the same address fails at the DB rather than

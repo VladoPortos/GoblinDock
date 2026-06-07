@@ -9,7 +9,7 @@ from sqlmodel import select
 
 from .config import settings
 from .db import session_scope
-from .models import Block, Connection, Image, Network, Recipe, User
+from .models import Block, Connection, Image, Network, Template, User
 from .security import encrypt, hash_password
 
 UBUNTU_2404_URL = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
@@ -626,7 +626,7 @@ def maybe_seed_proxmox() -> None:
 def seed_recipes() -> None:
     """A public starter recipe so AI dev boxes are one click away."""
     with session_scope() as s:
-        if s.exec(select(Recipe).where(Recipe.name == "AI Dev Box")).first():
+        if s.exec(select(Template).where(Template.name == "AI Dev Box")).first():
             return
         recipe = [
             {"id": "s-inst", "name": "Install", "blocks": [
@@ -641,7 +641,7 @@ def seed_recipes() -> None:
                 }},
             ]},
         ]
-        s.add(Recipe(
+        s.add(Template(
             name="AI Dev Box",
             description="Node.js + Claude Code + OpenAI Codex + a global CLAUDE.md — a ready-to-code box.",
             os_family="ubuntu", recipe_json=json.dumps(recipe),

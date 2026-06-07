@@ -62,12 +62,12 @@ def test_checksum_algo():
 
 
 def test_disk_bounds():
-    from app.api import DeployBody, GoldenBody, RecipeBody
+    from app.api import DeployBody, GoldenBody, TemplateBody
     from pydantic import ValidationError
     # valid
     DeployBody(goldenImageId=1, disk=20, cpu=2, ram=4)
     GoldenBody(name="img", disk=40)
-    RecipeBody(name="r", disk=10)
+    TemplateBody(name="r", disk=10)
     # negative / zero / absurd rejected
     for kwargs in ({"goldenImageId": 1, "disk": -5}, {"goldenImageId": 1, "disk": 0},
                    {"goldenImageId": 1, "disk": 999999}, {"goldenImageId": 1, "cpu": 0},

@@ -33,7 +33,7 @@ from .models import (
     Job,
     JobEvent,
     Network,
-    Recipe,
+    Template,
     Secret,
     Variable,
     User,
@@ -400,7 +400,7 @@ def state(request: Request, user: User = Depends(current_user), session: Session
 
     base = [S.base_image_dict(i) for i in session.exec(select(Image).where(Image.kind == "base")).all()]
     golden = [S.golden_image_dict(session, i) for i in session.exec(select(Image).where(Image.kind == "golden").order_by(Image.id.desc())).all()]
-    rcs = session.exec(select(Recipe).order_by(Recipe.id)).all()
+    rcs = session.exec(select(Template).order_by(Template.id)).all()
     if user.role != "admin":
         rcs = [r for r in rcs if r.public or r.owner_id == user.id]
     recipes = [S.recipe_dict(session, r) for r in rcs]
@@ -548,7 +548,7 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
     if not conn:
         raise HTTPException(400, "no Proxmox connection configured")
 
-    rc = session.get(Recipe, body.recipeId) if body.recipeId else None
+    rc = session.get(Template, body.recipeId) if body.recipeId else None
     if body.recipeId and not rc:
         raise HTTPException(404, "recipe not found")
     # Only a public recipe, your own, or (admin) any may be applied — a private recipe
@@ -573,7 +573,7 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
         net = default_network_for(session, conn, user.id)
 
     dep = Deployment(name=name, owner_id=user.id, connection_id=conn.id,
-                     image_id=img.id, recipe_id=(rc.id if rc else None), cpu=cpu, ram=ram,
+                     image_id=img.id, template_id=(rc.id if rc else None), cpu=cpu, ram=ram,
                      disk=disk, status="working", node=img.node or conn.node,
                      network_id=net.id, tags=body.tags, notes=body.notes)
     session.add(dep)
@@ -694,7 +694,7 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         raise HTTPException(403, "not your VM")
     conn = session.get(Connection, dep.connection_id)
     img = session.get(Image, dep.image_id) if dep.image_id else None
-    rc = session.get(Recipe, dep.recipe_id) if dep.recipe_id else None
+    rc = session.get(Template, dep.template_id) if dep.template_id else None
     owner = session.get(User, dep.owner_id) if dep.owner_id else None
     job = session.exec(select(Job).where(Job.deployment_id == dep.id).order_by(Job.id.desc())).first()
     out = {
@@ -1055,7 +1055,7 @@ def rebuild_golden(img_id: int, user: User = Depends(current_user), session: Ses
 # --------------------------------------------------------------------------- #
 # templates + recipes                                                          #
 # --------------------------------------------------------------------------- #
-class RecipeBody(BaseModel):
+class TemplateBody(BaseModel):
     name: str
     description: str = ""
     os_family: str = "ubuntu"
@@ -1067,8 +1067,8 @@ class RecipeBody(BaseModel):
 
 
 @router.post("/recipes")
-def save_recipe(body: RecipeBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    rc = Recipe(name=body.name.strip() or "recipe", description=body.description,
+def save_recipe(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    rc = Template(name=body.name.strip() or "recipe", description=body.description,
                 os_family=body.os_family, recipe_json=json.dumps(body.recipe or []),
                 default_cpu=min(body.cpu, settings.max_cores),
                 default_ram=min(body.ram, settings.max_ram_mb // 1024),
@@ -1079,13 +1079,13 @@ def save_recipe(body: RecipeBody, user: User = Depends(current_user), session: S
     return {"ok": True}
 
 
-def _recipe_owned(rc: Recipe, user: User) -> bool:
+def _recipe_owned(rc: Template, user: User) -> bool:
     return user.role == "admin" or rc.owner_id == user.id
 
 
 @router.put("/recipes/{rid}")
-def edit_recipe_ep(rid: int, body: RecipeBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    rc = session.get(Recipe, rid)
+def edit_recipe_ep(rid: int, body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    rc = session.get(Template, rid)
     if not rc:
         raise HTTPException(404, "not found")
     if not _recipe_owned(rc, user):
@@ -1105,7 +1105,7 @@ def edit_recipe_ep(rid: int, body: RecipeBody, user: User = Depends(current_user
 
 @router.delete("/recipes/{rid}")
 def delete_recipe_ep(rid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    rc = session.get(Recipe, rid)
+    rc = session.get(Template, rid)
     if not rc:
         raise HTTPException(404, "not found")
     if not _recipe_owned(rc, user):

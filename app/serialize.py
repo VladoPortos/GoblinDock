@@ -22,7 +22,7 @@ from .models import (
     JobEvent,
     JobStep,
     Network,
-    Recipe,
+    Template,
     Secret,
     Variable,
     User,
@@ -110,8 +110,8 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         if img:
             os_family = img.os_family
             image_name = img.name
-    if dep.recipe_id:
-        rc = session.get(Recipe, dep.recipe_id)
+    if dep.template_id:
+        rc = session.get(Template, dep.template_id)
         if rc:
             recipe_name = rc.name
 
@@ -272,8 +272,8 @@ def base_image_dict(img: Image) -> dict:
     }
 
 
-def recipe_dict(session: Session, rc: Recipe) -> dict:
-    used = session.exec(select(Deployment).where(Deployment.recipe_id == rc.id)).all()
+def recipe_dict(session: Session, rc: Template) -> dict:
+    used = session.exec(select(Deployment).where(Deployment.template_id == rc.id)).all()
     recipe = json.loads(rc.recipe_json or "[]")
     return {
         "id": f"r-{rc.id}",

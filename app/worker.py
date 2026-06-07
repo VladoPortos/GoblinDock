@@ -29,7 +29,7 @@ from .models import (
     Job,
     JobEvent,
     JobStep,
-    Recipe,
+    Template,
     Secret,
     Variable,
     utcnow,
@@ -437,7 +437,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
     # The optional RUNTIME recipe (applied on top of every deploy). Split into the
     # first-boot (cloud-init) part and the post-boot (ansible) part.
     with session_scope() as s:
-        rc = s.get(Recipe, dep.recipe_id) if dep.recipe_id else None
+        rc = s.get(Template, dep.template_id) if dep.template_id else None
         recipe_json = rc.recipe_json if rc else "[]"
     recipe = load_recipe(recipe_json)
     recipe_cmds = compile_cloudinit(recipe, _blocks_by_key(), _secret_lookup_factory(job.created_by)) if recipe else []
