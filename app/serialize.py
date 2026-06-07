@@ -288,6 +288,8 @@ def template_dict(session: Session, t: Template) -> dict:
         "public": t.public,
         "blocks": recipe_block_chips(recipe),
         "recipe": recipe,
+        "goldenImageId": t.golden_image_id,
+        "networkId": t.network_id,
     }
 
 

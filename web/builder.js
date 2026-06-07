@@ -207,6 +207,8 @@
         h('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 14 } },
           h(SpecField, { icon: 'tag', label: mode === 'golden' ? 'Image name' : 'Template name' },
             h(Field, { value: meta.name, onChange: meta.setName, mono: true })),
+          mode === 'template' && h(SpecField, { icon: 'info', label: 'Description' },
+            h(TextArea, { value: meta.desc, onChange: meta.setDesc, rows: 2 })),
           meta.imageSelect && h(SpecField, { icon: meta.imageSelect.icon || 'disk', label: meta.imageSelect.label },
             h(SelectField, { value: meta.imageSelect.value || '', onChange: (v) => meta.imageSelect.set(Number(v) || null), options: meta.imageSelect.options })),
           meta.locationSelect && h(SpecField, { icon: meta.locationSelect.icon || 'server', label: meta.locationSelect.label },
@@ -328,6 +330,10 @@
     // golden-mode: base + location (which Proxmox + node)
     const [selBaseId, setSelBaseId] = useState(loadedImg ? null : (firstBase.imgId || null));
     const [selConnId, setSelConnId] = useState(loadedImg ? loadedImg.connId : ((conns[0] && conns[0].connId) || null));
+    const [selGoldenId, setSelGoldenId] = useState(
+      mode === 'template' ? (loadedTpl ? loadedTpl.goldenImageId : (nav.goldenImageId || null)) : null);
+    const [selNetId, setSelNetId] = useState(mode === 'template' && loadedTpl ? loadedTpl.networkId : null);
+    const [desc, setDesc] = useState(mode === 'template' && loadedTpl ? (loadedTpl.desc || '') : '');
     const selBase = bases.find((b) => b.imgId === selBaseId) || firstBase;
     const selConn = conns.find((c) => c.connId === selConnId) || conns[0] || {};
 
@@ -342,11 +348,23 @@
           options: conns.map((c) => ({ value: c.connId, label: c.name + ' · ' + (c.node || 'auto') })) };
       }
     } else {
-      metaBase = ''; metaOs = loadedTpl ? loadedTpl.os : 'ubuntu';
+      const goldens = (GD.GOLDEN_IMAGES || []).filter((g) => g.deployable);
+      const selGold = goldens.find((g) => g.imgId === selGoldenId) || null;
+      metaBase = selGold ? selGold.name : ''; metaOs = selGold ? selGold.os : (loadedTpl ? loadedTpl.os : 'ubuntu');
+      imageSelect = { label: 'Golden image', icon: 'package', value: selGoldenId, set: (v) => { setSelGoldenId(v); setSelNetId(null); },
+        options: [{ value: '', label: '— pick an image to enable deploy —' },
+          ...goldens.map((g) => ({ value: g.imgId, label: g.name + ' · ' + (g.location || '') }))] };
+      const tplNets = selGold ? (GD.NETWORKS || []).filter((n) => n.connId === selGold.connId) : [];
+      if (selGold) {
+        locationSelect = { label: 'Network', icon: 'network', value: selNetId, set: setSelNetId,
+          options: [{ value: '', label: 'Connection default' },
+            ...tplNets.map((n) => ({ value: n.netId, label: n.name + ' · ' + n.mode }))] };
+      }
     }
     const meta = {
       name: recipeName, setName: setRecipeName, base: metaBase, os: metaOs,
       cpu, setCpu, mem, setMem, disk, setDisk, imageSelect, locationSelect,
+      desc, setDesc,
     };
 
     const recipePayload = () => sections.map((s) => ({
@@ -404,10 +422,10 @@
           });
           go('job', { jobId: r.jobId });
         } else if (loadedTpl) {
-          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public });
+          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public, goldenImageId: selGoldenId || null, networkId: selNetId || null });
           window.GDStore.toast('Template updated', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         } else {
-          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk) });
+          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), goldenImageId: selGoldenId || null, networkId: selNetId || null });
           window.GDStore.toast('Template saved', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         }
       } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); setBusy(false); busyRef.current = false; }
