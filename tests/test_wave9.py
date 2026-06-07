@@ -231,10 +231,70 @@ def test_ask_map_and_merge():
     print("test_ask_map_and_merge OK")
 
 
+def _mk_template(img_id, net_id=None, owner=None, public=True, ask=True):
+    from app.models import Template
+    recipe = [{"id": "s-os", "name": "OS Setup", "blocks": [
+        {"ref": "b-hostname", "name": "Set Hostname",
+         "inputs": {"hostname": ""}, **({"ask": ["hostname"]} if ask else {})},
+    ]}]
+    with session_scope() as s:
+        t = Template(name="t-" + os.urandom(3).hex(), recipe_json=json.dumps(recipe),
+                     golden_image_id=img_id, network_id=net_id,
+                     owner_id=owner, public=public)
+        s.add(t); s.flush()
+        return t.id
+
+
+def test_deploy_with_inputs():
+    from app import api
+    from app.models import Deployment, User
+    from app.seed import seed_blocks
+    from sqlmodel import select
+    seed_blocks()  # b-hostname schema must exist for type checks
+    uid = _mk_user("deployer@example.com")
+    conn_id, img_id, net_id = _mk_conn_golden_net()
+    tid = _mk_template(img_id, net_id)
+
+    def _deploy(**kw):
+        body = api.DeployBody(goldenImageId=img_id, **kw)
+        with session_scope() as s:
+            return api.deploy(body, user=s.get(User, uid), session=s)
+
+    # happy path: answer persists on the deployment row
+    r = _deploy(templateId=tid, name="vm-a",
+                deployInputs={"0.0": {"hostname": "my-host"}})
+    assert r["ok"]
+    with session_scope() as s:
+        d = s.exec(select(Deployment).where(Deployment.name == "vm-a")).first()
+        assert d.template_id == tid
+        assert json.loads(d.deploy_inputs_json) == {"0.0": {"hostname": "my-host"}}
+
+    # ask-flagged text input left unanswered → 400 (stored default is empty)
+    _expect_http(400, lambda: _deploy(templateId=tid, name="vm-b", deployInputs={}))
+    # non-ask input override → 400
+    _expect_http(400, lambda: _deploy(templateId=tid, name="vm-c",
+                 deployInputs={"0.0": {"hostname": "h", "evil": "x"}}))
+    # unknown address → 400
+    _expect_http(400, lambda: _deploy(templateId=tid, name="vm-d",
+                 deployInputs={"5.0": {"hostname": "h"}}))
+    # deployInputs without a template → 400
+    _expect_http(400, lambda: _deploy(name="vm-e", deployInputs={"0.0": {"hostname": "h"}}))
+    # wrong value type → 400
+    _expect_http(400, lambda: _deploy(templateId=tid, name="vm-f",
+                 deployInputs={"0.0": {"hostname": ["not", "a", "string"]}}))
+    # someone else's PRIVATE template → 404 (no id enumeration)
+    other = _mk_user("other@example.com")
+    priv = _mk_template(img_id, owner=other, public=False)
+    _expect_http(404, lambda: _deploy(templateId=priv, name="vm-g",
+                 deployInputs={"0.0": {"hostname": "h"}}))
+    print("test_deploy_with_inputs OK")
+
+
 if __name__ == "__main__":
     test_migration_renames_and_extends()
     test_migration_idempotent()
     test_template_crud_with_refs()
     test_template_edit_refs()
     test_ask_map_and_merge()
+    test_deploy_with_inputs()
     print("\nALL WAVE 9 UNIT TESTS PASSED")

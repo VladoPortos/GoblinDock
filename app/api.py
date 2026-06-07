@@ -40,7 +40,7 @@ from .models import (
     utcnow,
 )
 from .proxmox import Proxmox
-from .recipes import compile_playbook, lint_block
+from .recipes import ask_map, compile_playbook, lint_block, load_recipe
 from . import backup
 from .security import (
     encrypt,
@@ -516,6 +516,7 @@ def widget_summary(user: User = Depends(widget_key_user),
 class DeployBody(BaseModel):
     goldenImageId: int                 # the golden image to clone from
     templateId: Optional[int] = None  # optional template applied on top
+    deployInputs: dict = {}            # {"<si>.<bi>": {"<input>": value}} for ask-flagged inputs
     connectionId: Optional[int] = None
     networkId: Optional[int] = None
     name: Optional[str] = None
@@ -524,6 +525,59 @@ class DeployBody(BaseModel):
     disk: int = Field(default=20, ge=1, le=16384)     # GB
     tags: str = ""
     notes: str = ""
+
+
+def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> str:
+    """Validate ask-on-deploy answers against the template. Only inputs the
+    template flags `ask` may be overridden (tamper-proof); ask-flagged
+    text/secret inputs MUST end up non-empty (answer or stored value).
+    Returns canonical JSON to persist on the deployment."""
+    recipe = load_recipe(tpl.recipe_json)
+    allowed = ask_map(recipe)
+    supplied = supplied or {}
+    for addr in supplied:
+        if addr not in allowed:
+            raise HTTPException(400, f"deployInputs: unknown block address {addr!r}")
+    blocks = {b.key: b for b in session.exec(select(Block)).all()}
+    cleaned: dict[str, dict] = {}
+    for addr, names in allowed.items():
+        si, bi = (int(x) for x in addr.split("."))
+        placed = recipe[si]["blocks"][bi]
+        blk = blocks.get(placed.get("ref"))
+        try:
+            schema = json.loads(blk.input_schema_json or "[]") if blk else []
+        except (json.JSONDecodeError, TypeError):
+            schema = []
+        ftypes = {f.get("name"): f.get("type", "text") for f in schema if isinstance(f, dict)}
+        answers = supplied.get(addr) or {}
+        if not isinstance(answers, dict):
+            raise HTTPException(400, f"deployInputs: {addr!r} must be an object")
+        for name in answers:
+            if name not in names:
+                raise HTTPException(400, f"deployInputs: {name!r} is not ask-on-deploy")
+        out = {}
+        for name in names:
+            if name not in ftypes:
+                continue  # ask references an input the block no longer has — ignore
+            ftype = ftypes.get(name, "text")
+            if name in answers:
+                v = answers[name]
+                if ftype == "bool" and not isinstance(v, bool):
+                    raise HTTPException(400, f"deployInputs: {name!r} must be a boolean")
+                if ftype == "tags" and not isinstance(v, list):
+                    raise HTTPException(400, f"deployInputs: {name!r} must be a list")
+                if ftype not in ("bool", "tags") and not isinstance(v, str):
+                    raise HTTPException(400, f"deployInputs: {name!r} must be a string")
+                out[name] = v
+            if ftype in ("text", "secret") and not str(out.get(name) or "").strip():
+                # fall back to the template's stored value before failing
+                stored = (placed.get("inputs") or {}).get(name)
+                if stored and str(stored).strip():
+                    continue
+                raise HTTPException(400, f"template requires input {name!r}")
+        if out:
+            cleaned[addr] = out
+    return json.dumps(cleaned)
 
 
 def _auto_name(session: Session, base: str = "gd") -> str:
@@ -556,6 +610,10 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
     if tpl and not (tpl.public or tpl.owner_id == user.id or user.role == "admin"):
         raise HTTPException(404, "template not found")
 
+    if body.deployInputs and not tpl:
+        raise HTTPException(400, "deployInputs requires templateId")
+    deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs) if tpl else "{}"
+
     # Cap to the target connection's per-VM ceilings (0 = inherit the global default).
     eff_cores = conn.max_cores or settings.max_cores
     eff_ram_mb = conn.max_ram_mb or settings.max_ram_mb
@@ -575,7 +633,8 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
     dep = Deployment(name=name, owner_id=user.id, connection_id=conn.id,
                      image_id=img.id, template_id=(tpl.id if tpl else None), cpu=cpu, ram=ram,
                      disk=disk, status="working", node=img.node or conn.node,
-                     network_id=net.id, tags=body.tags, notes=body.notes)
+                     network_id=net.id, tags=body.tags, notes=body.notes,
+                     deploy_inputs_json=deploy_inputs_json)
     session.add(dep)
     session.commit()
     session.refresh(dep)

@@ -45,6 +45,7 @@ from .recipes import (
     compile_cloudinit,
     has_ansible_blocks,
     load_recipe,
+    merge_deploy_inputs,
 )
 from .security import decrypt, encrypt
 
@@ -434,12 +435,19 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         params["net0"] = _net0
     if cfg.get("dns"):
         params["nameserver"] = cfg["dns"]
-    # The optional RUNTIME recipe (applied on top of every deploy). Split into the
-    # first-boot (cloud-init) part and the post-boot (ansible) part.
+    # The optional template (applied on top of every deploy). Split into the
+    # first-boot (cloud-init) part and the post-boot (ansible) part. Ask-on-deploy
+    # answers live on the deployment row so a REBUILD re-applies them too.
     with session_scope() as s:
-        rc = s.get(Template, dep.template_id) if dep.template_id else None
-        recipe_json = rc.recipe_json if rc else "[]"
+        tpl = s.get(Template, dep.template_id) if dep.template_id else None
+        recipe_json = tpl.recipe_json if tpl else "[]"
     recipe = load_recipe(recipe_json)
+    try:
+        overrides = json.loads(dep.deploy_inputs_json or "{}")
+    except (json.JSONDecodeError, TypeError):
+        overrides = {}
+    if recipe and overrides:
+        recipe = merge_deploy_inputs(recipe, overrides)
     recipe_cmds = compile_cloudinit(recipe, _blocks_by_key(), _secret_lookup_factory(job.created_by)) if recipe else []
 
     used_snippet = False
