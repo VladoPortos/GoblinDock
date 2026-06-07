@@ -154,6 +154,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         "os": os_family,
         "image": image_name or "—",
         "template": template_name or image_name or "—",
+        "templateId": dep.template_id,
         "cpu": cpu_pct,
         "ram": ram_pct,
         "uptime": uptime,
@@ -200,9 +201,8 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
     status_map = {"running": "working", "queued": "working", "succeeded": "done",
                   "failed": "error", "canceled": "error"}
     phase_sets = {
-        "deploy": ["Allocate", "Clone", "Configure", "Boot"],
-        "rebuild": ["Destroy", "Allocate", "Clone", "Configure", "Boot"],
-        "image_build": ["Acquire", "Download", "Import", "Finalize"],
+        "deploy": ["Allocate", "Prepare image", "Create", "Configure", "Boot"],
+        "rebuild": ["Destroy", "Allocate", "Prepare image", "Create", "Configure", "Boot"],
         "destroy": ["Stop", "Destroy"],
     }
     phases = phase_sets.get(job.type, ["Start", "Run", "Finish"])

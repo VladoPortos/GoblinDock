@@ -514,15 +514,12 @@ def widget_summary(user: User = Depends(widget_key_user),
 # deployments (VMs)                                                            #
 # --------------------------------------------------------------------------- #
 class DeployBody(BaseModel):
-    goldenImageId: int                 # the golden image to clone from
-    templateId: Optional[int] = None  # optional template applied on top
+    templateId: int                    # the template to deploy from (required)
     deployInputs: dict = {}            # {"<si>.<bi>": {"<input>": value}} for ask-flagged inputs
-    connectionId: Optional[int] = None
-    networkId: Optional[int] = None
     name: Optional[str] = None
-    cpu: int = Field(default=1, ge=1, le=256)
-    ram: int = Field(default=2, ge=1, le=1024)        # GB
-    disk: int = Field(default=20, ge=1, le=16384)     # GB
+    cpu: Optional[int] = Field(default=None, ge=1, le=256)     # None → template default
+    ram: Optional[int] = Field(default=None, ge=1, le=1024)    # GB
+    disk: Optional[int] = Field(default=None, ge=1, le=16384)  # GB
     tags: str = ""
     notes: str = ""
 
@@ -592,57 +589,45 @@ def _auto_name(session: Session, base: str = "gd") -> str:
 @router.post("/deployments")
 def deploy(body: DeployBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     _enforce_quota(session, user, "vm")
-    img = session.get(Image, body.goldenImageId)
-    if not img or img.kind != "golden" or not img.template_vmid:
-        raise HTTPException(400, "pick a built golden image to deploy from")
-
-    # the golden template lives on a specific Proxmox — deploy there
-    conn = session.get(Connection, img.connection_id) if img.connection_id else None
-    if not conn:
-        conn = session.exec(select(Connection)).first()
-    if not conn:
-        raise HTTPException(400, "no Proxmox connection configured")
-
-    tpl = session.get(Template, body.templateId) if body.templateId else None
-    if body.templateId and not tpl:
+    tpl = session.get(Template, body.templateId)
+    if not tpl or not (tpl.public or tpl.owner_id == user.id or user.role == "admin"):
         raise HTTPException(404, "template not found")
-    # Only a public template, your own, or (admin) any may be applied — a private template
-    # must not be usable by id. 404 (not 403) so ids can't be enumerated.
-    if tpl and not (tpl.public or tpl.owner_id == user.id or user.role == "admin"):
-        raise HTTPException(404, "template not found")
+    base = session.get(Image, tpl.base_image_id) if tpl.base_image_id else None
+    if not base or base.kind != "base":
+        raise HTTPException(400, "template has no base image — edit it first")
+    conn = session.get(Connection, tpl.connection_id) if tpl.connection_id else None
+    if not conn:
+        raise HTTPException(400, "template has no location — edit it and pick a Proxmox connection")
 
-    if body.deployInputs and not tpl:
-        raise HTTPException(400, "deployInputs requires templateId")
-    deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs) if tpl else "{}"
+    deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs)
 
-    # Cap to the target connection's per-VM ceilings (0 = inherit the global default).
     eff_cores = conn.max_cores or settings.max_cores
     eff_ram_mb = conn.max_ram_mb or settings.max_ram_mb
     eff_disk_gb = conn.max_disk_gb or settings.max_disk_gb
-    cpu = max(1, min(body.cpu, eff_cores))
-    ram = max(1, min(body.ram, eff_ram_mb // 1024))
-    disk = max(1, min(body.disk, eff_disk_gb) if eff_disk_gb else body.disk)
+    cpu = max(1, min(body.cpu if body.cpu is not None else tpl.default_cpu, eff_cores))
+    ram = max(1, min(body.ram if body.ram is not None else tpl.default_ram, eff_ram_mb // 1024))
+    disk = body.disk if body.disk is not None else tpl.default_disk
+    disk = max(1, min(disk, eff_disk_gb) if eff_disk_gb else disk)
     name = _clean_name(body.name) if (body.name or "").strip() else _auto_name(session)
 
-    # resolve network (explicit, else the connection's default)
-    net = session.get(Network, body.networkId) if body.networkId else None
+    net = session.get(Network, tpl.network_id) if tpl.network_id else None
     if net and net.connection_id != conn.id:
         net = None
     if not net:
         net = default_network_for(session, conn, user.id)
 
     dep = Deployment(name=name, owner_id=user.id, connection_id=conn.id,
-                     image_id=img.id, template_id=(tpl.id if tpl else None), cpu=cpu, ram=ram,
-                     disk=disk, status="working", node=img.node or conn.node,
+                     image_id=base.id, template_id=tpl.id, cpu=cpu, ram=ram,
+                     disk=disk, status="working", node=conn.node,
                      network_id=net.id, tags=body.tags, notes=body.notes,
                      deploy_inputs_json=deploy_inputs_json)
     session.add(dep)
     session.commit()
     session.refresh(dep)
 
-    # Pass the CLAMPED disk (not body.disk) so the per-target ceiling actually applies —
-    # the worker resizes to and records cfg["disk"].
-    ctx = {"src_vmid": img.template_vmid, "cpu": cpu, "ram": ram, "disk": disk}
+    ctx = {"src_url": base.source_url, "checksum": base.checksum or "",
+           "checksum_algorithm": _checksum_algo(base.checksum or ""),
+           "cpu": cpu, "ram": ram, "disk": disk}
     ctx.update(_network_ctx(session, net, dep.id))
 
     job = Job(type="deploy", title=f"Deploying {name}", deployment_id=dep.id,
@@ -695,16 +680,22 @@ def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session
         raise HTTPException(404, "not found")
     if dep.owner_id != user.id and user.role != "admin":
         raise HTTPException(403, "not your VM")
-    img = session.get(Image, dep.image_id) if dep.image_id else None
-    src_vmid = img.template_vmid if img else None
-    if not src_vmid:
-        raise HTTPException(400, "source image missing")
+    if not dep.template_id:
+        raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
+    tpl = session.get(Template, dep.template_id)
+    base = session.get(Image, tpl.base_image_id) if tpl and tpl.base_image_id else None
+    if not base or base.kind != "base":
+        raise HTTPException(400, "template has no base image — edit it first")
     dep.status = "working"
     session.add(dep)
-    # Preserve the VM's network (static IP / VLAN) across the rebuild instead of forcing
-    # DHCP — rebuild a context like deploy does, reusing the existing IP reservation.
+    # Preserve the VM's network identity (static IP / VLAN) across the rebuild.
+    # The existing IpAllocation row is reused by allocate_ip() inside _network_ctx —
+    # it looks up the deployment_id and returns the same IP, so no new address is
+    # allocated and the VM keeps its reserved static IP after the rebuild.
     net = session.get(Network, dep.network_id) if dep.network_id else None
-    ctx = {"src_vmid": src_vmid, "cpu": dep.cpu, "ram": dep.ram, "disk": dep.disk}
+    ctx = {"src_url": base.source_url, "checksum": base.checksum or "",
+           "checksum_algorithm": _checksum_algo(base.checksum or ""),
+           "cpu": dep.cpu, "ram": dep.ram, "disk": dep.disk}
     ctx.update(_network_ctx(session, net, dep.id) if net else {"network_mode": "dhcp"})
     job = Job(type="rebuild", title=f"Rebuilding {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",

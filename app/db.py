@@ -123,6 +123,8 @@ def _migrate() -> None:
         "deployments": ["last_action"],
         "blocks": ["editable"],
         "jobs": ["total_phases"],
+        # templates.golden_image_id → superseded by base_image_id + connection_id
+        # (nullable — not a crash risk; removed to avoid confusion, data discarded by design)
         "templates": ["golden_image_id"],
     }
     import logging

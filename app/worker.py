@@ -67,6 +67,20 @@ _worker_thread: Optional[threading.Thread] = None
 _stop = threading.Event()
 
 
+def _base_disk_filename(src_url: str) -> str:
+    """Cached per-URL qcow2 name on node storage. 'import' content needs a
+    recognised extension (cloud .img files are qcow2), and the name flows into
+    the comma-delimited import-from config — strict allowlist, URL-hash namespaced."""
+    raw_name = (src_url.rsplit("/", 1)[-1] if src_url else "image") or "image"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).lstrip(".-") or "image"
+    stem = safe.rsplit(".", 1)[0] or "image"
+    url_tag = hashlib.sha256((src_url or "").encode()).hexdigest()[:8]
+    filename = f"{stem}-{url_tag}.qcow2"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
+        raise RuntimeError(f"unsafe image filename derived from URL: {raw_name!r}")
+    return filename
+
+
 # --------------------------------------------------------------------------- #
 # Per-job progress helper                                                      #
 # --------------------------------------------------------------------------- #
@@ -348,9 +362,9 @@ def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str]) 
 # --------------------------------------------------------------------------- #
 # Job implementations                                                          #
 # --------------------------------------------------------------------------- #
-def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4) -> None:
+def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5) -> None:
     # phase_base/phase_total let a rebuild present this as a continuation (e.g. phases
-    # 2..5 of 5) instead of resetting the progress bar to "Phase 1 of 4".
+    # 2..6 of 6) instead of resetting the progress bar to "Phase 1 of 5".
     def _ph(n: int) -> int:
         return phase_base + n
     cfg = json.loads(job.context_json or "{}")
@@ -363,16 +377,12 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         raise RuntimeError("missing connection or deployment")
 
     px = Proxmox(conn)
-    # Clone from the node where the golden template actually lives. dep.node is set at
-    # deploy-creation to the image's node (api.py), so honour it first — falling back to
-    # the connection default only when unknown. (conn.node-or-pick alone clones from the
-    # wrong node when the template was built on a different node, or pick_node is blank.)
+    # Build on the deployment's node — set at deploy-creation from the template's connection.
     node = dep.node or conn.node or px.pick_node()
 
-    # source template vmid
-    src_vmid = cfg.get("src_vmid")
-    if not src_vmid:
-        raise RuntimeError("template has no built image to clone from")
+    src_url = cfg.get("src_url")
+    if not src_url:
+        raise RuntimeError("template has no base image source URL")
 
     ctx.progress(2, f"Phase {_ph(1)} of {phase_total} · Allocate")
     st = ctx.add_step(f"Acquire lock on {conn.name}")
@@ -381,13 +391,44 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
     ctx.log(f"[{_ts()}] goblindock: allocated VMID {new_vmid} on {node}", "l-dim")
     ctx.finish_step(st, t)
 
-    ctx.progress(12, f"Phase {_ph(2)} of {phase_total} · Clone")
-    st = ctx.add_step(f"Clone from template (vmid {src_vmid}) → {dep.name}")
+    ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")
+    st = ctx.add_step("Ensure base cloud image on node storage")
     t = ctx.start_step(st)
-    ctx.log(f"[{_ts()}] clone: {src_vmid} → {new_vmid} ({dep.name})", "l-acc")
-    upid = px.clone(src_vmid, new_vmid, dep.name, node=node, full=True)
-    px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
-    ctx.log(f"[{_ts()}] ✓ clone complete", "l-ok")
+    filename = _base_disk_filename(src_url)
+    if px.storage_has_volume(filename, node=node):
+        ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
+    else:
+        try:
+            upid = px.download_url(filename, src_url, node=node,
+                                   checksum=cfg.get("checksum", ""),
+                                   checksum_algorithm=cfg.get("checksum_algorithm", ""))
+            px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=1200)
+            ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
+        except Exception as e:  # noqa: BLE001
+            if px.storage_has_volume(filename, node=node):
+                ctx.log(f"[{_ts()}] download reported '{e}' but {filename} is present — continuing", "l-warn")
+            else:
+                raise RuntimeError(f"image download/verification failed: {e}") from e
+    ctx.finish_step(st, t)
+
+    ctx.progress(20, f"Phase {_ph(3)} of {phase_total} · Create")
+    st = ctx.add_step(f"Create VM and import base disk → {dep.name}")
+    t = ctx.start_step(st)
+    import_path = px.iso_volume_path(filename)
+    ctx.log(f"[{_ts()}] create vm {new_vmid} import-from {import_path}", "l-acc")
+    try:
+        upid = px.create_vm_import(new_vmid, dep.name, import_path,
+                                   cores=int(cfg.get("cpu", 1)),
+                                   ram_mb=int(cfg.get("ram", 2)) * 1024, node=node)
+        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
+    except Exception:
+        # best-effort cleanup of a half-created VM so the vmid doesn't orphan
+        try:
+            px.destroy(new_vmid, node=node)
+        except Exception:  # noqa: BLE001
+            pass
+        raise
+    ctx.log(f"[{_ts()}] ✓ disk imported", "l-ok")
     ctx.finish_step(st, t)
     with session_scope() as s:
         d = s.get(Deployment, dep.id)
@@ -395,7 +436,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         d.node = node
         s.add(d)
 
-    ctx.progress(40, f"Phase {_ph(3)} of {phase_total} · Configure")
+    ctx.progress(45, f"Phase {_ph(4)} of {phase_total} · Configure")
     st = ctx.add_step("Apply cloud-init (name, SSH key, network, size)")
     t = ctx.start_step(st)
     # Clamp to the TARGET connection's per-VM ceilings (0 = inherit the global default),
@@ -476,7 +517,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 4
         ctx.log(f"[{_ts()}] resize skipped: {e}", "l-warn")
     ctx.finish_step(st, t)
 
-    ctx.progress(60, f"Phase {_ph(4)} of {phase_total} · Boot")
+    ctx.progress(65, f"Phase {_ph(5)} of {phase_total} · Boot")
     st = ctx.add_step("Start VM & wait for guest agent")
     t = ctx.start_step(st)
     ctx.log(f"[{_ts()}] boot: starting {dep.name}", "l-dim")
@@ -573,21 +614,7 @@ def _run_image_build(ctx: JobCtx, job: Job) -> None:
     ctx.progress(10, "Phase 2 of 4 · Download base")
     st = ctx.add_step("Download cloud image to node storage")
     t = ctx.start_step(st)
-    # 'import' content type requires a recognised image extension; Ubuntu/Debian
-    # cloud images ship as qcow2 (even when named .img), so normalise to .qcow2.
-    # SANITISE: the filename flows into the comma-delimited scsi0 import-from config
-    # string — strip everything outside a strict allowlist so a crafted URL path
-    # (commas, '..', spaces) can't inject extra Proxmox disk options or traverse.
-    raw_name = (src_url.rsplit("/", 1)[-1] if src_url else img.name) or "image"
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).lstrip(".-") or "image"
-    stem = safe.rsplit(".", 1)[0] or "image"
-    # Namespace the cached filename by a hash of the SOURCE URL so two different URLs
-    # that share a basename (e.g. both end in /noble.img) can't reuse each other's
-    # cached file — the "already present" fast-path then only reuses the same-URL image.
-    url_tag = hashlib.sha256((src_url or "").encode()).hexdigest()[:8]
-    filename = f"{stem}-{url_tag}.qcow2"
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
-        raise RuntimeError(f"unsafe image filename derived from URL: {raw_name!r}")
+    filename = _base_disk_filename(src_url)
     ctx.log(f"[{_ts()}] download-url: {src_url}", "l-dim")
     if px.storage_has_volume(filename, node=node):
         # Already on the node from a previous build — re-using it is the intended
@@ -758,7 +785,7 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     px = Proxmox(conn)
     node = dep.node or conn.node or px.pick_node()
 
-    ctx.progress(1, "Phase 1 of 5 · Destroy")
+    ctx.progress(1, "Phase 1 of 6 · Destroy")
     st = ctx.add_step(f"Stop & destroy old disk for {dep.name}")
     t = ctx.start_step(st)
     old_vmid = dep.vmid
@@ -779,7 +806,7 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     # Re-run a deploy keeping the same name (and ip if static) by reusing the job's
     # existing context. phase_base=1/total=5 so progress continues (Phase 2..5 of 5)
     # instead of jumping back to "Phase 1 of 4".
-    _run_deploy(ctx, job, phase_base=1, phase_total=5)
+    _run_deploy(ctx, job, phase_base=1, phase_total=6)
 
 
 def _run_destroy(ctx: JobCtx, job: Job) -> None:

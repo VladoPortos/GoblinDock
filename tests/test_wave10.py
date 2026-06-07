@@ -105,7 +105,88 @@ def test_template_refs_validation():
     print("test_template_refs_validation OK")
 
 
+def _mk_template10(base_id, conn_id, net_id=None, ask=True, cpu=1, ram=2, disk=20):
+    from app.models import Template
+    recipe = [{"id": "s-os", "name": "OS Setup", "blocks": [
+        {"ref": "b-hostname", "name": "Set Hostname",
+         "inputs": {"hostname": ""}, **({"ask": ["hostname"]} if ask else {})},
+    ]}]
+    with session_scope() as s:
+        t = Template(name="t10-" + os.urandom(3).hex(), recipe_json=json.dumps(recipe),
+                     base_image_id=base_id, connection_id=conn_id, network_id=net_id,
+                     default_cpu=cpu, default_ram=ram, default_disk=disk, public=True)
+        s.add(t); s.flush()
+        return t.id
+
+
+def test_deploy_templates_only():
+    from app import api
+    from app.models import Deployment, Job, User
+    from app.seed import seed_blocks
+    from sqlmodel import select
+    seed_blocks()
+    uid = _mk_user("t10-deploy@example.com")
+    conn_id, base_id, net_id = _mk_conn_base_net()
+    tid = _mk_template10(base_id, conn_id, net_id, cpu=1, ram=2, disk=25)
+
+    def _deploy(**kw):
+        body = api.DeployBody(**kw)
+        with session_scope() as s:
+            return api.deploy(body, user=s.get(User, uid), session=s)
+
+    # sizes default from the template; image_id set to the base image; ctx carries src_url
+    r = _deploy(templateId=tid, name="t10-a", deployInputs={"0.0": {"hostname": "h1"}})
+    assert r["ok"]
+    with session_scope() as s:
+        d = s.exec(select(Deployment).where(Deployment.name == "t10-a")).first()
+        assert d.image_id == base_id and d.template_id == tid
+        assert (d.cpu, d.ram, d.disk) == (1, 2, 25), (d.cpu, d.ram, d.disk)
+        job = s.exec(select(Job).where(Job.deployment_id == d.id)).first()
+        ctx = json.loads(job.context_json)
+        assert ctx.get("src_url"), ctx
+        assert "src_vmid" not in ctx, ctx
+
+    # explicit size override respected (server clamps still apply)
+    r2 = _deploy(templateId=tid, name="t10-b", cpu=1, ram=1, disk=30,
+                 deployInputs={"0.0": {"hostname": "h2"}})
+    assert r2["ok"]
+    with session_scope() as s:
+        d2 = s.exec(select(Deployment).where(Deployment.name == "t10-b")).first()
+        assert (d2.ram, d2.disk) == (1, 30), (d2.ram, d2.disk)
+
+    # template without base image / connection → 400
+    t_nobase = _mk_template10(None, conn_id)
+    _expect_http(400, lambda: _deploy(templateId=t_nobase, name="t10-c",
+                                      deployInputs={"0.0": {"hostname": "h"}}))
+    t_noconn = _mk_template10(base_id, None)
+    _expect_http(400, lambda: _deploy(templateId=t_noconn, name="t10-d",
+                                      deployInputs={"0.0": {"hostname": "h"}}))
+    # missing template id → pydantic ValidationError
+    try:
+        api.DeployBody(name="t10-e")
+        raise AssertionError("expected ValidationError")
+    except Exception as e:
+        assert "templateId" in str(e), e
+    print("test_deploy_templates_only OK")
+
+
+def test_legacy_rebuild_guard():
+    from app import api
+    from app.models import Deployment, User
+    uid = _mk_user("t10-rb@example.com")
+    conn_id, base_id, net_id = _mk_conn_base_net()
+    with session_scope() as s:
+        d = Deployment(name="legacy-rb", owner_id=uid, connection_id=conn_id,
+                       vmid=8042, status="running", template_id=None)
+        s.add(d); s.flush(); dep_id = d.id
+    with session_scope() as s:
+        _expect_http(400, lambda: api.vm_rebuild(dep_id, user=s.get(User, uid), session=s))
+    print("test_legacy_rebuild_guard OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
+    test_deploy_templates_only()
+    test_legacy_rebuild_guard()
     print("\nALL WAVE 10 UNIT TESTS PASSED")

@@ -243,16 +243,6 @@ def _mk_template(base_id, conn_id, net_id=None, owner=None, public=True, ask=Tru
         return t.id
 
 
-def _mk_golden(conn_id):
-    # TEMPORARY shim — removed in templates-only Task 2 when DeployBody drops goldenImageId
-    from app.models import Image
-    with session_scope() as s:
-        img = Image(kind="golden", name="g-shim-" + os.urandom(2).hex(), os_family="ubuntu",
-                    connection_id=conn_id, template_vmid=9001, build_status="ready")
-        s.add(img); s.flush()
-        return img.id
-
-
 def test_deploy_with_inputs():
     from app import api
     from app.models import Deployment, User
@@ -261,11 +251,10 @@ def test_deploy_with_inputs():
     seed_blocks()  # b-hostname schema must exist for type checks
     uid = _mk_user("deployer@example.com")
     conn_id, base_id, net_id = _mk_conn_base_net()
-    golden_id = _mk_golden(conn_id)
     tid = _mk_template(base_id, conn_id, net_id)
 
     def _deploy(**kw):
-        body = api.DeployBody(goldenImageId=golden_id, **kw)
+        body = api.DeployBody(**kw)
         with session_scope() as s:
             return api.deploy(body, user=s.get(User, uid), session=s)
 
@@ -286,8 +275,12 @@ def test_deploy_with_inputs():
     # unknown address → 400
     _expect_http(400, lambda: _deploy(templateId=tid, name="vm-d",
                  deployInputs={"5.0": {"hostname": "h"}}))
-    # deployInputs without a template → 400
-    _expect_http(400, lambda: _deploy(name="vm-e", deployInputs={"0.0": {"hostname": "h"}}))
+    # deployInputs without a templateId → pydantic ValidationError (templateId required)
+    try:
+        api.DeployBody(name="vm-e", deployInputs={"0.0": {"hostname": "h"}})
+        raise AssertionError("expected ValidationError")
+    except Exception as e:
+        assert "templateId" in str(e), e
     # wrong value type → 400
     _expect_http(400, lambda: _deploy(templateId=tid, name="vm-f",
                  deployInputs={"0.0": {"hostname": ["not", "a", "string"]}}))

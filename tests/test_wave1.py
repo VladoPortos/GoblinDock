@@ -65,13 +65,13 @@ def test_disk_bounds():
     from app.api import DeployBody, GoldenBody, TemplateBody
     from pydantic import ValidationError
     # valid
-    DeployBody(goldenImageId=1, disk=20, cpu=2, ram=4)
+    DeployBody(templateId=1, disk=20, cpu=2, ram=4)
     GoldenBody(name="img", disk=40)
     TemplateBody(name="r", disk=10)
     # negative / zero / absurd rejected
-    for kwargs in ({"goldenImageId": 1, "disk": -5}, {"goldenImageId": 1, "disk": 0},
-                   {"goldenImageId": 1, "disk": 999999}, {"goldenImageId": 1, "cpu": 0},
-                   {"goldenImageId": 1, "ram": 99999}):
+    for kwargs in ({"templateId": 1, "disk": -5}, {"templateId": 1, "disk": 0},
+                   {"templateId": 1, "disk": 999999}, {"templateId": 1, "cpu": 0},
+                   {"templateId": 1, "ram": 99999}):
         try:
             DeployBody(**kwargs)
             assert False, f"expected ValidationError for {kwargs}"
