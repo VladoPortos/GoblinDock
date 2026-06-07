@@ -623,12 +623,20 @@ def maybe_seed_proxmox() -> None:
         ))
 
 
-def seed_recipes() -> None:
-    """A public starter recipe so AI dev boxes are one click away."""
+def seed_templates() -> None:
+    """A public starter template so AI dev boxes are one click away. The hostname
+    block is ask-on-deploy — the demo shows off deploy-time prompts out of the box.
+    Golden-image wiring is best-effort: linked when a ready ubuntu golden exists
+    (upgraded installs); fresh installs have none yet, so the card shows the
+    'no image set' state until the user builds one."""
     with session_scope() as s:
         if s.exec(select(Template).where(Template.name == "AI Dev Box")).first():
             return
         recipe = [
+            {"id": "s-os", "name": "OS Setup", "blocks": [
+                {"ref": "b-hostname", "name": "Set Hostname",
+                 "inputs": {"hostname": ""}, "ask": ["hostname"]},
+            ]},
             {"id": "s-inst", "name": "Install", "blocks": [
                 {"ref": "b-nodejs", "name": "Node.js (LTS)", "inputs": {"version": "22"}},
                 {"ref": "b-claudecode", "name": "Claude Code", "inputs": {"node_version": "22"}},
@@ -641,10 +649,14 @@ def seed_recipes() -> None:
                 }},
             ]},
         ]
+        golden = s.exec(select(Image).where(
+            Image.kind == "golden", Image.os_family == "ubuntu",
+            Image.template_vmid.is_not(None))).first()
         s.add(Template(
             name="AI Dev Box",
             description="Node.js + Claude Code + OpenAI Codex + a global CLAUDE.md — a ready-to-code box.",
             os_family="ubuntu", recipe_json=json.dumps(recipe),
+            golden_image_id=golden.id if golden else None,
             default_cpu=1, default_ram=2, default_disk=20, public=True, owner_id=None,
         ))
 
@@ -662,7 +674,7 @@ def seed_default_networks() -> None:
 
 def run_all_seeds() -> None:
     seed_blocks()
-    seed_recipes()
+    seed_templates()
     seed_base_image()
     maybe_seed_admin()
     maybe_seed_proxmox()

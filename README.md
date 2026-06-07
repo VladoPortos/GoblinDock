@@ -38,7 +38,7 @@ GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
   on a throwaway VM, de-identifies it (fresh machine-id, cleaned cloud-init), and
   converts it to a template.
 - **🚀 One-click deploy** — clone a golden image, pick a target, size, and optional
-  **recipe**, and GoblinDock provisions, configures, and tracks the VM — reporting its
+  **template**, and GoblinDock provisions, configures, and tracks the VM — reporting its
   IP back via the guest agent.
 - **🖥️ Per-VM detail page** — live CPU / RAM / disk usage, full config, guest-agent OS
   & network info, the deployment log, and a built-in **console** (graphical VGA *and*
@@ -94,11 +94,11 @@ throttle see the real client address.
 | **Connection (target)** | A Proxmox node/cluster + token. Each target sets its own **per-VM ceilings** (max vCPU / RAM / disk). |
 | **ISO / base image** | A public cloud image (e.g. Ubuntu 24.04) — the raw material. |
 | **Golden image** | A base image **+ baked blocks** = a deployable Proxmox template. |
-| **Recipe** | A named, image-independent bundle of blocks applied **on top of a VM at deploy time** (e.g. *AI Dev Box*, *MySQL node*). |
+| **Template** | A named, image-independent bundle of blocks applied **on top of a VM at deploy time** (e.g. *AI Dev Box*, *MySQL node*). |
 | **Block** | One customization step (install a package, write a file, run a script, install Claude Code…). 29 built-ins + your own. |
 | **Secret / Variable** | Reusable values referenced as `{{ secrets.NAME }}` (encrypted) or `{{ variable.NAME }}` (plaintext, visible). |
 
-The flow: **upload a base image → bake a golden image → deploy from it (± a recipe).**
+The flow: **upload a base image → bake a golden image → deploy from it (± a template).**
 
 ---
 
@@ -164,12 +164,12 @@ localectl set-locale LANG=en_US.UTF-8 || true
 
 You can see the exact generated playbook any time with **View YAML** in the builder.
 
-### Golden image vs recipe — *where* it runs
+### Golden image vs template — *where* it runs
 
 - **Golden image:** the blocks are **baked into the template**. The build boots a
   throwaway VM, runs the cloud-init script + the playbook against it, de-identifies it,
   and templatizes it. Every deploy from that golden starts already configured.
-- **Recipe (runtime):** the blocks are applied **on top of each freshly-deployed VM** —
+- **Template (runtime):** the blocks are applied **on top of each freshly-deployed VM** —
   its cloud-init blocks at the clone's first boot, its ansible blocks once it's up. Same
   compile model, just applied per-deploy instead of baked once.
 
@@ -199,7 +199,7 @@ Open any VM → **Console**. Two tabs:
 - **Serial** — an `xterm.js` serial console.
 
 Cloud images set up SSH-key login with **no console password**, so add the **Console
-Password** block to a recipe/golden if you want to log in at the console.
+Password** block to a template/golden if you want to log in at the console.
 
 ---
 
@@ -216,7 +216,7 @@ One Docker container, no external services:
   editor), xterm.js + noVNC (consoles) — all served from `web/`, SRI-pinned.
 
 ```
-backend:  app/*.py + app/routers/   (FastAPI app · threaded job worker · APScheduler · Proxmox client · recipe compiler · SQLite models)
+backend:  app/*.py + app/routers/   (FastAPI app · threaded job worker · APScheduler · Proxmox client · template compiler · SQLite models)
 frontend: web/{index.html,styles.css,*.js, vendor/}
 ```
 
@@ -259,7 +259,7 @@ it falls back to native cloud-init.
 - **Tenant isolation** — `/api/state` is role-filtered: a non-admin only ever receives
   their own VMs, a **redacted** connection view (no Proxmox host / token id / SSH
   paths, no user directory) and a **redacted** network view (no bridge / VLAN / subnet /
-  gateway / DNS — just enough to pick one). Recipes and blocks honour visibility — a
+  gateway / DNS — just enough to pick one). Templates and blocks honour visibility — a
   private one can't be deployed, compiled, or forked by guessing its id. Optional
   per-user VM / image **quotas** (`GOBLINDOCK_MAX_VMS_PER_USER` / `_IMAGES_PER_USER`).
 - **Host-key / TLS verification** — Proxmox API TLS (`verify_tls`, per connection) and
