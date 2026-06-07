@@ -719,7 +719,9 @@ def _execute(job_id: int) -> None:
                     from .models import IpAllocation as _IpAlloc
                     for a in s.exec(select(_IpAlloc).where(_IpAlloc.deployment_id == dep.id)).all():
                         s.delete(a)
-            if job.image_id:
+            if job.image_id and job.type == "image_build":
+                # legacy golden-build rows only — a failed image_sync must NOT
+                # touch the base image's build_status (it stays 'ready')
                 img = s.get(Image, job.image_id)
                 if img:
                     img.build_status = "failed" if not cancelled else "none"

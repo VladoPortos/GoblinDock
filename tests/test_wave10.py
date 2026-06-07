@@ -274,6 +274,15 @@ def test_sync_endpoint():
     with session_scope() as s:
         brief = S.job_brief(s, s.get(Job, job_id))
         assert brief["imageId"] == base_id
+    with session_scope() as s:
+        detail = S.job_detail(s, s.get(Job, job_id))
+        assert detail["phases"] == ["Prepare image"], detail["phases"]
+    # the failure handler must be scoped to legacy image_build jobs — a failed
+    # image_sync must never flip a base image's build_status (guard regression check)
+    import inspect
+    from app import worker as W
+    src = inspect.getsource(W._execute)
+    assert 'job.type == "image_build"' in src, "image_id failure handler lost its type guard"
     print("test_sync_endpoint OK")
 
 
