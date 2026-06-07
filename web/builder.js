@@ -304,6 +304,7 @@
     const busyRef = React.useRef(false);
     const [blockModal, setBlockModal] = useState(null);
     const [rebuildAsk, setRebuildAsk] = useState(false);
+    const [buildAsk, setBuildAsk] = useState(false);
     const dragRef = React.useRef(null);
 
     const bases = GD.BASE_IMAGES || [];
@@ -415,7 +416,7 @@
           warnCount > 0 && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, h(Icon, { name: 'warn', size: 12 }), warnCount, ' need input')),
         h('div', { className: 'row', style: { marginLeft: 'auto', gap: 8 } },
           h('button', { className: 'btn sm', onClick: openYaml }, h(Icon, { name: 'code', size: 15 }), 'View YAML'),
-          h('button', { className: 'btn primary sm', onClick: () => { if (mode === 'golden' && loadedImg) setRebuildAsk(true); else doBuildOrSave(); }, disabled: busy }, h(Icon, { name: mode === 'golden' ? 'hammer' : 'check', size: 15 }), busy ? 'Working…' : (mode === 'golden' ? (loadedImg ? 'Rebuild' : 'Build image') : (loadedRecipe ? 'Save changes' : 'Save recipe'))))),
+          h('button', { className: 'btn primary sm', onClick: () => { if (mode === 'golden' && loadedImg) setRebuildAsk(true); else if (mode === 'golden') setBuildAsk(true); else doBuildOrSave(); }, disabled: busy }, h(Icon, { name: mode === 'golden' ? 'hammer' : 'check', size: 15 }), busy ? 'Working…' : (mode === 'golden' ? (loadedImg ? 'Rebuild' : 'Build image') : (loadedRecipe ? 'Save changes' : 'Save recipe'))))),
       h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
         h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({ new: true }) }),
         h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),
@@ -429,6 +430,14 @@
         h('div', { style: { padding: 0 } },
           h('pre', { className: 'logpane', style: { margin: 0, borderRadius: 0, border: 'none', maxHeight: '60vh', fontSize: 12 } }, yamlText))),
       blockModal && h(BlockEditorModal, { initial: blockModal.initial, onClose: () => setBlockModal(null), onSaved: () => { setBlockModal(null); window.GDStore.toast('Block saved', 'ok'); window.GDStore.refresh().catch(() => {}); } }),
+      buildAsk && h(ConfirmModal, {
+        onClose: () => setBuildAsk(false), tone: 'accent', icon: 'hammer',
+        title: 'Build ' + recipeName + '?',
+        body: 'This immediately creates a temporary build VM on ' + (selConn.name || 'your Proxmox target')
+          + (selConn.node ? ' · ' + selConn.node : '')
+          + ', runs the blocks, and converts it into a reusable template. You can watch progress live.',
+        confirmLabel: 'Build image', onConfirm: () => { setBuildAsk(false); doBuildOrSave(); },
+      }),
       rebuildAsk && h(ConfirmModal, {
         onClose: () => setRebuildAsk(false), tone: 'danger', icon: 'rebuild',
         title: 'Rebuild ' + recipeName + '?',
