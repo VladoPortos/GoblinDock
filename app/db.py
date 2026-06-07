@@ -62,6 +62,12 @@ def _rename_legacy() -> None:
         if "recipes" in tables and "templates" not in tables:
             conn.exec_driver_sql("ALTER TABLE recipes RENAME TO templates")
             log.info("migrated: table recipes → templates")
+            # the rename drags the old auto-index along — drop it so _migrate()'s
+            # ix_templates_name doesn't end up as a duplicate on the same column
+            conn.exec_driver_sql("DROP INDEX IF EXISTS ix_recipes_name")
+        elif "recipes" in tables and "templates" in tables:
+            log.warning("both recipes and templates tables exist — legacy recipes "
+                        "table left untouched; verify no data was stranded")
         if "deployments" in tables:
             cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(deployments)")}
             if "recipe_id" in cols and "template_id" not in cols:
