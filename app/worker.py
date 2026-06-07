@@ -49,20 +49,6 @@ from .recipes import (
 )
 from .security import decrypt, encrypt
 
-_DEIDENTIFY_PLAY = """---
-- name: de-identify golden image
-  hosts: all
-  become: true
-  gather_facts: false
-  tasks:
-    - name: cloud-init clean
-      ansible.builtin.shell: cloud-init clean --logs || true
-    - name: reset machine-id
-      ansible.builtin.shell: truncate -s 0 /etc/machine-id; rm -f /var/lib/dbus/machine-id || true
-    - name: remove ssh host keys
-      ansible.builtin.shell: rm -f /etc/ssh/ssh_host_* || true
-"""
-
 _worker_thread: Optional[threading.Thread] = None
 _stop = threading.Event()
 
@@ -214,23 +200,6 @@ def _redactor(values: set):
                 line = line.replace(v, "***")
         return line
     return red
-
-
-def _wait_stopped(px, vmid: int, node: str, deadline: int = 120) -> bool:
-    """Poll vm_current until the guest reports 'stopped', up to `deadline` seconds.
-    Returns True once stopped, False on timeout."""
-    end = time.time() + deadline
-    while time.time() < end:
-        try:
-            if (px.vm_current(vmid, node=node) or {}).get("status") == "stopped":
-                return True
-        except Exception:  # noqa: BLE001
-            pass
-        time.sleep(2)
-    try:
-        return (px.vm_current(vmid, node=node) or {}).get("status") == "stopped"
-    except Exception:  # noqa: BLE001
-        return False
 
 
 def _valid_pubkey(key: str) -> bool:
@@ -385,6 +354,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         raise RuntimeError("template has no base image source URL")
 
     ctx.progress(2, f"Phase {_ph(1)} of {phase_total} · Allocate")
+    # "lock" is cosmetic — vmid allocation relies on the single-worker invariant; a multi-worker rollout needs real cross-process locking.
     st = ctx.add_step(f"Acquire lock on {conn.name}")
     t = ctx.start_step(st)
     new_vmid = dep.vmid or px.next_free_vmid(settings.vmid_min, settings.vmid_max, node)
@@ -574,203 +544,6 @@ def _wait_for_ip(ctx: JobCtx, px: Proxmox, vmid: int, node: str, timeout: int = 
     return None
 
 
-def _run_image_build(ctx: JobCtx, job: Job) -> None:
-    cfg = json.loads(job.context_json or "{}")
-    with session_scope() as s:
-        conn = s.get(Connection, job.connection_id)
-        img = s.get(Image, job.image_id)
-        conn = Connection(**conn.model_dump()) if conn else None
-        img = Image(**img.model_dump()) if img else None
-    if not conn or not img:
-        raise RuntimeError("missing connection or image")
-
-    px = Proxmox(conn)
-    node = img.node or conn.node or px.pick_node()
-    if img.storage:                 # honour the golden image's chosen location
-        px.storage = img.storage
-    src_url = cfg.get("source_url") or img.source_url
-    # Clamp the baked disk to the target connection's ceiling (mirroring the deploy
-    # path) so a golden build can't bypass the per-VM disk cap. Floor at 1G.
-    eff_disk_gb = conn.max_disk_gb or settings.max_disk_gb
-    disk_gb = int(cfg.get("disk", 20))
-    if eff_disk_gb:
-        disk_gb = min(disk_gb, eff_disk_gb)
-    disk_gb = max(1, disk_gb)
-
-    ctx.progress(3, "Phase 1 of 4 · Acquire")
-    st = ctx.add_step(f"Allocate template VMID on {conn.name}")
-    t = ctx.start_step(st)
-    vmid = img.template_vmid or px.next_free_vmid(settings.vmid_min, settings.vmid_max, node)
-    ctx.log(f"[{_ts()}] golden image '{img.name}' → VMID {vmid} on {node}", "l-acc")
-    # persist the vmid now so a mid-build failure leaves a tracked (deletable)
-    # row instead of an untracked orphan on the node
-    with session_scope() as s:
-        i = s.get(Image, img.id)
-        if i:
-            i.template_vmid = vmid
-            s.add(i)
-    ctx.finish_step(st, t)
-
-    ctx.progress(10, "Phase 2 of 4 · Download base")
-    st = ctx.add_step("Download cloud image to node storage")
-    t = ctx.start_step(st)
-    filename = _base_disk_filename(src_url)
-    ctx.log(f"[{_ts()}] download-url: {src_url}", "l-dim")
-    if px.storage_has_volume(filename, node=node):
-        # Already on the node from a previous build — re-using it is the intended
-        # idempotent fast-path (a checksum, if supplied, was verified when it landed).
-        ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
-    else:
-        try:
-            upid = px.download_url(filename, src_url, node=node,
-                                   checksum=cfg.get("checksum", ""),
-                                   checksum_algorithm=cfg.get("checksum_algorithm", ""))
-            px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=1200)
-            ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
-        except Exception as e:  # noqa: BLE001
-            # Only tolerate a genuine already-present race; a checksum mismatch or a
-            # network failure leaves the file absent → FAIL the build (the integrity
-            # backstop must not be silently swallowed).
-            if px.storage_has_volume(filename, node=node):
-                ctx.log(f"[{_ts()}] download reported '{e}' but {filename} is present — continuing", "l-warn")
-            else:
-                raise RuntimeError(f"image download/verification failed: {e}") from e
-    ctx.finish_step(st, t)
-
-    ctx.progress(35, "Phase 3 of 4 · Import & configure")
-
-    # Rebuild: if this vmid already hosts a VM/template from a previous build of this
-    # image, destroy it first — Proxmox can't create a VM over an existing id (the
-    # UI warns + confirms before this runs). For a fresh build the id is free, so this
-    # is a no-op.
-    if vmid in {v.get("vmid") for v in px.list_qemu(node)}:
-        st = ctx.add_step(f"Remove existing template {vmid} before rebuild")
-        t = ctx.start_step(st)
-        try:
-            px.stop(vmid, node=node)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            upid = px.destroy(vmid, node=node)
-            px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=180)
-            ctx.log(f"[{_ts()}] ✓ removed previous template {vmid} for rebuild", "l-warn")
-        except Exception as e:  # noqa: BLE001
-            ctx.log(f"[{_ts()}] could not remove existing {vmid}: {e}", "l-warn")
-        ctx.finish_step(st, t)
-
-    st = ctx.add_step("Create VM and import cloud-image disk")
-    t = ctx.start_step(st)
-    import_path = px.iso_volume_path(filename)
-    ctx.log(f"[{_ts()}] create vm {vmid} import-from {import_path}", "l-acc")
-    upid = px.create_vm_import(vmid, img.name, import_path,
-                               cores=settings.max_cores, ram_mb=settings.max_ram_mb, node=node)
-    px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
-    ctx.log(f"[{_ts()}] ✓ disk imported", "l-ok")
-    ctx.finish_step(st, t)
-
-    st = ctx.add_step("Attach cloud-init, resize disk")
-    t = ctx.start_step(st)
-    blocks = _blocks_by_key()
-    recipe = load_recipe(img.recipe_json)
-    lookup = _secret_lookup_factory(job.created_by)
-    ci_cmds = compile_cloudinit(recipe, blocks, lookup) if recipe else []
-    ansible_needed = has_ansible_blocks(recipe, blocks)
-    bake = bool(ci_cmds) or ansible_needed     # do we need to boot the build VM?
-
-    managed_priv, managed_pub = _managed_keypair()
-    user_pubkey = _ssh_pubkey(job.created_by)
-    pubkeys = [k for k in (user_pubkey, managed_pub) if k]
-    params = {"ipconfig0": "ip=dhcp", "agent": "enabled=1"}
-    if bake and conn.ssh_key_path:
-        cc = _deploy_cloud_config(img.name, pubkeys, ci_cmds)
-        try:
-            volid = write_snippet_over_ssh(conn, f"gd-build-{vmid}.yml", cc)
-            params["cicustom"] = f"user={volid}"
-            ctx.log(f"[{_ts()}] baking via snippet {volid}", "l-acc")
-        except Exception as e:  # noqa: BLE001
-            ctx.log(f"[{_ts()}] snippet unavailable ({e}); native cloud-init", "l-warn")
-            params["ciuser"] = "goblin"
-            import urllib.parse
-            if pubkeys:
-                params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
-    else:
-        params["ciuser"] = "goblin"
-        import urllib.parse
-        if pubkeys:
-            params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
-        if ci_cmds and not conn.ssh_key_path:
-            ctx.log(f"[{_ts()}] cloud-init blocks need an SSH key on the connection — skipped", "l-warn")
-    px.set_config(vmid, node=node, **params)
-    try:
-        px.resize_disk(vmid, "scsi0", f"{disk_gb}G", node=node)
-        ctx.log(f"[{_ts()}] resize scsi0 → {disk_gb}G", "l-dim")
-    except Exception as e:  # noqa: BLE001
-        ctx.log(f"[{_ts()}] resize skipped: {e}", "l-warn")
-    ctx.finish_step(st, t)
-
-    ctx.progress(60, "Phase 4 of 4 · Finalize")
-    if bake:
-        st = ctx.add_step("Boot & apply blocks (cloud-init + ansible)")
-        t = ctx.start_step(st)
-        upid = px.start(vmid, node=node)
-        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=120)
-        ip = _wait_for_ip(ctx, px, vmid, node, timeout=300)
-        if ansible_needed:
-            if ip:
-                _run_ansible_phase(ctx, recipe, job.created_by, ip, managed_priv, img.name)
-            else:
-                raise RuntimeError("build VM never reported an IP — cannot run ansible blocks")
-        # de-identify so clones get a fresh machine-id, then shut down
-        if ip:
-            try:
-                run_playbook(_DEIDENTIFY_PLAY, ip, "goblin", managed_priv,
-                             on_line=lambda ln: None, timeout=180)
-                ctx.log(f"[{_ts()}] ✓ de-identified (machine-id reset, cloud-init clean)", "l-dim")
-            except Exception as e:  # noqa: BLE001
-                ctx.log(f"[{_ts()}] de-identify note: {e}", "l-warn")
-        try:
-            px.shutdown(vmid, node=node, timeout=90)
-        except Exception:  # noqa: BLE001
-            px.stop(vmid, node=node)
-        # shutdown() only POSTs the task and returns — POLL until the guest is actually
-        # stopped (Proxmox refuses to templatize a running VM). Bounded deadline; hard
-        # stop if it overruns so the build still completes.
-        if not _wait_stopped(px, vmid, node, deadline=120):
-            ctx.log(f"[{_ts()}] VM {vmid} still running after shutdown — forcing stop", "l-warn")
-            try:
-                px.stop(vmid, node=node)
-            except Exception:  # noqa: BLE001
-                pass
-            if not _wait_stopped(px, vmid, node, deadline=30):
-                # Proxmox refuses to templatize a running VM — fail cleanly rather than
-                # hit a confusing templatize error.
-                raise RuntimeError(f"build VM {vmid} would not stop — cannot convert to template")
-        ctx.finish_step(st, t)
-
-    st = ctx.add_step("Convert to template")
-    t = ctx.start_step(st)
-    px.templatize(vmid, node=node)
-    ctx.log(f"[{_ts()}] ✓ VMID {vmid} converted to template", "l-ok")
-    ctx.finish_step(st, t)
-
-    with session_scope() as s:
-        i = s.get(Image, img.id)
-        i.template_vmid = vmid
-        i.build_status = "ready"
-        i.progress = 100
-        i.node = node
-        i.built_at = utcnow()
-        s.add(i)
-    if bake and conn.ssh_key_path:
-        try:
-            delete_snippet_over_ssh(conn, f"gd-build-{vmid}.yml")
-        except Exception:  # noqa: BLE001
-            pass
-
-    ctx.progress(100, "Complete")
-    ctx.log(f"[{_ts()}] ✓ golden image '{img.name}' ready", "l-ok")
-
-
 def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     with session_scope() as s:
         conn = s.get(Connection, job.connection_id)
@@ -804,8 +577,8 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     ctx.finish_step(st, t)
 
     # Re-run a deploy keeping the same name (and ip if static) by reusing the job's
-    # existing context. phase_base=1/total=5 so progress continues (Phase 2..5 of 5)
-    # instead of jumping back to "Phase 1 of 4".
+    # existing context. phase_base=1/total=6 so progress continues (Phase 2..6 of 6)
+    # instead of jumping back to "Phase 1 of 5".
     _run_deploy(ctx, job, phase_base=1, phase_total=6)
 
 
@@ -862,7 +635,6 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
 
 _DISPATCH = {
     "deploy": _run_deploy,
-    "image_build": _run_image_build,
     "rebuild": _run_rebuild,
     "destroy": _run_destroy,
 }
@@ -912,7 +684,6 @@ def _execute(job_id: int) -> None:
     except Exception as e:  # noqa: BLE001
         cancelled = "cancel" in str(e).lower()
         ctx.log(f"[{_ts()}] ✗ {e}", "l-err")
-        cleanup = None   # (Connection, vmid, node) of a half-built VM to destroy
         with session_scope() as s:
             job = s.get(Job, job_id)
             job.status = "canceled" if cancelled else "failed"
@@ -937,34 +708,7 @@ def _execute(job_id: int) -> None:
                 img = s.get(Image, job.image_id)
                 if img:
                     img.build_status = "failed" if not cancelled else "none"
-                    # A failed/cancelled build leaves a half-baked VM on the node
-                    # that never became a template. Schedule its destruction and
-                    # drop the stale vmid claim, so a later build doesn't reuse the
-                    # id while this ghost row still points at it (which would make a
-                    # future delete destroy the wrong VM).
-                    if (job.type == "image_build" and img.kind == "golden"
-                            and img.template_vmid and img.connection_id):
-                        conn = s.get(Connection, img.connection_id)
-                        if conn:
-                            cleanup = (Connection(**conn.model_dump()),
-                                       img.template_vmid, img.node or conn.node)
-                        img.template_vmid = None
                     s.add(img)
-        if cleanup:
-            conn_c, vmid_c, node_c = cleanup
-            try:
-                px = Proxmox(conn_c)
-                cfg = px.vm_config(vmid_c, node=node_c)
-                if not cfg.get("template"):     # never destroy a real template here
-                    try:
-                        px.stop(vmid_c, node=node_c)
-                    except Exception:  # noqa: BLE001
-                        pass
-                    upid = px.destroy(vmid_c, node=node_c)
-                    px.wait_task(upid, node=node_c, timeout=180)
-                    ctx.log(f"[{_ts()}] cleaned up partial build VM {vmid_c}", "l-dim")
-            except Exception:  # noqa: BLE001
-                pass
         traceback.print_exc()
 
 
@@ -1014,7 +758,7 @@ def _recover_orphans() -> None:
             if job.image_id:
                 img = s.get(Image, job.image_id)
                 if img and img.build_status == "building":
-                    # keep template_vmid so an admin can still destroy/rebuild the ghost
+                    # keep template_vmid so an admin can identify and manually clean up the ghost on the node
                     img.build_status = "failed"
                     s.add(img)
 

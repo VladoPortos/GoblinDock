@@ -109,7 +109,7 @@ def _check_password(pw: str) -> None:
 
 
 def _enforce_quota(session: Session, user: User, kind: str) -> None:
-    """Per-user resource cap (0 = unlimited; admins exempt). kind: 'vm' | 'image'."""
+    """Per-user resource cap (0 = unlimited; admins exempt). kind: 'vm'."""
     if user.role == "admin":
         return
     if kind == "vm" and settings.max_vms_per_user:
@@ -117,19 +117,14 @@ def _enforce_quota(session: Session, user: User, kind: str) -> None:
         if n >= settings.max_vms_per_user:
             raise HTTPException(429, f"VM quota reached ({settings.max_vms_per_user}) — "
                                      "destroy one first or ask an admin to raise your limit")
-    if kind == "image" and settings.max_images_per_user:
-        n = len(session.exec(select(Image).where(
-            Image.kind == "golden", Image.created_by == user.id)).all())
-        if n >= settings.max_images_per_user:
-            raise HTTPException(429, f"golden-image quota reached ({settings.max_images_per_user})")
 
 
 def validate_image_url(url: str) -> str:
     """SSRF guard for the cloud-image download URL: https only, every resolved
     address must be globally routable.
 
-    Reachable by any authenticated user (build_golden accepts a raw source_url), so
-    this is a real user->infra boundary. Residual risk we accept by design: the
+    Reachable by any authenticated user, so this is a real user->infra boundary.
+    Residual risk we accept by design: the
     multi-GB fetch is done by the Proxmox NODE (download-url), not by GoblinDock, so
     an HTTP redirect to an internal host or DNS rebinding between this check and the
     node's fetch (TOCTOU) can't be fully closed here without proxying GBs through the
@@ -399,7 +394,6 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     vms = [S.vm_dict(session, d, user, px_cache, users, conns) for d in deps]
 
     base = [S.base_image_dict(i) for i in session.exec(select(Image).where(Image.kind == "base")).all()]
-    golden = [S.golden_image_dict(session, i) for i in session.exec(select(Image).where(Image.kind == "golden").order_by(Image.id.desc())).all()]
     tpls = session.exec(select(Template).order_by(Template.id)).all()
     if user.role != "admin":
         tpls = [t for t in tpls if t.public or t.owner_id == user.id]
@@ -454,7 +448,6 @@ def state(request: Request, user: User = Depends(current_user), session: Session
                    "vmidMin": settings.vmid_min, "vmidMax": settings.vmid_max},
         "VMS": vms,
         "BASE_IMAGES": base,
-        "GOLDEN_IMAGES": golden,
         "TEMPLATES": templates,
         "PALETTE": blocks,
         "SECRETS": secrets,
@@ -494,10 +487,9 @@ def widget_summary(user: User = Depends(widget_key_user),
         job_q = job_q.where(Job.created_by == user.id)
     jobs_active = len(session.exec(job_q).all())
 
-    golden = session.exec(
-        select(Image.id).where(Image.kind == "golden",
-                               Image.template_vmid.is_not(None))
-    ).all()
+    tpl_rows = session.exec(select(Template).where(
+        Template.base_image_id.is_not(None),
+        Template.connection_id.is_not(None))).all()
 
     return {
         "vms_total": len(statuses),
@@ -506,7 +498,7 @@ def widget_summary(user: User = Depends(widget_key_user),
         "vms_working": _count("working"),
         "vms_error": _count("error"),
         "jobs_active": jobs_active,
-        "golden_images": len(golden),
+        "templates": len(tpl_rows),
     }
 
 
@@ -1000,18 +992,6 @@ class BaseImageBody(BaseModel):
     checksum: str = ""
 
 
-class GoldenBody(BaseModel):
-    name: str
-    os_family: str = "ubuntu"
-    connectionId: Optional[int] = None   # location: which Proxmox
-    node: Optional[str] = None           # location: which node
-    storage: Optional[str] = None        # location: which VM-disk storage
-    baseImageId: Optional[int] = None
-    source_url: Optional[str] = None
-    disk: int = Field(default=20, ge=1, le=16384)     # GB
-    recipe: list = []
-
-
 @router.post("/images/base")
 def add_base_image(body: BaseImageBody, user: User = Depends(require_admin),
                    session: Session = Depends(get_session)):
@@ -1024,83 +1004,6 @@ def add_base_image(body: BaseImageBody, user: User = Depends(require_admin),
     session.commit()
     return {"ok": True}
 
-
-@router.post("/images/golden")
-def build_golden(body: GoldenBody, user: User = Depends(current_user),
-                 session: Session = Depends(get_session)):
-    conn = (session.get(Connection, body.connectionId) if body.connectionId
-            else session.exec(select(Connection)).first())
-    if not conn:
-        raise HTTPException(400, "no Proxmox connection configured")
-    _enforce_quota(session, user, "image")
-    name = _clean_name(body.name, "image name")
-    # A raw, user-supplied download URL points the Proxmox NODE at an arbitrary host
-    # (SSRF-via-node, redirect/rebind not fully closeable). Restrict that to admins;
-    # non-admins must build from a vetted base image (admin-curated) or the default.
-    base = session.get(Image, body.baseImageId) if body.baseImageId else None
-    if base and base.kind != "base":     # only a base image is a valid build source
-        raise HTTPException(400, "baseImageId must reference a base image")
-    checksum = base.checksum if base else ""
-    if body.source_url and user.role != "admin":
-        raise HTTPException(403, "custom image URLs are admin-only — build from a base image")
-    source_url = body.source_url
-    if base and not source_url:
-        source_url = base.source_url
-    if not source_url:
-        from .seed import UBUNTU_2404_URL
-        source_url = UBUNTU_2404_URL
-    source_url = validate_image_url(source_url)
-    # Clamp the baked disk to the target ceiling (parity with the deploy path).
-    eff_disk_gb = conn.max_disk_gb or settings.max_disk_gb
-    disk_gb = max(1, min(body.disk, eff_disk_gb) if eff_disk_gb else body.disk)
-    img = Image(kind="golden", name=name, os_family=body.os_family,
-                connection_id=conn.id, node=body.node or conn.node,
-                storage=body.storage or conn.storage,
-                base_image_id=body.baseImageId, disk_gb=disk_gb, checksum=checksum,
-                source_url=source_url, recipe_json=json.dumps(body.recipe or []),
-                build_status="building", progress=0, created_by=user.id)
-    session.add(img)
-    session.commit()
-    session.refresh(img)
-    # Plumb the base image's checksum into the build so the node verifies integrity
-    # on download (the F19 fix re-raises on a mismatch instead of swallowing it).
-    job = Job(type="image_build", title=f"Building image: {img.name}", image_id=img.id,
-              connection_id=conn.id, created_by=user.id, status="queued",
-              context_json=json.dumps({"source_url": source_url, "disk": disk_gb,
-                                        "checksum": checksum,
-                                        "checksum_algorithm": _checksum_algo(checksum)}))
-    session.add(job)
-    record_audit(session, user, "image.build", "image", img.id, img.name)
-    session.commit()
-    session.refresh(job)
-    return {"ok": True, "jobId": job.id, "imgId": img.id}
-
-
-@router.post("/images/{img_id}/rebuild")
-def rebuild_golden(img_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    img = session.get(Image, img_id)
-    if not img or img.kind != "golden":
-        raise HTTPException(404, "golden image not found")
-    # Rebuild is a mutation (churns the node template, resets build_status) — same
-    # owner/admin guard as edit_image/delete_image. Golden images are a shared catalog
-    # anyone can DEPLOY from, but only the owner (or an admin) may rebuild one.
-    if img.created_by != user.id and user.role != "admin":
-        raise HTTPException(403, "not yours")
-    conn = session.get(Connection, img.connection_id) if img.connection_id else session.exec(select(Connection)).first()
-    if not conn:
-        raise HTTPException(400, "no connection")
-    img.build_status = "building"
-    img.progress = 0
-    session.add(img)
-    job = Job(type="image_build", title=f"Rebuilding image: {img.name}", image_id=img.id,
-              connection_id=conn.id, created_by=user.id, status="queued",
-              context_json=json.dumps({"source_url": img.source_url, "disk": img.disk_gb or 20,
-                                        "checksum": img.checksum or "",
-                                        "checksum_algorithm": _checksum_algo(img.checksum or "")}))
-    session.add(job)
-    session.commit()
-    session.refresh(job)
-    return {"ok": True, "jobId": job.id}
 
 
 # --------------------------------------------------------------------------- #
@@ -2034,14 +1937,13 @@ def delete_block(key: str, user: User = Depends(current_user), session: Session 
 
 
 # =========================================================================== #
-# CRUD: images (edit base, delete base+golden)                               #
+# CRUD: images (edit/delete base images)                                     #
 # =========================================================================== #
 class BaseImageEditBody(BaseModel):
     name: Optional[str] = None
     os_family: Optional[str] = None
     source_url: Optional[str] = None
     checksum: Optional[str] = None
-    recipe: Optional[list] = None
 
 
 @router.put("/images/{img_id}")
@@ -2060,14 +1962,12 @@ def edit_image(img_id: int, body: BaseImageEditBody, user: User = Depends(curren
     if body.os_family:
         img.os_family = body.os_family
     if body.source_url:
-        # Same SSRF-via-node rationale as build_golden: a raw download URL is admin-only.
+        # Same SSRF-via-node rationale: a raw download URL is admin-only.
         if user.role != "admin":
             raise HTTPException(403, "custom image URLs are admin-only")
         img.source_url = validate_image_url(body.source_url)
     if body.checksum is not None:
         img.checksum = body.checksum
-    if body.recipe is not None:
-        img.recipe_json = json.dumps(body.recipe)
     session.add(img)
     record_audit(session, user, "image.update", "image", img.id, img.name)
     session.commit()
@@ -2084,73 +1984,12 @@ def delete_image(img_id: int, user: User = Depends(current_user), session: Sessi
     if img.kind == "base" and user.role != "admin":
         raise HTTPException(403, "admin only")
     if session.exec(select(Deployment).where(Deployment.image_id == img_id)).first():
-        raise HTTPException(409, "golden image has deployed VMs — destroy them first")
-    # Destroy the node template (best effort, guarded to our vmid window). Only for
-    # a successfully-built golden, and only if no OTHER image row claims the same
-    # vmid — a failed build can leave a stale vmid claim that a later successful
-    # build reused, and we must not take out that live template.
-    shared = None
-    if img.template_vmid and img.connection_id:
-        shared = session.exec(
-            select(Image).where(
-                Image.id != img.id,
-                Image.connection_id == img.connection_id,
-                Image.template_vmid == img.template_vmid,
-            )
-        ).first()
-    if (img.kind == "golden" and img.build_status == "ready"
-            and img.template_vmid and img.connection_id and shared is None):
-        conn = session.get(Connection, img.connection_id)
-        if conn:
-            try:
-                px = Proxmox(conn)
-                node = img.node or conn.node or px.pick_node()
-                px.stop(img.template_vmid, node)
-            except Exception:  # noqa: BLE001
-                pass
-            try:
-                upid = px.destroy(img.template_vmid, node)
-                px.wait_task(upid, node=node, timeout=180)
-            except Exception:  # noqa: BLE001
-                pass
+        raise HTTPException(409, "image has deployed VMs — destroy them first")
     session.delete(img)
     record_audit(session, user, "image.delete", "image", img_id, img.name)
     session.commit()
     return {"ok": True}
 
-
-@router.get("/images/stale")
-def stale_images(user: User = Depends(current_user), session: Session = Depends(get_session)):
-    """Read-only report of golden images that look stale — failed/incomplete builds, or
-    ready templates that no deployment references. Pure DB analysis: NO Proxmox calls and
-    nothing destructive. Cleanup is opt-in and reuses DELETE /api/images/{id}, so its
-    409-on-deployments / RBAC / shared-vmid-template guards stay in force. Non-admins only
-    see their OWN goldens; admins see all (with owner names)."""
-    q = select(Image).where(Image.kind == "golden")
-    if user.role != "admin":
-        q = q.where(Image.created_by == user.id)
-    unames = ({u.id: u.name for u in session.exec(select(User)).all()}
-              if user.role == "admin" else {})
-    out = []
-    for img in session.exec(q.order_by(Image.id.desc())).all():
-        deps = session.exec(
-            select(func.count(Deployment.id)).where(Deployment.image_id == img.id)).one()
-        if img.build_status == "failed":
-            reason = "build failed"
-        elif img.build_status == "none" and not img.template_vmid:
-            reason = "never finished building"
-        elif img.build_status == "ready" and deps == 0:
-            reason = "no deployments use it"
-        else:
-            continue  # building/importing, or ready+in-use → not stale
-        out.append({
-            "imgId": img.id, "name": img.name, "reason": reason,
-            "deployments": deps, "state": img.build_status, "vmid": img.template_vmid,
-            "built": S._rel(img.built_at) if img.built_at else "—",
-            "owner": unames.get(img.created_by, "—"),
-            "canDelete": (img.created_by == user.id or user.role == "admin"),
-        })
-    return {"candidates": out}
 
 
 # =========================================================================== #

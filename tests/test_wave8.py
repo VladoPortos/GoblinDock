@@ -157,7 +157,7 @@ def test_widget_key_user_auth():
 
 def test_widget_summary_counts():
     from app import api
-    from app.models import Deployment, Image, Job
+    from app.models import Connection, Deployment, Image, Job, Template
 
     aid = _mk_user("summary-a@x.io")
     bid = _mk_user("summary-b@x.io")
@@ -170,10 +170,18 @@ def test_widget_summary_counts():
         s.add(Job(title="ra", created_by=aid, status="running"))
         s.add(Job(title="da", created_by=aid, status="succeeded"))
         s.add(Job(title="qb", created_by=bid, status="running"))
-        # goldens: only a built one (template_vmid set) is deployable
-        s.add(Image(kind="golden", name="g-ready", template_vmid=9001, build_status="ready"))
-        s.add(Image(kind="golden", name="g-building", build_status="building"))
-        s.add(Image(kind="base", name="base1"))
+        # one deployable template (base_image_id + connection_id both set)
+        base = Image(kind="base", name="base1", source_url="https://example.com/img.img",
+                     build_status="ready")
+        s.add(base)
+        s.flush()
+        conn = Connection(name="c1", host="h", port=8006, token_id="t", token_secret_enc=b"x")
+        s.add(conn)
+        s.flush()
+        s.add(Template(name="tpl1", base_image_id=base.id, connection_id=conn.id,
+                       owner_id=aid, public=True))
+        # a template missing connection_id must NOT count
+        s.add(Template(name="tpl-no-conn", base_image_id=base.id, owner_id=aid, public=True))
 
     # non-admin A sees ONLY their own VMs/jobs
     with session_scope() as s:
@@ -184,7 +192,7 @@ def test_widget_summary_counts():
     assert out["vms_error"] == 1, out
     assert out["vms_working"] == 1, out
     assert out["jobs_active"] == 2, out
-    assert out["golden_images"] == 1, out
+    assert out["templates"] == 1, out
 
     # admin sees ALL VMs/jobs
     admin_id = _mk_user("summary-admin@x.io", role="admin")
@@ -193,7 +201,7 @@ def test_widget_summary_counts():
     assert out["vms_total"] == 6, out
     assert out["vms_running"] == 3, out
     assert out["jobs_active"] == 3, out
-    assert out["golden_images"] == 1, out
+    assert out["templates"] == 1, out
     print("test_widget_summary_counts OK")
 
 

@@ -1,4 +1,4 @@
-"""Wave 2 — job state-machine reliability (claim-cancel, crash recovery, wait-stopped).
+"""Wave 2 — job state-machine reliability (claim-cancel, crash recovery).
 
 Uses an isolated temp SQLite DB. Run:
   GOBLINDOCK_SECRET_KEY=<64hex> .venv/bin/python tests/test_wave2.py
@@ -73,21 +73,7 @@ def test_recover_orphans():
     print("test_recover_orphans OK")
 
 
-def test_wait_stopped():
-    class _Px:
-        def __init__(self, statuses):
-            self.statuses = list(statuses)
-        def vm_current(self, vmid, node=None):
-            return {"status": self.statuses.pop(0) if self.statuses else "stopped"}
-    # already stopped → True immediately
-    assert worker._wait_stopped(_Px(["stopped"]), 8001, "n", deadline=5) is True
-    # never stops within a zero deadline → False (final check sees 'running')
-    assert worker._wait_stopped(_Px(["running"]), 8001, "n", deadline=0) is False
-    print("test_wait_stopped OK")
-
-
 if __name__ == "__main__":
     test_claim_skips_cancelled()
     test_recover_orphans()
-    test_wait_stopped()
     print("\nALL WAVE 2 UNIT TESTS PASSED")

@@ -225,41 +225,6 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
     }
 
 
-def golden_image_dict(session: Session, img: Image) -> dict:
-    recipe = json.loads(img.recipe_json or "[]")
-    chips = recipe_block_chips(recipe) or ["clean cloud-init base"]
-    # building/importing both render as "building"; ready→ready; anything else
-    # (failed/none) passes through unchanged so a failed build isn't hidden.
-    state = {"building": "building", "importing": "building",
-             "ready": "ready"}.get(img.build_status, img.build_status)
-    conn = session.get(Connection, img.connection_id) if img.connection_id else None
-    return {
-        "id": f"img-{img.id}",
-        "imgId": img.id,
-        "name": img.name,
-        "os": img.os_family,
-        "base": _base_name(session, img),
-        "built": _rel(img.built_at) if img.built_at else "—",
-        "state": state,
-        "blocks": chips,
-        "vmid": img.template_vmid,
-        "deployable": bool(img.template_vmid and img.build_status == "ready"),
-        "progress": img.progress,
-        "osFamily": img.os_family,
-        "recipe": recipe,
-        "connId": img.connection_id,
-        "location": (conn.name if conn else "—") + (" · " + img.node if img.node else ""),
-    }
-
-
-def _base_name(session: Session, img: Image) -> str:
-    if img.base_image_id:
-        b = session.get(Image, img.base_image_id)
-        if b:
-            return b.name
-    return "Ubuntu 24.04 LTS"
-
-
 def base_image_dict(img: Image) -> dict:
     return {
         "id": f"img-{img.id}",

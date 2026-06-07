@@ -330,14 +330,14 @@ built-in `customapi` widget does it all from `services.yaml`.
         - { field: vms_running,   label: Running, format: number }
         - { field: vms_total,     label: VMs,     format: number }
         - { field: jobs_active,   label: Jobs,    format: number }
-        - { field: golden_images, label: Goldens, format: number }
+        - { field: templates,     label: Templates, format: number }
 ```
 
 The key is **per-user and read-only** — it authenticates only `GET /api/widget/summary`
 (scoped to its owner: a User sees their own counts, an Admin sees all) and can never
 deploy, read, or change anything. **Regenerate** rotates it (the old key dies immediately)
 and **Revoke** disables it, both from the Profile page. Available fields: `vms_total`,
-`vms_running`, `vms_stopped`, `vms_working`, `vms_error`, `jobs_active`, `golden_images`.
+`vms_running`, `vms_stopped`, `vms_working`, `vms_error`, `jobs_active`, `templates`.
 
 ---
 
