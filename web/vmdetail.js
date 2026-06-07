@@ -277,7 +277,7 @@
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
           Card('Overview', h('div', null,
             h(Row, { k: 'Golden image', v: d.golden }),
-            h(Row, { k: 'Recipe', v: d.recipe || 'none' }),
+            h(Row, { k: 'Template', v: d.template || 'none' }),
             h(Row, { k: 'Target', v: d.connection + ' · ' + d.node }),
             h(Row, { k: 'IP address', v: d.ip, mono: true, copy: true }),
             h(Row, { k: 'MAC', v: d.mac || (cfg.net0 || '').match(/[0-9A-Fa-f:]{17}/)?.[0], mono: true }),

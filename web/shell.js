@@ -12,7 +12,7 @@
     ]},
     { group: 'Build', items: [
       { id: 'golden',    label: 'Golden Images', icon: 'package' },
-      { id: 'recipes',   label: 'Recipes',    icon: 'template' },
+      { id: 'templates', label: 'Templates',   icon: 'template' },
       { id: 'blocks',    label: 'Blocks',     icon: 'blocks' },
     ]},
     { group: 'Manage', items: [
@@ -59,8 +59,8 @@
   const TITLES = {
     dashboard: ['Operate', 'Virtual Machines'], vmdetail: ['Operate', 'Virtual Machine'], deploy: ['Operate', 'Deploy VM'],
     job: ['Operate', 'Job Progress'], golden: ['Build', 'Golden Images'],
-    builder: ['Build', 'Golden Image'], recipes: ['Build', 'Recipes'],
-    newrecipe: ['Build', 'Recipe'], blocks: ['Build', 'Blocks'],
+    builder: ['Build', 'Golden Image'], templates: ['Build', 'Templates'],
+    newtemplate: ['Build', 'Template'], blocks: ['Build', 'Blocks'],
     isos: ['Manage', 'ISOs / Base Images'], secrets: ['Manage', 'Secrets'],
     variables: ['Manage', 'Variables'],
     settings: ['Manage', 'Settings'], profile: ['Account', 'Profile'],

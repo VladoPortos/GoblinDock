@@ -102,11 +102,11 @@ window.API = (function () {
     deleteImage: (id) => req('DELETE', `/api/images/${id}`),
     staleImages: () => req('GET', '/api/images/stale'),
 
-    // recipes (runtime customisation, decoupled from images)
-    saveRecipe: (p) => req('POST', '/api/recipes', p),
-    editRecipe: (id, p) => req('PUT', `/api/recipes/${id}`, p),
-    deleteRecipe: (id) => req('DELETE', `/api/recipes/${id}`),
-    compile: (recipe, name) => req('POST', '/api/recipes/compile', { recipe, name }),
+    // templates (deployment presets: golden image + blocks + defaults)
+    saveTemplate: (p) => req('POST', '/api/templates', p),
+    editTemplate: (id, p) => req('PUT', `/api/templates/${id}`, p),
+    deleteTemplate: (id) => req('DELETE', `/api/templates/${id}`),
+    compile: (recipe, name) => req('POST', '/api/templates/compile', { recipe, name }),
 
     // blocks
     createBlock: (p) => req('POST', '/api/blocks', p),

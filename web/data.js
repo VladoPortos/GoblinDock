@@ -19,7 +19,7 @@
     VMS: [],
     BASE_IMAGES: [],
     GOLDEN_IMAGES: [],
-    RECIPES: [],
+    TEMPLATES: [],
     PALETTE: [],
     SECRETS: [],
     VARIABLES: [],

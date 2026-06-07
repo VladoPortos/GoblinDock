@@ -203,7 +203,7 @@
     sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; secId = s.id; } }));
     if (!block) {
       return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
-        h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, mode === 'golden' ? 'Golden image' : 'Recipe')),
+        h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, mode === 'golden' ? 'Golden image' : 'Template')),
         h('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 14 } },
           h(SpecField, { icon: 'tag', label: mode === 'golden' ? 'Image name' : 'Template name' },
             h(Field, { value: meta.name, onChange: meta.setName, mono: true })),
@@ -227,7 +227,7 @@
             h(Icon, { name: 'info', size: 15, style: { color: 'var(--text-faint)', flexShrink: 0, marginTop: 1 } }),
             h('p', { className: 'hint', style: { fontSize: 11.5 } }, mode === 'golden'
               ? 'Blocks here are baked INTO the image. Cloud-init blocks run at first boot; ansible blocks run post-boot.'
-              : 'These blocks run on every VM you deploy with this recipe.'))));
+              : 'These blocks run on every VM you deploy with this template.'))));
     }
     const schema = paletteByKey(block.ref).schema || [];
     return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
@@ -290,14 +290,14 @@
 
   // ---------- Shell ----------
   function Builder({ go, mode }) {
-    // mode: 'golden' (base + location + bake-time blocks) | 'recipe' (runtime blocks)
+    // mode: 'golden' (base + location + bake-time blocks) | 'template' (runtime blocks)
     const nav = window.GDStore.nav || {};
     const loadedImg = mode === 'golden' && nav.imageId ? (GD.GOLDEN_IMAGES || []).find((g) => g.imgId === nav.imageId) : null;
-    const loadedRecipe = mode === 'recipe' && nav.recipeId ? (GD.RECIPES || []).find((r) => r.recipeId === nav.recipeId) : null;
+    const loadedTpl = mode === 'template' && nav.templateId ? (GD.TEMPLATES || []).find((r) => r.templateId === nav.templateId) : null;
     const firstBase = (nav.baseImageId ? (GD.BASE_IMAGES || []).find((b) => b.imgId === nav.baseImageId) : null) || (GD.BASE_IMAGES || [])[0] || {};
 
     const initSections = () => {
-      const src = (loadedImg && loadedImg.recipe) || (loadedRecipe && loadedRecipe.recipe) || null;
+      const src = (loadedImg && loadedImg.recipe) || (loadedTpl && loadedTpl.recipe) || null;
       if (!src || !src.length) return blankSections();
       const out = blankSections();
       const byId = Object.fromEntries(out.map((s) => [s.id, s]));
@@ -321,10 +321,10 @@
 
     const bases = GD.BASE_IMAGES || [];
     const conns = (GD.CONNECTIONS || []);
-    const [recipeName, setRecipeName] = useState(loadedImg ? loadedImg.name : loadedRecipe ? loadedRecipe.name : (mode === 'golden' ? 'gd-custom' : 'Custom recipe'));
-    const [cpu, setCpu] = useState(loadedRecipe ? loadedRecipe.cpu : 1);
-    const [mem, setMem] = useState(loadedRecipe ? loadedRecipe.mem : 2);
-    const [disk, setDisk] = useState(loadedImg ? 20 : (loadedRecipe ? loadedRecipe.disk : 20));
+    const [recipeName, setRecipeName] = useState(loadedImg ? loadedImg.name : loadedTpl ? loadedTpl.name : (mode === 'golden' ? 'gd-custom' : 'Custom template'));
+    const [cpu, setCpu] = useState(loadedTpl ? loadedTpl.cpu : 1);
+    const [mem, setMem] = useState(loadedTpl ? loadedTpl.mem : 2);
+    const [disk, setDisk] = useState(loadedImg ? 20 : (loadedTpl ? loadedTpl.disk : 20));
     // golden-mode: base + location (which Proxmox + node)
     const [selBaseId, setSelBaseId] = useState(loadedImg ? null : (firstBase.imgId || null));
     const [selConnId, setSelConnId] = useState(loadedImg ? loadedImg.connId : ((conns[0] && conns[0].connId) || null));
@@ -342,7 +342,7 @@
           options: conns.map((c) => ({ value: c.connId, label: c.name + ' · ' + (c.node || 'auto') })) };
       }
     } else {
-      metaBase = ''; metaOs = loadedRecipe ? loadedRecipe.os : 'ubuntu';
+      metaBase = ''; metaOs = loadedTpl ? loadedTpl.os : 'ubuntu';
     }
     const meta = {
       name: recipeName, setName: setRecipeName, base: metaBase, os: metaOs,
@@ -403,12 +403,12 @@
             recipe: recipePayload(), disk: Number(disk) || 20,
           });
           go('job', { jobId: r.jobId });
-        } else if (loadedRecipe) {
-          await window.API.editRecipe(loadedRecipe.recipeId, { name: recipeName.trim(), recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedRecipe.public });
-          window.GDStore.toast('Recipe updated', 'ok'); await window.GDStore.refresh().catch(() => {}); go('recipes');
+        } else if (loadedTpl) {
+          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public });
+          window.GDStore.toast('Template updated', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         } else {
-          await window.API.saveRecipe({ name: recipeName.trim() || 'Custom recipe', recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk) });
-          window.GDStore.toast('Recipe saved', 'ok'); await window.GDStore.refresh().catch(() => {}); go('recipes');
+          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk) });
+          window.GDStore.toast('Template saved', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         }
       } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); setBusy(false); busyRef.current = false; }
     };
@@ -419,8 +419,8 @@
     return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%' } },
       h('div', { className: 'builder-bar' },
         h('div', { className: 'row', style: { gap: 10, minWidth: 0 } },
-          h('button', { className: 'btn ghost sm', title: 'Back', onClick: () => go(mode === 'golden' ? 'golden' : 'recipes') },
-            h(Icon, { name: 'chevronL', size: 16 }), mode === 'golden' ? 'Golden Images' : 'Recipes'),
+          h('button', { className: 'btn ghost sm', title: 'Back', onClick: () => go(mode === 'golden' ? 'golden' : 'templates') },
+            h(Icon, { name: 'chevronL', size: 16 }), mode === 'golden' ? 'Golden Images' : 'Templates'),
           h(Icon, { name: mode === 'golden' ? 'hammer' : 'template', size: 17, style: { color: 'var(--accent)' } }),
           h('input', { className: 'recipe-name mono', value: recipeName, onChange: (e) => setRecipeName(e.target.value) }),
           h('span', { className: 'chip', style: { gap: 6 } }, h(OSGlyph, { os: meta.os, size: 14 }), meta.base),
@@ -428,7 +428,7 @@
           warnCount > 0 && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, h(Icon, { name: 'warn', size: 12 }), warnCount, ' need input')),
         h('div', { className: 'row', style: { marginLeft: 'auto', gap: 8 } },
           h('button', { className: 'btn sm', onClick: openYaml }, h(Icon, { name: 'code', size: 15 }), 'View YAML'),
-          h('button', { className: 'btn primary sm', onClick: () => { if (mode === 'golden' && loadedImg) setRebuildAsk(true); else if (mode === 'golden') setBuildAsk(true); else doBuildOrSave(); }, disabled: busy }, h(Icon, { name: mode === 'golden' ? 'hammer' : 'check', size: 15 }), busy ? 'Working…' : (mode === 'golden' ? (loadedImg ? 'Rebuild' : 'Build image') : (loadedRecipe ? 'Save changes' : 'Save recipe'))))),
+          h('button', { className: 'btn primary sm', onClick: () => { if (mode === 'golden' && loadedImg) setRebuildAsk(true); else if (mode === 'golden') setBuildAsk(true); else doBuildOrSave(); }, disabled: busy }, h(Icon, { name: mode === 'golden' ? 'hammer' : 'check', size: 15 }), busy ? 'Working…' : (mode === 'golden' ? (loadedImg ? 'Rebuild' : 'Build image') : (loadedTpl ? 'Save changes' : 'Save template'))))),
       h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
         h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({ new: true }) }),
         h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),

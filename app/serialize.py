@@ -104,16 +104,16 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     conn = conns.get(dep.connection_id)
     os_family = "generic"
     image_name = ""
-    recipe_name = ""
+    template_name = ""
     if dep.image_id:
         img = session.get(Image, dep.image_id)
         if img:
             os_family = img.os_family
             image_name = img.name
     if dep.template_id:
-        rc = session.get(Template, dep.template_id)
-        if rc:
-            recipe_name = rc.name
+        tpl = session.get(Template, dep.template_id)
+        if tpl:
+            template_name = tpl.name
 
     status = dep.status
     cpu_pct = 0
@@ -153,7 +153,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         "conn": conn.name if conn else "—",
         "os": os_family,
         "image": image_name or "—",
-        "template": recipe_name or image_name or "—",
+        "template": template_name or image_name or "—",
         "cpu": cpu_pct,
         "ram": ram_pct,
         "uptime": uptime,
@@ -272,20 +272,20 @@ def base_image_dict(img: Image) -> dict:
     }
 
 
-def recipe_dict(session: Session, rc: Template) -> dict:
-    used = session.exec(select(Deployment).where(Deployment.template_id == rc.id)).all()
-    recipe = json.loads(rc.recipe_json or "[]")
+def template_dict(session: Session, t: Template) -> dict:
+    used = session.exec(select(Deployment).where(Deployment.template_id == t.id)).all()
+    recipe = json.loads(t.recipe_json or "[]")
     return {
-        "id": f"r-{rc.id}",
-        "recipeId": rc.id,
-        "name": rc.name,
-        "os": rc.os_family,
-        "desc": rc.description or "",
-        "cpu": rc.default_cpu,
-        "mem": rc.default_ram,
-        "disk": rc.default_disk,
+        "id": f"t-{t.id}",
+        "templateId": t.id,
+        "name": t.name,
+        "os": t.os_family,
+        "desc": t.description or "",
+        "cpu": t.default_cpu,
+        "mem": t.default_ram,
+        "disk": t.default_disk,
         "used": len(used),
-        "public": rc.public,
+        "public": t.public,
         "blocks": recipe_block_chips(recipe),
         "recipe": recipe,
     }

@@ -81,9 +81,9 @@
       deploy: () => h(window.Deploy, { go }),
       job: () => h(window.JobProgress, { go }),
       builder: () => h(window.Builder, { go, mode: 'golden' }),
-      newrecipe: () => h(window.Builder, { go, mode: 'recipe' }),
+      newtemplate: () => h(window.Builder, { go, mode: 'template' }),
       golden: () => h(window.GoldenImages, { go }),
-      recipes: () => h(window.RecipesList, { go }),
+      templates: () => h(window.TemplatesList, { go }),
       isos: () => h(window.Isos, { go }),
       blocks: () => h(window.BlocksLib, { go }),
       secrets: () => h(window.Secrets, { go }),
@@ -92,7 +92,7 @@
       profile: () => h(window.Profile, { go, theme, setTheme }),
     };
     const Screen = SCREENS[route] || SCREENS.dashboard;
-    const fullBleed = route === 'builder' || route === 'newrecipe';
+    const fullBleed = route === 'builder' || route === 'newtemplate';
 
     return h('div', { className: 'app' },
       h(Sidebar, { route, go, collapsed, setCollapsed, runningJobs }),

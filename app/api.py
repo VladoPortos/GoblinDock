@@ -1,5 +1,5 @@
 """GoblinDock HTTP API — one router covering auth, state, VMs, images,
-templates, blocks, recipes, secrets, settings and jobs (incl. SSE).
+templates, blocks, secrets, settings and jobs (incl. SSE).
 """
 from __future__ import annotations
 
@@ -400,10 +400,10 @@ def state(request: Request, user: User = Depends(current_user), session: Session
 
     base = [S.base_image_dict(i) for i in session.exec(select(Image).where(Image.kind == "base")).all()]
     golden = [S.golden_image_dict(session, i) for i in session.exec(select(Image).where(Image.kind == "golden").order_by(Image.id.desc())).all()]
-    rcs = session.exec(select(Template).order_by(Template.id)).all()
+    tpls = session.exec(select(Template).order_by(Template.id)).all()
     if user.role != "admin":
-        rcs = [r for r in rcs if r.public or r.owner_id == user.id]
-    recipes = [S.recipe_dict(session, r) for r in rcs]
+        tpls = [t for t in tpls if t.public or t.owner_id == user.id]
+    templates = [S.template_dict(session, t) for t in tpls]
     blocks_all = session.exec(select(Block).order_by(Block.id)).all()
     if user.role != "admin":
         blocks_all = [b for b in blocks_all if b.builtin or b.owner_id == user.id]
@@ -455,7 +455,7 @@ def state(request: Request, user: User = Depends(current_user), session: Session
         "VMS": vms,
         "BASE_IMAGES": base,
         "GOLDEN_IMAGES": golden,
-        "RECIPES": recipes,
+        "TEMPLATES": templates,
         "PALETTE": blocks,
         "SECRETS": secrets,
         "VARIABLES": variables,
@@ -515,7 +515,7 @@ def widget_summary(user: User = Depends(widget_key_user),
 # --------------------------------------------------------------------------- #
 class DeployBody(BaseModel):
     goldenImageId: int                 # the golden image to clone from
-    recipeId: Optional[int] = None     # optional runtime recipe applied on top
+    templateId: Optional[int] = None  # optional template applied on top
     connectionId: Optional[int] = None
     networkId: Optional[int] = None
     name: Optional[str] = None
@@ -548,13 +548,13 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
     if not conn:
         raise HTTPException(400, "no Proxmox connection configured")
 
-    rc = session.get(Template, body.recipeId) if body.recipeId else None
-    if body.recipeId and not rc:
-        raise HTTPException(404, "recipe not found")
-    # Only a public recipe, your own, or (admin) any may be applied — a private recipe
+    tpl = session.get(Template, body.templateId) if body.templateId else None
+    if body.templateId and not tpl:
+        raise HTTPException(404, "template not found")
+    # Only a public template, your own, or (admin) any may be applied — a private template
     # must not be usable by id. 404 (not 403) so ids can't be enumerated.
-    if rc and not (rc.public or rc.owner_id == user.id or user.role == "admin"):
-        raise HTTPException(404, "recipe not found")
+    if tpl and not (tpl.public or tpl.owner_id == user.id or user.role == "admin"):
+        raise HTTPException(404, "template not found")
 
     # Cap to the target connection's per-VM ceilings (0 = inherit the global default).
     eff_cores = conn.max_cores or settings.max_cores
@@ -573,7 +573,7 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
         net = default_network_for(session, conn, user.id)
 
     dep = Deployment(name=name, owner_id=user.id, connection_id=conn.id,
-                     image_id=img.id, template_id=(rc.id if rc else None), cpu=cpu, ram=ram,
+                     image_id=img.id, template_id=(tpl.id if tpl else None), cpu=cpu, ram=ram,
                      disk=disk, status="working", node=img.node or conn.node,
                      network_id=net.id, tags=body.tags, notes=body.notes)
     session.add(dep)
@@ -694,7 +694,7 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         raise HTTPException(403, "not your VM")
     conn = session.get(Connection, dep.connection_id)
     img = session.get(Image, dep.image_id) if dep.image_id else None
-    rc = session.get(Template, dep.template_id) if dep.template_id else None
+    tpl = session.get(Template, dep.template_id) if dep.template_id else None
     owner = session.get(User, dep.owner_id) if dep.owner_id else None
     job = session.exec(select(Job).where(Job.deployment_id == dep.id).order_by(Job.id.desc())).first()
     out = {
@@ -703,7 +703,7 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         "status": dep.status, "ip": dep.ip, "mac": dep.mac, "tags": dep.tags,
         "created": S._rel(dep.created_at), "owner": owner.name if owner else "—",
         "connection": conn.name if conn else "—",
-        "golden": img.name if img else "—", "recipe": rc.name if rc else None,
+        "golden": img.name if img else "—", "template": tpl.name if tpl else None,
         "os": img.os_family if img else "generic",
         "reqCpu": dep.cpu, "reqRam": dep.ram, "reqDisk": dep.disk,
         "jobId": job.id if job else None,
@@ -1053,7 +1053,7 @@ def rebuild_golden(img_id: int, user: User = Depends(current_user), session: Ses
 
 
 # --------------------------------------------------------------------------- #
-# templates + recipes                                                          #
+# templates                                                                    #
 # --------------------------------------------------------------------------- #
 class TemplateBody(BaseModel):
     name: str
@@ -1066,29 +1066,29 @@ class TemplateBody(BaseModel):
     public: bool = True
 
 
-@router.post("/recipes")
-def save_recipe(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    rc = Template(name=body.name.strip() or "recipe", description=body.description,
+@router.post("/templates")
+def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    rc = Template(name=body.name.strip() or "template", description=body.description,
                 os_family=body.os_family, recipe_json=json.dumps(body.recipe or []),
                 default_cpu=min(body.cpu, settings.max_cores),
                 default_ram=min(body.ram, settings.max_ram_mb // 1024),
                 default_disk=body.disk, public=body.public, owner_id=user.id)
     session.add(rc)
-    record_audit(session, user, "recipe.create", "recipe", "-", rc.name)
+    record_audit(session, user, "template.create", "template", "-", rc.name)
     session.commit()
     return {"ok": True}
 
 
-def _recipe_owned(rc: Template, user: User) -> bool:
+def _template_owned(rc: Template, user: User) -> bool:
     return user.role == "admin" or rc.owner_id == user.id
 
 
-@router.put("/recipes/{rid}")
-def edit_recipe_ep(rid: int, body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
+@router.put("/templates/{rid}")
+def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     rc = session.get(Template, rid)
     if not rc:
         raise HTTPException(404, "not found")
-    if not _recipe_owned(rc, user):
+    if not _template_owned(rc, user):
         raise HTTPException(403, "not yours")
     rc.name = body.name.strip() or rc.name
     rc.description = body.description
@@ -1098,20 +1098,20 @@ def edit_recipe_ep(rid: int, body: TemplateBody, user: User = Depends(current_us
     rc.default_disk = body.disk
     rc.public = body.public
     session.add(rc)
-    record_audit(session, user, "recipe.update", "recipe", rc.id, rc.name)
+    record_audit(session, user, "template.update", "template", rc.id, rc.name)
     session.commit()
     return {"ok": True}
 
 
-@router.delete("/recipes/{rid}")
-def delete_recipe_ep(rid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+@router.delete("/templates/{rid}")
+def delete_template_ep(rid: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
     rc = session.get(Template, rid)
     if not rc:
         raise HTTPException(404, "not found")
-    if not _recipe_owned(rc, user):
+    if not _template_owned(rc, user):
         raise HTTPException(403, "not yours")
     session.delete(rc)
-    record_audit(session, user, "recipe.delete", "recipe", rid, rc.name)
+    record_audit(session, user, "template.delete", "template", rid, rc.name)
     session.commit()
     return {"ok": True}
 
@@ -1121,8 +1121,8 @@ class CompileBody(BaseModel):
     name: str = "recipe"
 
 
-@router.post("/recipes/compile")
-def compile_recipe(body: CompileBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
+@router.post("/templates/compile")
+def compile_template(body: CompileBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     # Resolve only blocks the caller may see (built-in or their own) — same visibility
     # rule as /state and /blocks — so a crafted recipe can't render another user's
     # private block template. Unknown/forbidden keys simply render as no-ops.

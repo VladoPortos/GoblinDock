@@ -155,8 +155,8 @@
       widgetCard);
   }
 
-  /* ============ RECIPES LIST ============ */
-  function RecipeCard({ r, go, onDelete }) {
+  /* ============ TEMPLATES LIST ============ */
+  function TemplateCard({ r, go, onDelete }) {
     return h('div', { className: 'card', style: { overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
       h('div', { className: 'card-pad', style: { display: 'flex', flexDirection: 'column', gap: 12, flex: 1 } },
         h('div', { className: 'row', style: { gap: 10 } },
@@ -167,45 +167,45 @@
           h('div', { style: { marginLeft: 'auto' } },
             r.public ? h('span', { className: 'badge accent' }, h(Icon, { name: 'globe', size: 12 }), 'Public')
               : h('span', { className: 'badge' }, h(Icon, { name: 'user', size: 12 }), 'Private'))),
-        h('p', { className: 'hint', style: { fontSize: 12.5, lineHeight: 1.5, minHeight: 34 } }, r.desc || 'A reusable runtime customization applied on top of a deployed VM.'),
+        h('p', { className: 'hint', style: { fontSize: 12.5, lineHeight: 1.5, minHeight: 34 } }, r.desc || 'A reusable deployment preset.'),
         (r.blocks || []).length > 0 && h('div', { className: 'row wrap', style: { gap: 5 } },
           r.blocks.slice(0, 6).map((b, i) => h('span', { key: i, className: 'chip', style: { fontSize: 10.5, padding: '3px 7px' } }, b))),
         h('div', { className: 'row mono', style: { gap: 10, fontSize: 11, color: 'var(--text-faint)', marginTop: 'auto', paddingTop: 4 } },
           h('span', null, r.used, ' deploys'))),
       h('div', { style: { display: 'flex', borderTop: '1px solid var(--border-soft)' } },
-        h('button', { className: 'card-act', onClick: () => go('newrecipe', { recipeId: r.recipeId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit recipe'),
+        h('button', { className: 'card-act', onClick: () => go('newtemplate', { templateId: r.templateId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit template'),
         h(Menu, { align: 'right', items: [
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onDelete(r) },
         ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' } }, h(Icon, { name: 'more', size: 16 })))));
   }
 
-  function RecipesList({ go }) {
+  function TemplatesList({ go }) {
     const [confirm, setConfirm] = useState(null);
-    const recipes = GD.RECIPES || [];
-    const del = async (r) => { await window.API.deleteRecipe(r.recipeId); window.GDStore.toast('Recipe deleted', 'ok'); window.GDStore.refresh().catch(() => {}); };
+    const templates = GD.TEMPLATES || [];
+    const del = async (r) => { await window.API.deleteTemplate(r.templateId); window.GDStore.toast('Template deleted', 'ok'); window.GDStore.refresh().catch(() => {}); };
     return h('div', { className: 'page fadein' },
       h('div', { className: 'page-head' },
         h('div', null,
-          h('h1', { className: 'page-title' }, 'Recipes'),
-          h('div', { className: 'page-sub' }, 'Reusable runtime customizations (e.g. MySQL, k8s-node) applied to a VM at deploy time.')),
+          h('h1', { className: 'page-title' }, 'Templates'),
+          h('div', { className: 'page-sub' }, 'Reusable deployment presets — a golden image + blocks + defaults, ready to deploy.')),
         h('div', { className: 'spacer' }),
-        h('button', { className: 'btn primary', onClick: () => go('newrecipe') }, h(Icon, { name: 'plus', size: 16 }), 'New recipe')),
-      recipes.length === 0
+        h('button', { className: 'btn primary', onClick: () => go('newtemplate') }, h(Icon, { name: 'plus', size: 16 }), 'New template')),
+      templates.length === 0
         ? h('div', { className: 'card' }, h('div', { className: 'empty' },
             h('div', { className: 'glyph' }, h(Icon, { name: 'template', size: 28 })),
-            h('h3', null, 'No recipes yet'),
-            h('p', null, 'Pack a set of blocks under a name — choose it (or skip it) when you deploy.'),
-            h('button', { className: 'btn primary', onClick: () => go('newrecipe') }, h(Icon, { name: 'plus', size: 16 }), 'New recipe')))
+            h('h3', null, 'No templates yet'),
+            h('p', null, 'Save a golden image + blocks + sizing under a name — then deploy it again and again.'),
+            h('button', { className: 'btn primary', onClick: () => go('newtemplate') }, h(Icon, { name: 'plus', size: 16 }), 'New template')))
         : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 } },
-            recipes.map((r) => h(RecipeCard, { key: r.id, r, go, onDelete: (x) => setConfirm(x) }))),
+            templates.map((r) => h(TemplateCard, { key: r.id, r, go, onDelete: (x) => setConfirm(x) }))),
       confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null), tone: 'danger', icon: 'trash',
         title: 'Delete ' + confirm.name + '?',
-        body: 'Removes this recipe. Deployed VMs and golden images are not affected.',
-        confirmLabel: 'Delete recipe', onConfirm: () => del(confirm),
+        body: 'Removes this template. Deployed VMs and golden images are not affected.',
+        confirmLabel: 'Delete template', onConfirm: () => del(confirm),
       }));
   }
 
   window.Profile = Profile;
-  window.RecipesList = RecipesList;
+  window.TemplatesList = TemplatesList;
 })();

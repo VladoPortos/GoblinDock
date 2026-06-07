@@ -30,7 +30,7 @@
       h('div', { className: 'page-head' },
         h('div', null,
           h('h1', { className: 'page-title' }, 'Blocks'),
-          h('div', { className: 'page-sub' }, 'The Lego pieces of every recipe. Fork a built-in to customise it.')),
+          h('div', { className: 'page-sub' }, 'The Lego pieces of every template. Fork a built-in to customise it.')),
         h('div', { className: 'spacer' }),
         h('div', { className: 'search', style: { maxWidth: 240 } },
           h(Icon, { name: 'search', size: 15 }), h('input', { placeholder: 'Search blocks…', value: q, onChange: (e) => setQ(e.target.value) })),
@@ -55,7 +55,7 @@
                   h('button', { className: 'btn ghost sm', onClick: () => setEditor({ initial: b }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
                   h('button', { className: 'icon-btn danger', onClick: () => setConfirm(b) }, h(Icon, { name: 'trash', size: 15 }))))))),
       editor && h(window.BlockEditorModal, { initial: editor.initial, onClose: () => setEditor(null), onSaved: () => { setEditor(null); toast('Block saved', 'ok'); refresh(); } }),
-      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'This removes your custom block. Recipes already using it keep their copy of the inputs.', confirmLabel: 'Delete block', onConfirm: () => del(confirm) }));
+      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'This removes your custom block. Templates already using it keep their copy of the inputs.', confirmLabel: 'Delete block', onConfirm: () => del(confirm) }));
   }
 
   /* ============ SECRETS ============ */
@@ -178,7 +178,7 @@
       h('div', { className: 'page-head' },
         h('div', null,
           h('h1', { className: 'page-title' }, 'Variables'),
-          h('div', { className: 'page-sub' }, 'Plain (non-secret) values — visible, reusable across scripts and recipes.')),
+          h('div', { className: 'page-sub' }, 'Plain (non-secret) values — visible, reusable across scripts and templates.')),
         h('div', { className: 'spacer' }),
         h('button', { className: 'btn primary', onClick: () => setModal('add') }, h(Icon, { name: 'plus', size: 16 }), 'Add variable')),
       h('div', { className: 'card', style: { padding: 13, marginBottom: 16, display: 'flex', gap: 10, alignItems: 'center', background: 'var(--surface-2)' } },

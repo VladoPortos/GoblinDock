@@ -1,4 +1,4 @@
-/* GoblinDock — Deploy VM: pick a golden image + optional recipe + size. */
+/* GoblinDock — Deploy VM: pick a golden image + optional template + size. */
 (function () {
   const { useState, useEffect } = React;
   const Icon = window.Icon;
@@ -35,7 +35,7 @@
     const goldens = (GD.GOLDEN_IMAGES || []).filter(g => g.deployable);
     if (goldens.length === 0) return h(EmptyDeploy, { go });
 
-    const recipes = GD.RECIPES || [];
+    const templates = GD.TEMPLATES || [];
 
     const navGold = (window.GDStore.nav && window.GDStore.nav.goldenImageId)
       ? goldens.find(g => g.imgId === window.GDStore.nav.goldenImageId) : null;
@@ -48,7 +48,7 @@
     const maxMem = _conn.maxRamGb || _gl.maxRam || 2;
     const maxDisk = _conn.maxDiskGb || 500;
 
-    const [recipeId, setRecipeId] = useState(null);
+    const [templateId, setTemplateId] = useState(null);
     const [cpu, setCpu] = useState(maxCpu);
     const [mem, setMem] = useState(maxMem);
     const [disk, setDisk] = useState(Math.min(20, maxDisk));
@@ -57,11 +57,11 @@
     const [busy, setBusy] = useState(false);
     const busyRef = React.useRef(false);
 
-    const rc = recipes.find(r => r.recipeId === recipeId);
-    const pickRecipe = (id) => {
-      setRecipeId(id);
-      const r = recipes.find(x => x.recipeId === id);
-      if (r) { setCpu(Math.min(r.cpu, maxCpu)); setMem(Math.min(r.mem, maxMem)); setDisk(Math.min(r.disk, maxDisk)); }
+    const tpl = templates.find(r => r.templateId === templateId);
+    const pickTemplate = (id) => {
+      setTemplateId(id);
+      const t = templates.find(x => x.templateId === id);
+      if (t) { setCpu(Math.min(t.cpu, maxCpu)); setMem(Math.min(t.mem, maxMem)); setDisk(Math.min(t.disk, maxDisk)); }
     };
 
     // network from the golden image's connection (the template lives there)
@@ -80,7 +80,7 @@
       setBusy(true);
       try {
         const r = await window.API.deploy({
-          goldenImageId: gold.imgId, recipeId: recipeId || null,
+          goldenImageId: gold.imgId, templateId: templateId || null,
           networkId: netObj.netId || null, name: name.trim(), cpu, ram: mem, disk,
           tags,
         });
@@ -112,13 +112,13 @@
                 h('div', { className: 'row mono', style: { gap: 8, fontSize: 10.5, color: 'var(--text-faint)' } },
                   h(Icon, { name: 'server', size: 12 }), g.location || '—'))))),
 
-          // 2. recipe (optional)
+          // 2. template (optional)
           h('div', { className: 'card card-pad' },
-            h(SectionLabel, { n: '2', title: 'Recipe', hint: 'optional runtime customization' }),
-            h('select', { className: 'select', value: recipeId || '', onChange: (e) => pickRecipe(e.target.value ? Number(e.target.value) : null) },
+            h(SectionLabel, { n: '2', title: 'Template', hint: 'optional preset' }),
+            h('select', { className: 'select', value: templateId || '', onChange: (e) => pickTemplate(e.target.value ? Number(e.target.value) : null) },
               h('option', { value: '' }, 'None — plain VM from the golden image'),
-              recipes.map(r => h('option', { key: r.id, value: r.recipeId }, r.name + ' (' + (r.blocks || []).length + ' blocks)'))),
-            rc && h('div', { className: 'hint', style: { marginTop: 8, fontSize: 12 } }, rc.desc || 'Applied on top of the deployed VM.')),
+              templates.map(t => h('option', { key: t.id, value: t.templateId }, t.name + ' (' + (t.blocks || []).length + ' blocks)'))),
+            tpl && h('div', { className: 'hint', style: { marginTop: 8, fontSize: 12 } }, tpl.desc || 'Applied on top of the deployed VM.')),
 
           // 3. where + size
           h('div', { className: 'card card-pad' },
@@ -161,7 +161,7 @@
                 h('div', { className: 'hint', style: { fontSize: 11.5 } }, 'from ', gold.name))),
             h('div', { className: 'divider' }),
             h(Row, { k: 'Golden image', v: gold.name }),
-            h(Row, { k: 'Recipe', v: rc ? rc.name : 'none' }),
+            h(Row, { k: 'Template', v: tpl ? tpl.name : 'none' }),
             h(Row, { k: 'Location', v: gold.location || '—' }),
             h(Row, { k: 'Network', v: netObj.name || 'DHCP' }),
             h(Row, { k: 'Resources', v: cpu + ' vCPU · ' + mem + ' GB · ' + disk + ' GB' }),
