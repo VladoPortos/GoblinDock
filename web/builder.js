@@ -385,7 +385,7 @@
       const uid = 'u' + (UID++);
       const inputs = {};
       (block.schema || []).forEach((f) => { inputs[f.name] = f.default; });
-      setSections((prev) => prev.map((s) => s.id === sid ? { ...s, blocks: [...s.blocks, { uid, ref: block.id, name: block.name, inputs }] } : s));
+      setSections((prev) => prev.map((s) => s.id === sid ? { ...s, blocks: [...s.blocks, { uid, ref: block.id, name: block.name, inputs, ask: [] }] } : s));
       setSel(uid);
     };
     // a block accepts only its own category section (drives the drop lock + cursor)
