@@ -329,10 +329,28 @@ def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
         ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
         return filename
     try:
+        ctx.log(f"[{_ts()}] downloading {filename} — large images can take several minutes", "l-acc")
         upid = px.download_url(filename, src_url, node=node,
                                checksum=cfg.get("checksum", ""),
                                checksum_algorithm=cfg.get("checksum_algorithm", ""))
-        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=1200)
+        _last = {"line": None, "tick": 0}
+
+        def _progress(_st):
+            # forward the node's wget progress (e.g. "... 62% 468K 8m27s") into the
+            # job log every ~3rd poll (~4.5s); best-effort — never fail the download
+            _last["tick"] += 1
+            if _last["tick"] % 3:
+                return
+            try:
+                tail = px.api.nodes(node).tasks(upid).log.get() or []
+                line = ((tail[-1] or {}).get("t") or "").strip()
+            except Exception:  # noqa: BLE001
+                return
+            if "%" in line and line != _last["line"]:
+                _last["line"] = line
+                ctx.log(f"[{_ts()}] {line}", "l-dim")
+
+        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=3600, on_poll=_progress)
         ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
     except Exception as e:  # noqa: BLE001
         if px.storage_has_volume(filename, node=node):

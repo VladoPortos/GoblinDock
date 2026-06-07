@@ -147,6 +147,12 @@ class Proxmox:
                     raise ProxmoxError(f"task {upid} failed: {exit_status or 'unknown error'}")
                 return
             time.sleep(1.5)
+        # the node task keeps running after WE give up — stop it so a failed job
+        # doesn't leave an orphaned download/clone chewing on the node
+        try:
+            self.api.nodes(node).tasks(upid).delete()
+        except Exception:  # noqa: BLE001
+            pass
         raise ProxmoxError(f"task {upid} timed out")
 
     # ---- lifecycle -----------------------------------------------------

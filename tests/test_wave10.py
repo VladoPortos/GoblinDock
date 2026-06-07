@@ -286,6 +286,49 @@ def test_sync_endpoint():
     print("test_sync_endpoint OK")
 
 
+def test_wait_task_timeout_stops_task():
+    from app.models import Connection
+    from app.proxmox import Proxmox, ProxmoxError
+    px = Proxmox(Connection(name="stub", host="127.0.0.1", token_id="t@pve!x", node="pve"))
+    calls = {"deleted": 0, "polls": 0}
+
+    class _Status:
+        @staticmethod
+        def get():
+            calls["polls"] += 1
+            return {"status": "running"}
+
+    class _Task:
+        status = _Status()
+        @staticmethod
+        def delete():
+            calls["deleted"] += 1
+
+    class _Tasks:
+        def __call__(self, upid):
+            return _Task()
+
+    class _Node:
+        tasks = _Tasks()
+
+    class _Nodes:
+        def __call__(self, node):
+            return _Node()
+
+    class _Api:
+        nodes = _Nodes()
+
+    px.api = _Api()
+    try:
+        px.wait_task("UPID:stub", node="pve", timeout=0.2)
+        raise AssertionError("expected ProxmoxError timeout")
+    except ProxmoxError as e:
+        assert "timed out" in str(e), e
+    assert calls["deleted"] == 1, "timeout must stop the orphaned node task"
+    assert calls["polls"] >= 1
+    print("test_wait_task_timeout_stops_task OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
@@ -294,4 +337,5 @@ if __name__ == "__main__":
     test_seed_template_wiring()
     test_cached_images_endpoint()
     test_sync_endpoint()
+    test_wait_task_timeout_stops_task()
     print("\nALL WAVE 10 UNIT TESTS PASSED")
