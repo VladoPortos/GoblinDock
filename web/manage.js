@@ -328,7 +328,7 @@
             h('button', { className: 'icon-btn danger', onClick: () => setConfirm(c) }, h(Icon, { name: 'trash', size: 16 })))))),
       modal === 'add' && h(ConnModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Connection added', 'ok'); refresh(); } }),
       modal && modal.conn && h(ConnModal, { conn: modal.conn, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Connection updated', 'ok'); refresh(); } }),
-      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Remove ' + confirm.name + '?', body: 'Only allowed if it has no VMs or golden images. This does not touch the Proxmox node.', confirmLabel: 'Remove', onConfirm: () => del(confirm) }));
+      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Remove ' + confirm.name + '?', body: 'Only allowed if it has no VMs. (Legacy image rows that still reference it block deletion too.) This does not touch the Proxmox node.', confirmLabel: 'Remove', onConfirm: () => del(confirm) }));
   }
 
   function Stat({ k, v }) {
