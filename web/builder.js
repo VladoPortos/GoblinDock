@@ -188,37 +188,49 @@
     return h(Field, { label, value, onChange, mono: field.type === 'text' });
   }
 
+  // labelled field with a leading icon — used by the right-hand "spec" panel
+  function SpecField({ icon, label, children }) {
+    return h('div', null,
+      h('div', { className: 'row', style: { gap: 6, marginBottom: 6 } },
+        h(Icon, { name: icon, size: 13, style: { color: 'var(--accent)' } }),
+        h('label', { className: 'field-label', style: { margin: 0 } }, label)),
+      children);
+  }
+
   // ---------- Inspector ----------
   function Inspector({ sections, sel, mode, meta, setInput }) {
     let block = null, secId = null;
     sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; secId = s.id; } }));
     if (!block) {
-      return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)' } },
+      return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
         h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, mode === 'golden' ? 'Golden image' : 'Recipe')),
         h('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 14 } },
-          h(Field, { label: mode === 'golden' ? 'Image name' : 'Recipe name', value: meta.name, onChange: meta.setName, mono: true }),
-          meta.imageSelect && h(SelectField, { label: meta.imageSelect.label, value: meta.imageSelect.value || '', onChange: (v) => meta.imageSelect.set(Number(v)), options: meta.imageSelect.options }),
-          meta.locationSelect && h(SelectField, { label: meta.locationSelect.label, value: meta.locationSelect.value || '', onChange: (v) => meta.locationSelect.set(Number(v)), options: meta.locationSelect.options }),
-          mode === 'golden' && !meta.imageSelect && h('div', null,
-            h('label', { className: 'field-label' }, 'Base image'),
+          h(SpecField, { icon: 'tag', label: mode === 'golden' ? 'Image name' : 'Template name' },
+            h(Field, { value: meta.name, onChange: meta.setName, mono: true })),
+          meta.imageSelect && h(SpecField, { icon: meta.imageSelect.icon || 'disk', label: meta.imageSelect.label },
+            h(SelectField, { value: meta.imageSelect.value || '', onChange: (v) => meta.imageSelect.set(Number(v) || null), options: meta.imageSelect.options })),
+          meta.locationSelect && h(SpecField, { icon: meta.locationSelect.icon || 'server', label: meta.locationSelect.label },
+            h(SelectField, { value: meta.locationSelect.value || '', onChange: (v) => meta.locationSelect.set(Number(v) || null), options: meta.locationSelect.options })),
+          mode === 'golden' && !meta.imageSelect && h(SpecField, { icon: 'disk', label: 'Base image' },
             h('div', { className: 'row', style: { gap: 8, padding: '8px 10px', background: 'var(--inset)', borderRadius: 9, border: '1px solid var(--border)' } },
               h(OSGlyph, { os: meta.os, size: 18 }), h('span', { className: 'mono', style: { fontSize: 12.5 } }, meta.base))),
           h('div', { className: 'divider' }),
-          h('div', { className: 'panel-title', style: { marginBottom: -4 } }, mode === 'golden' ? 'Disk' : 'Default resources'),
           mode === 'golden'
-            ? h(Field, { label: 'Disk (GB)', value: meta.disk, onChange: meta.setDisk, mono: true })
-            : h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 } },
-                h(Field, { label: 'vCPU', value: meta.cpu, onChange: meta.setCpu, mono: true }),
-                h(Field, { label: 'RAM', value: meta.mem, onChange: meta.setMem, mono: true }),
-                h(Field, { label: 'Disk', value: meta.disk, onChange: meta.setDisk, mono: true })),
-          h('div', { className: 'card', style: { padding: 13, background: 'var(--surface-2)', display: 'flex', gap: 10 } },
+            ? h(SpecField, { icon: 'cpu', label: 'Disk (GB)' },
+                h(Field, { value: meta.disk, onChange: meta.setDisk, mono: true }))
+            : h(SpecField, { icon: 'cpu', label: 'Default resources' },
+                h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 } },
+                  h(Field, { label: 'vCPU', value: meta.cpu, onChange: meta.setCpu, mono: true }),
+                  h(Field, { label: 'RAM', value: meta.mem, onChange: meta.setMem, mono: true }),
+                  h(Field, { label: 'Disk', value: meta.disk, onChange: meta.setDisk, mono: true }))),
+          h('div', { className: 'card', style: { padding: 13, background: 'var(--surface)', display: 'flex', gap: 10 } },
             h(Icon, { name: 'info', size: 15, style: { color: 'var(--text-faint)', flexShrink: 0, marginTop: 1 } }),
             h('p', { className: 'hint', style: { fontSize: 11.5 } }, mode === 'golden'
               ? 'Blocks here are baked INTO the image. Cloud-init blocks run at first boot; ansible blocks run post-boot.'
               : 'These blocks run on every VM you deploy with this recipe.'))));
     }
     const schema = paletteByKey(block.ref).schema || [];
-    return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)' } },
+    return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
       h('div', { className: 'bpane-head' },
         h('span', { className: 'placed-ico', style: { width: 22, height: 22 } }, h(Icon, { name: refIcon(block.ref), size: 14 })),
         h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 12.5 } }, block.name)),
