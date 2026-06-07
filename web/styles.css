@@ -428,19 +428,6 @@ body {
 .fadein { /* entrance handled instantly; no container animation (keeps SPA snappy) */ }
 a { color: var(--accent); text-decoration: none; }
 
-.stp { width: 30px; height: 34px; border: none; background: var(--surface-2); color: var(--text-dim); cursor: pointer; font-size: 16px; font-family: 'JetBrains Mono', monospace; transition: background .1s, color .1s; }
-.stp:hover { background: var(--surface-3); color: var(--text); }
-
-/* template picker card */
-.tpl-card {
-  display: flex; flex-direction: column; gap: 8px; text-align: left;
-  padding: 13px; border-radius: 12px; cursor: pointer;
-  background: var(--surface-2); border: 1px solid var(--border-soft);
-  transition: border-color .12s, background .12s, box-shadow .12s;
-}
-.tpl-card:hover { border-color: var(--border-strong); background: var(--surface-3); }
-.tpl-card.sel { border-color: var(--accent-line); background: var(--accent-ghost); box-shadow: 0 0 0 1px var(--accent-line); }
-
 /* range slider */
 .range { -webkit-appearance: none; appearance: none; width: 100%; height: 6px; border-radius: 99px; cursor: pointer;
   background: linear-gradient(90deg, var(--accent) var(--pct, 50%), var(--inset) var(--pct, 50%)); }
@@ -499,7 +486,6 @@ a { color: var(--accent); text-decoration: none; }
 .canvas-section { margin-bottom: 8px; }
 .cs-head { display: flex; align-items: center; gap: 9px; padding: 4px 2px 9px; }
 .cs-num { width: 18px; height: 18px; border-radius: 6px; display: grid; place-items: center; background: var(--surface-3); color: var(--text-dim); font-size: 10.5px; font-weight: 700; flex-shrink: 0; }
-.cs-connector { width: 2px; height: 8px; background: var(--border-strong); margin: 0 0 0 8px; }
 .dropzone { display: flex; flex-direction: column; gap: 8px; padding: 8px; border-radius: 12px; border: 1.5px dashed transparent; transition: background .12s, border-color .12s; }
 .dropzone.empty { border-color: var(--border); background: var(--inset); padding: 16px; }
 .dropzone.over { border-color: var(--accent-line); background: var(--accent-ghost); }
@@ -520,10 +506,6 @@ a { color: var(--accent); text-decoration: none; }
 .tag { display: inline-flex; align-items: center; gap: 5px; padding: 3px 7px; border-radius: 6px; background: var(--surface-3); color: var(--text-dim); font-size: 11px; }
 .tag svg { cursor: pointer; opacity: .5; } .tag svg:hover { opacity: 1; }
 .tag-input input { flex: 1; min-width: 50px; background: none; border: none; outline: none; color: var(--text); font-size: 12px; }
-.code-edit { background: var(--inset); border: 1px solid var(--border); border-radius: 9px; padding: 10px 12px; font-size: 12px; line-height: 1.8; color: var(--text-dim); }
-.code-edit .l-dim { color: var(--text-faint); margin-right: 12px; }
-.secret-field { display: flex; align-items: center; gap: 8px; padding: 7px 9px 7px 11px; background: var(--accent-ghost); border: 1px solid var(--accent-line); border-radius: 9px; }
-
 /* card action footer */
 .card-act { flex: 1; display: inline-flex; align-items: center; justify-content: center; gap: 6px; height: 40px; border: none; cursor: pointer;
   background: transparent; color: var(--text-dim); font-family: 'JetBrains Mono', monospace; font-size: 11.5px; font-weight: 600;

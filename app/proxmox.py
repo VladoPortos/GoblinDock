@@ -164,14 +164,6 @@ class Proxmox:
         guard_vmid(vmid)
         return self.api.nodes(node or self.pick_node()).qemu(vmid).status.stop.post()
 
-    def shutdown(self, vmid: int, node: Optional[str] = None, timeout: int = 60) -> str:
-        guard_vmid(vmid)
-        return (
-            self.api.nodes(node or self.pick_node())
-            .qemu(vmid)
-            .status.shutdown.post(timeout=timeout, forceStop=1)
-        )
-
     def reboot(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
         return self.api.nodes(node or self.pick_node()).qemu(vmid).status.reboot.post()
