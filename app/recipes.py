@@ -134,6 +134,44 @@ def load_recipe(recipe_json: str) -> list[dict]:
         return []
 
 
+def ask_map(recipe: list[dict]) -> dict[str, list[str]]:
+    """Ask-on-deploy index: ``{"<sectionIdx>.<blockIdx>": [input names]}`` for
+    every placed block carrying a non-empty ``ask`` list."""
+    out: dict[str, list[str]] = {}
+    for si, sec in enumerate(recipe):
+        for bi, block in enumerate(sec.get("blocks") or []):
+            asks = [a for a in (block.get("ask") or []) if isinstance(a, str)]
+            if asks:
+                out[f"{si}.{bi}"] = asks
+    return out
+
+
+def merge_deploy_inputs(recipe: list[dict], overrides: dict) -> list[dict]:
+    """Overlay deploy-time answers onto a template's recipe. Only inputs listed
+    in the addressed block's own ``ask`` array are applied; unknown addresses,
+    names or shapes are silently ignored (defense in depth — the API already
+    validated them). Returns a deep copy; never mutates the stored recipe."""
+    if not overrides:
+        return recipe
+    allowed = ask_map(recipe)
+    out = json.loads(json.dumps(recipe))
+    for addr, answers in overrides.items():
+        names = allowed.get(addr)
+        if not names or not isinstance(answers, dict):
+            continue
+        try:
+            si, bi = (int(x) for x in addr.split("."))
+        except (ValueError, TypeError):
+            continue
+        block = out[si]["blocks"][bi]
+        inputs = block.get("inputs") or {}
+        for name, value in answers.items():
+            if name in names:
+                inputs[name] = value
+        block["inputs"] = inputs
+    return out
+
+
 def _schema_defaults(block: Block) -> dict:
     try:
         schema = json.loads(block.input_schema_json or "[]")

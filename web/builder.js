@@ -33,7 +33,7 @@
   }
   function warnOf(b) {
     const sc = paletteByKey(b.ref).schema || [];
-    return sc.some((f) => (f.type === 'text' || f.type === 'secret') && !(b.inputs || {})[f.name]);
+    return sc.some((f) => (f.type === 'text' || f.type === 'secret') && !(b.inputs || {})[f.name] && !((b.ask || []).includes(f.name)));
   }
 
   // ---------- Palette ----------
@@ -107,7 +107,9 @@
                           return h('span', { className: 'badge', style: { fontSize: 9, padding: '1px 5px', border: 'none', background: ph === 'cloudinit' ? 'var(--info-ghost)' : 'var(--accent-ghost)', color: ph === 'cloudinit' ? 'var(--info)' : 'var(--accent)' } }, ph === 'cloudinit' ? 'cloud-init' : 'ansible');
                         })(),
                         warnOf(b) && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none', padding: '1px 6px', fontSize: 10 } },
-                          h(Icon, { name: 'warn', size: 11 }), 'needs input')),
+                          h(Icon, { name: 'warn', size: 11 }), 'needs input'),
+                        (b.ask || []).length > 0 && h('span', { className: 'badge', style: { background: 'var(--info-ghost)', color: 'var(--info)', border: 'none', padding: '1px 6px', fontSize: 10 } },
+                          h(Icon, { name: 'info', size: 11 }), 'asks at deploy')),
                       h('div', { className: 'hint mono', style: { fontSize: 11, marginTop: 2 } }, summaryOf(b))),
                     h('div', { className: 'pb-actions' },
                       h('button', { className: 'icon-btn', title: 'Move up', onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, -1); } }, h(Icon, { name: 'chevronR', size: 14, style: { transform: 'rotate(-90deg)' } })),
@@ -198,7 +200,7 @@
   }
 
   // ---------- Inspector ----------
-  function Inspector({ sections, sel, mode, meta, setInput }) {
+  function Inspector({ sections, sel, mode, meta, setInput, setAsk }) {
     let block = null, secId = null;
     sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; secId = s.id; } }));
     if (!block) {
@@ -240,7 +242,10 @@
         h('div', { className: 'chip', style: { width: 'fit-content' } }, refCat(block.ref)),
         schema.length === 0
           ? h('p', { className: 'hint', style: { fontSize: 12 } }, 'This block has no inputs.')
-          : schema.map((f) => h(SchemaField, { key: f.name, field: f, value: (block.inputs || {})[f.name], onChange: (v) => setInput(block.uid, f.name, v) }))));
+          : schema.map((f) => h('div', { key: f.name },
+              h(SchemaField, { field: f, value: (block.inputs || {})[f.name], onChange: (v) => setInput(block.uid, f.name, v) }),
+              mode === 'template' && h('div', { style: { marginTop: 6, padding: '4px 8px', background: 'var(--inset)', borderRadius: 7 } },
+                h(Toggle, { label: 'Ask on deployment', on: (block.ask || []).includes(f.name), onChange: (on) => setAsk(block.uid, f.name, on) }))))));
   }
 
   // ---------- Custom block editor ----------
@@ -305,7 +310,7 @@
       const byId = Object.fromEntries(out.map((s) => [s.id, s]));
       src.forEach((sec) => {
         const target = byId[sec.id] || byId[SECTION_BY_NAME[sec.name]] || out[1];
-        (sec.blocks || []).forEach((b) => target.blocks.push({ uid: 'u' + (UID++), ref: b.ref, name: b.name || paletteByKey(b.ref).name || b.ref, inputs: b.inputs || {} }));
+        (sec.blocks || []).forEach((b) => target.blocks.push({ uid: 'u' + (UID++), ref: b.ref, name: b.name || paletteByKey(b.ref).name || b.ref, inputs: b.inputs || {}, ask: Array.isArray(b.ask) ? b.ask.slice() : [] }));
       });
       return out;
     };
@@ -371,7 +376,8 @@
 
     const recipePayload = () => sections.map((s) => ({
       id: s.id, name: s.name,
-      blocks: s.blocks.map((b) => ({ ref: b.ref, name: b.name, inputs: b.inputs || {} })),
+      blocks: s.blocks.map((b) => ({ ref: b.ref, name: b.name, inputs: b.inputs || {},
+        ...(mode === 'template' && b.ask && b.ask.length ? { ask: b.ask } : {}) })),
     }));
     const sectionFor = (block) => SECTION_BY_NAME[block.section] || SECTION_BY_NAME[block.cat] || 's-inst';
     const addBlock = (block, secId) => {
@@ -399,6 +405,11 @@
       return { ...s, blocks: arr };
     }));
     const setInput = (uid, name, value) => setSections((prev) => prev.map((s) => ({ ...s, blocks: s.blocks.map((b) => b.uid === uid ? { ...b, inputs: { ...(b.inputs || {}), [name]: value } } : b) })));
+    const setAsk = (uid, name, on) => setSections((prev) => prev.map((s) => ({ ...s, blocks: s.blocks.map((b) => {
+      if (b.uid !== uid) return b;
+      const cur = b.ask || [];
+      return { ...b, ask: on ? (cur.includes(name) ? cur : [...cur, name]) : cur.filter((x) => x !== name) };
+    }) })));
 
     const openYaml = async () => {
       setYaml(true); setYamlText('# compiling…');
@@ -452,7 +463,7 @@
       h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
         h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({ new: true }) }),
         h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),
-        h(Inspector, { sections, sel, mode, meta, setInput })),
+        h(Inspector, { sections, sel, mode, meta, setInput, setAsk })),
       yaml && h(Modal, { onClose: () => setYaml(false), width: 'min(680px, 94vw)' },
         h('div', { className: 'modal-head' },
           h(Icon, { name: 'code', size: 17, style: { color: 'var(--accent)' } }),

@@ -199,9 +199,39 @@ def test_template_edit_refs():
     print("test_template_edit_refs OK")
 
 
+def test_ask_map_and_merge():
+    from app.recipes import ask_map, merge_deploy_inputs
+    recipe = [
+        {"id": "s-os", "name": "OS Setup", "blocks": [
+            {"ref": "b-hostname", "name": "Set Hostname",
+             "inputs": {"hostname": "default-host"}, "ask": ["hostname"]},
+        ]},
+        {"id": "s-inst", "name": "Install", "blocks": [
+            {"ref": "b-apt", "name": "APT", "inputs": {"packages": ["curl"]}},
+        ]},
+    ]
+    assert ask_map(recipe) == {"0.0": ["hostname"]}
+    # valid override is applied
+    merged = merge_deploy_inputs(recipe, {"0.0": {"hostname": "my-vm"}})
+    assert merged[0]["blocks"][0]["inputs"]["hostname"] == "my-vm"
+    # original recipe is never mutated
+    assert recipe[0]["blocks"][0]["inputs"]["hostname"] == "default-host"
+    # non-ask input name on a valid address is ignored
+    merged = merge_deploy_inputs(recipe, {"0.0": {"evil": "x"}})
+    assert "evil" not in merged[0]["blocks"][0]["inputs"]
+    # address without ask flags is ignored
+    merged = merge_deploy_inputs(recipe, {"1.0": {"packages": ["nc"]}})
+    assert merged[1]["blocks"][0]["inputs"]["packages"] == ["curl"]
+    # junk addresses / shapes don't crash
+    assert merge_deploy_inputs(recipe, {"9.9": {"a": 1}, "x.y": {"b": 2}, "0.0": "notadict"})
+    assert merge_deploy_inputs(recipe, {}) == recipe
+    print("test_ask_map_and_merge OK")
+
+
 if __name__ == "__main__":
     test_migration_renames_and_extends()
     test_migration_idempotent()
     test_template_crud_with_refs()
     test_template_edit_refs()
+    test_ask_map_and_merge()
     print("\nALL WAVE 9 UNIT TESTS PASSED")
