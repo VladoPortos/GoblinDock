@@ -125,7 +125,7 @@
           onClose: () => setConfirm(null), tone: 'danger', icon: 'trash',
           title: 'Delete ' + confirm.name + '?',
           body: 'Destroys the Proxmox template (vmid ' + (confirm.vmid || '—') + ') and removes it. Already-deployed VMs are unaffected. Cannot be undone.'
-            + (refs ? ' ' + refs + ' template' + (refs === 1 ? '' : 's') + ' reference this image — they keep working but lose one-click deploy until re-pointed.' : ''),
+            + (refs ? ' ' + refs + ' template' + (refs === 1 ? ' references' : 's reference') + ' this image — ' + (refs === 1 ? 'it keeps' : 'they keep') + ' working but ' + (refs === 1 ? 'loses' : 'lose') + ' one-click deploy until re-pointed.' : ''),
           confirmLabel: 'Delete image', onConfirm: () => del(confirm),
         });
       })(),
