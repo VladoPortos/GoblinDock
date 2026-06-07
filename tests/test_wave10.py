@@ -245,6 +245,38 @@ def test_cached_images_endpoint():
     print("test_cached_images_endpoint OK")
 
 
+def test_sync_endpoint():
+    from app import api
+    from app.models import Image, Job, User
+    uid = _mk_user("t10-sync@example.com")
+    conn_id, base_id, net_id = _mk_conn_base_net()
+    with session_scope() as s:
+        user = s.get(User, uid)
+        _expect_http(404, lambda: api.sync_image(999999, api.SyncBody(connectionId=conn_id), user=user, session=s))
+        g = Image(kind="golden", name="legacy-sync-g", os_family="ubuntu")
+        s.add(g); s.flush()
+        _expect_http(400, lambda: api.sync_image(g.id, api.SyncBody(connectionId=conn_id), user=user, session=s))
+        b = Image(kind="base", name="no-url-sync", os_family="ubuntu", source_url="", build_status="ready")
+        s.add(b); s.flush()
+        _expect_http(400, lambda: api.sync_image(b.id, api.SyncBody(connectionId=conn_id), user=user, session=s))
+        _expect_http(404, lambda: api.sync_image(base_id, api.SyncBody(connectionId=999999), user=user, session=s))
+        r = api.sync_image(base_id, api.SyncBody(connectionId=conn_id), user=user, session=s)
+        assert r["ok"] and r["jobId"]
+        job_id = r["jobId"]
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        assert job.type == "image_sync" and job.image_id == base_id and job.connection_id == conn_id
+        ctx = json.loads(job.context_json)
+        assert ctx["src_url"] and "checksum" in ctx and "checksum_algorithm" in ctx
+    from app.worker import _DISPATCH
+    assert "image_sync" in _DISPATCH
+    from app import serialize as S
+    with session_scope() as s:
+        brief = S.job_brief(s, s.get(Job, job_id))
+        assert brief["imageId"] == base_id
+    print("test_sync_endpoint OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
@@ -252,4 +284,5 @@ if __name__ == "__main__":
     test_legacy_rebuild_guard()
     test_seed_template_wiring()
     test_cached_images_endpoint()
+    test_sync_endpoint()
     print("\nALL WAVE 10 UNIT TESTS PASSED")

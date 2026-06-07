@@ -1029,6 +1029,37 @@ def cached_images(connectionId: int, user: User = Depends(current_user),
     return {"online": True, "cached": cached}
 
 
+class SyncBody(BaseModel):
+    connectionId: int
+
+
+@router.post("/images/{img_id}/sync")
+def sync_image(img_id: int, body: SyncBody, user: User = Depends(current_user),
+               session: Session = Depends(get_session)):
+    """Pre-pull a base cloud image onto the connection's storage — the same
+    cached download a deploy triggers, just ahead of time."""
+    img = session.get(Image, img_id)
+    if not img:
+        raise HTTPException(404, "image not found")
+    if img.kind != "base":
+        raise HTTPException(400, "only base images can be synced")
+    if not (img.source_url or "").strip():
+        raise HTTPException(400, "image has no source URL")
+    conn = session.get(Connection, body.connectionId)
+    if not conn:
+        raise HTTPException(404, "connection not found")
+    job = Job(type="image_sync", title=f"Syncing {img.name} → {conn.name}",
+              image_id=img.id, connection_id=conn.id, created_by=user.id, status="queued",
+              context_json=json.dumps({"src_url": img.source_url,
+                                       "checksum": img.checksum or "",
+                                       "checksum_algorithm": _checksum_algo(img.checksum or "")}))
+    session.add(job)
+    record_audit(session, user, "image.sync", "image", img.id, img.name)
+    session.commit()
+    session.refresh(job)
+    return {"ok": True, "jobId": job.id}
+
+
 # --------------------------------------------------------------------------- #
 # templates                                                                    #
 # --------------------------------------------------------------------------- #

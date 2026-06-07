@@ -317,6 +317,31 @@ def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str]) 
 # --------------------------------------------------------------------------- #
 # Job implementations                                                          #
 # --------------------------------------------------------------------------- #
+def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
+    """Make sure the base cloud image is cached on the node's image storage.
+    Returns the cached filename. Tolerates a concurrent download of the same
+    file (deploy + sync racing is fine); raises on real download/checksum failures."""
+    src_url = cfg.get("src_url")
+    if not src_url:
+        raise RuntimeError("no base image source URL")
+    filename = base_disk_filename(src_url)
+    if px.storage_has_volume(filename, node=node):
+        ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
+        return filename
+    try:
+        upid = px.download_url(filename, src_url, node=node,
+                               checksum=cfg.get("checksum", ""),
+                               checksum_algorithm=cfg.get("checksum_algorithm", ""))
+        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=1200)
+        ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
+    except Exception as e:  # noqa: BLE001
+        if px.storage_has_volume(filename, node=node):
+            ctx.log(f"[{_ts()}] download reported '{e}' but {filename} is present — continuing", "l-warn")
+        else:
+            raise RuntimeError(f"image download/verification failed: {e}") from e
+    return filename
+
+
 def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5) -> None:
     # phase_base/phase_total let a rebuild present this as a continuation (e.g. phases
     # 2..6 of 6) instead of resetting the progress bar to "Phase 1 of 5".
@@ -350,21 +375,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")
     st = ctx.add_step("Ensure base cloud image on node storage")
     t = ctx.start_step(st)
-    filename = base_disk_filename(src_url)
-    if px.storage_has_volume(filename, node=node):
-        ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
-    else:
-        try:
-            upid = px.download_url(filename, src_url, node=node,
-                                   checksum=cfg.get("checksum", ""),
-                                   checksum_algorithm=cfg.get("checksum_algorithm", ""))
-            px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=1200)
-            ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
-        except Exception as e:  # noqa: BLE001
-            if px.storage_has_volume(filename, node=node):
-                ctx.log(f"[{_ts()}] download reported '{e}' but {filename} is present — continuing", "l-warn")
-            else:
-                raise RuntimeError(f"image download/verification failed: {e}") from e
+    filename = _ensure_base_disk(ctx, px, node, cfg)
     ctx.finish_step(st, t)
 
     ctx.progress(20, f"Phase {_ph(3)} of {phase_total} · Create")
@@ -619,10 +630,28 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
     ctx.progress(100, "Complete")
 
 
+def _run_image_sync(ctx: JobCtx, job: Job) -> None:
+    with session_scope() as s:
+        conn = s.get(Connection, job.connection_id)
+        conn = Connection(**conn.model_dump()) if conn else None
+    if not conn:
+        raise RuntimeError("missing connection")
+    cfg = json.loads(job.context_json or "{}")
+    px = Proxmox(conn)
+    node = conn.node or px.pick_node()
+    ctx.progress(5, "Phase 1 of 1 · Prepare image")
+    st = ctx.add_step("Ensure base cloud image on node storage")
+    t = ctx.start_step(st)
+    _ensure_base_disk(ctx, px, node, cfg)
+    ctx.finish_step(st, t)
+    ctx.progress(100, "Complete")
+
+
 _DISPATCH = {
     "deploy": _run_deploy,
     "rebuild": _run_rebuild,
     "destroy": _run_destroy,
+    "image_sync": _run_image_sync,
 }
 
 

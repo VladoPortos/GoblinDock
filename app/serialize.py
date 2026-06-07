@@ -181,6 +181,7 @@ def job_brief(session: Session, job: Job) -> dict:
         "elapsed": _elapsed(job.started_at, job.finished_at),
         "step": done,
         "total": total,
+        "imageId": job.image_id,
     }
 
 
@@ -204,6 +205,7 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
         "deploy": ["Allocate", "Prepare image", "Create", "Configure", "Boot"],
         "rebuild": ["Destroy", "Allocate", "Prepare image", "Create", "Configure", "Boot"],
         "destroy": ["Stop", "Destroy"],
+        "image_sync": ["Prepare image"],
     }
     phases = phase_sets.get(job.type, ["Start", "Run", "Finish"])
     return {
