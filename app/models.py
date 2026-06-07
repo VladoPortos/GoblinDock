@@ -161,7 +161,7 @@ class Deployment(SQLModel, table=True):
     name: str = Field(index=True)
     owner_id: Optional[int] = None
     connection_id: Optional[int] = None
-    image_id: Optional[int] = None        # the golden image deployed from
+    image_id: Optional[int] = None        # the base image this VM was built from
     template_id: Optional[int] = None     # optional template applied on top
     # ask-on-deploy answers, {"<si>.<bi>": {"<input>": value}} — kept on the row
     # (not just the job) so a VM rebuild re-applies them.

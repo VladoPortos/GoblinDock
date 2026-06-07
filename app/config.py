@@ -100,7 +100,6 @@ class Settings:
         # Per-user quotas (0 = unlimited). Stop one tenant exhausting the shared VMID
         # pool / node storage. Admins are exempt.
         self.max_vms_per_user = int(os.environ.get("GOBLINDOCK_MAX_VMS_PER_USER", "0"))
-        self.max_images_per_user = int(os.environ.get("GOBLINDOCK_MAX_IMAGES_PER_USER", "0"))
 
         # Scheduled SQLite backups (driven by APScheduler — see app/scheduler.py).
         # The single SQLite file IS the whole datastore (users, deployments, audit,

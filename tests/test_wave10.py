@@ -184,9 +184,24 @@ def test_legacy_rebuild_guard():
     print("test_legacy_rebuild_guard OK")
 
 
+def test_seed_template_wiring():
+    from app.seed import run_all_seeds
+    from app.models import Template
+    from sqlmodel import select
+    run_all_seeds()
+    with session_scope() as s:
+        t = s.exec(select(Template).where(Template.name == "AI Dev Box")).first()
+        assert t is not None
+        assert t.base_image_id is not None, "AI Dev Box should wire to the seeded ubuntu base image"
+        rec = json.loads(t.recipe_json)
+        assert rec[0]["blocks"][0].get("ask") == ["hostname"], rec[0]["blocks"][0]
+    print("test_seed_template_wiring OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
     test_deploy_templates_only()
     test_legacy_rebuild_guard()
+    test_seed_template_wiring()
     print("\nALL WAVE 10 UNIT TESTS PASSED")

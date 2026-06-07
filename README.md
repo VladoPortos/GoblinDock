@@ -19,13 +19,13 @@
 
 **[goblindock.com](https://goblindock.com)** · `docker pull ghcr.io/vladoportos/goblindock:latest`
 
-Build golden images from Lego-style blocks, deploy fully-configured VMs in a click,
+Build fully-configured VMs in a click from reusable templates,
 and manage them — live metrics, deployment log, and a real **graphical console** —
 all from a single container backed by one SQLite file.
 
 </div>
 
-![The block builder — compose a golden image from typed blocks](docs/screenshots/builder.png)
+![The block builder — compose a template from typed blocks](docs/screenshots/builder.png)
 
 ---
 
@@ -33,13 +33,11 @@ all from a single container backed by one SQLite file.
 
 GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
 
-- **🧱 Golden images from blocks** — assemble an Ubuntu cloud image + a stack of
-  customization blocks into a reusable Proxmox **template**. The build runs the blocks
-  on a throwaway VM, de-identifies it (fresh machine-id, cleaned cloud-init), and
-  converts it to a template.
-- **🚀 One-click deploy** — clone a golden image, pick a target, size, and optional
-  **template**, and GoblinDock provisions, configures, and tracks the VM — reporting its
-  IP back via the guest agent.
+- **🧱 Templates from blocks** — assemble a base cloud image + a stack of customization
+  blocks into a reusable **template** (e.g. *AI Dev Box*, *MySQL node*). Cloud-init blocks
+  run at the VM's first boot; ansible blocks run post-boot — all compiled from the canvas.
+- **🚀 One-click deploy** — pick a template, size, and target, and GoblinDock provisions,
+  configures, and tracks the VM — reporting its IP back via the guest agent.
 - **🖥️ Per-VM detail page** — live CPU / RAM / disk usage, full config, guest-agent OS
   & network info, the deployment log, and a built-in **console** (graphical VGA *and*
   serial — the same noVNC console Proxmox uses).
@@ -92,13 +90,12 @@ throttle see the real client address.
 | Thing | What it is |
 |------|------------|
 | **Connection (target)** | A Proxmox node/cluster + token. Each target sets its own **per-VM ceilings** (max vCPU / RAM / disk). |
-| **ISO / base image** | A public cloud image (e.g. Ubuntu 24.04) — the raw material. |
-| **Golden image** | A base image **+ baked blocks** = a deployable Proxmox template. |
-| **Template** | A named, image-independent bundle of blocks applied **on top of a VM at deploy time** (e.g. *AI Dev Box*, *MySQL node*). |
+| **ISO / base image** | A public cloud image (e.g. Ubuntu 24.04) — the raw material every deploy builds from. |
+| **Template** | A named deployment preset: a base cloud image + location + blocks + default resources (e.g. *AI Dev Box*, *MySQL node*). Deploy in one click. |
 | **Block** | One customization step (install a package, write a file, run a script, install Claude Code…). 29 built-ins + your own. |
 | **Secret / Variable** | Reusable values referenced as `{{ secrets.NAME }}` (encrypted) or `{{ variable.NAME }}` (plaintext, visible). |
 
-The flow: **upload a base image → bake a golden image → deploy from it (± a template).**
+The flow: **add a base image (or use the seeded ones) → build a template (blocks + location + size) → deploy.**
 
 ---
 
@@ -164,14 +161,12 @@ localectl set-locale LANG=en_US.UTF-8 || true
 
 You can see the exact generated playbook any time with **View YAML** in the builder.
 
-### Golden image vs template — *where* it runs
+### How a deploy works
 
-- **Golden image:** the blocks are **baked into the template**. The build boots a
-  throwaway VM, runs the cloud-init script + the playbook against it, de-identifies it,
-  and templatizes it. Every deploy from that golden starts already configured.
-- **Template (runtime):** the blocks are applied **on top of each freshly-deployed VM** —
-  its cloud-init blocks at the clone's first boot, its ansible blocks once it's up. Same
-  compile model, just applied per-deploy instead of baked once.
+Every deploy builds the VM **fresh from the base cloud image** — cloud-init blocks run
+at first boot (timezone, users, boot scripts), ansible blocks run post-boot (packages,
+Docker, Claude Code, etc.). No pre-baked template image is needed. A deploy typically
+takes a few minutes; you can watch every step live on the job page.
 
 ### Engines & plumbing
 
@@ -199,7 +194,7 @@ Open any VM → **Console**. Two tabs:
 - **Serial** — an `xterm.js` serial console.
 
 Cloud images set up SSH-key login with **no console password**, so add the **Console
-Password** block to a template/golden if you want to log in at the console.
+Password** block to your template if you want to log in at the console.
 
 ---
 
@@ -261,7 +256,7 @@ it falls back to native cloud-init.
   paths, no user directory) and a **redacted** network view (no bridge / VLAN / subnet /
   gateway / DNS — just enough to pick one). Templates and blocks honour visibility — a
   private one can't be deployed, compiled, or forked by guessing its id. Optional
-  per-user VM / image **quotas** (`GOBLINDOCK_MAX_VMS_PER_USER` / `_IMAGES_PER_USER`).
+  per-user VM **quota** (`GOBLINDOCK_MAX_VMS_PER_USER`).
 - **Host-key / TLS verification** — Proxmox API TLS (`verify_tls`, per connection) and
   SSH host-key checking (`GOBLINDOCK_SSH_STRICT` + `known_hosts`) default to trust-on-
   first-use for a homelab LAN; **enable both** when the control plane is reachable from
@@ -294,10 +289,10 @@ end). Among the guarantees it now makes:
 - **Per-target ceilings are enforced end-to-end** — requested vCPU / RAM / disk is clamped
   to the connection's limits all the way to the worker, and a connection may raise its
   limits *above* the global default.
-- **Clones come from the right node** — a VM is always cloned from the node where its
-  golden template actually lives.
-- **Rebuild keeps identity** — a rebuilt VM keeps its **static IP / VLAN** (and the golden
-  image's real disk size) instead of reverting to DHCP / 20 GB.
+- **Deploys target the right node** — a VM is always built on the node set in the
+  template's connection.
+- **Rebuild keeps identity** — a rebuilt VM keeps its **static IP / VLAN** (and the
+  original disk size) instead of reverting to DHCP / 20 GB.
 - **Static IPs can't double-book** — allocation is serialized and backed by a unique
   `(network, ip)` index.
 - **`GET /api/state` is read-only** and only serializes the VMs you're allowed to see — no
@@ -309,7 +304,7 @@ end). Among the guarantees it now makes:
 
 GoblinDock exposes a small, read-only JSON endpoint for a
 [Homepage](https://gethomepage.dev) dashboard tile — counts of your VMs, active jobs and
-golden images, and nothing else. It needs **no plugin and no PR to Homepage**: the
+templates, and nothing else. It needs **no plugin and no PR to Homepage**: the
 built-in `customapi` widget does it all from `services.yaml`.
 
 1. In GoblinDock, open **Profile → Homepage widget → Generate key** and copy the key — it

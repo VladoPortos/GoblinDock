@@ -61,7 +61,7 @@
       h('div', { className: 'page-head' },
         h('div', null,
           h('h1', { className: 'page-title' }, 'ISOs / Base Images'),
-          h('div', { className: 'page-sub' }, 'Public cloud images — the raw material you bake Golden Images from.')),
+          h('div', { className: 'page-sub' }, 'Public cloud images — the raw material templates deploy from.')),
         h('div', { className: 'spacer' }),
         isAdmin && h('button', { className: 'btn primary', onClick: () => setModal('add') }, h(Icon, { name: 'download', size: 16 }), 'Add base image')),
       bases.length === 0

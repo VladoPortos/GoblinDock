@@ -58,7 +58,7 @@
       '        - { field: vms_running,   label: Running, format: number }',
       '        - { field: vms_total,     label: VMs,     format: number }',
       '        - { field: jobs_active,   label: Jobs,    format: number }',
-      '        - { field: golden_images, label: Goldens, format: number }',
+      '        - { field: templates,     label: Templates, format: number }',
     ].join('\n');
     const copyText = (txt, label) => {
       if (navigator.clipboard && navigator.clipboard.writeText) {
@@ -200,14 +200,14 @@
       h('div', { className: 'page-head' },
         h('div', null,
           h('h1', { className: 'page-title' }, 'Templates'),
-          h('div', { className: 'page-sub' }, 'Deployment presets — a golden image + blocks + defaults. Deploy in one click.')),
+          h('div', { className: 'page-sub' }, 'Deployment presets — a base image + blocks + defaults. Deploy in one click.')),
         h('div', { className: 'spacer' }),
         h('button', { className: 'btn primary', onClick: () => go('newtemplate') }, h(Icon, { name: 'plus', size: 16 }), 'New template')),
       templates.length === 0
         ? h('div', { className: 'card' }, h('div', { className: 'empty' },
             h('div', { className: 'glyph' }, h(Icon, { name: 'template', size: 28 })),
             h('h3', null, 'No templates yet'),
-            h('p', null, 'Save a golden image + blocks + sizing under a name — then deploy it again and again.'),
+            h('p', null, 'Save a base image + blocks + sizing under a name — then deploy it again and again.'),
             h('button', { className: 'btn primary', onClick: () => go('newtemplate') }, h(Icon, { name: 'plus', size: 16 }), 'New template')))
         : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 } },
             templates.map((t) => h(TemplateCard, { key: t.id, r: t, go, onDelete: (x) => setConfirm(x), onDeploy: (x) => setDeploying(x) }))),
@@ -215,7 +215,7 @@
       confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null), tone: 'danger', icon: 'trash',
         title: 'Delete ' + confirm.name + '?',
-        body: 'Removes this template. Deployed VMs and golden images are not affected.',
+        body: 'Removes this template. Deployed VMs are not affected.',
         confirmLabel: 'Delete template', onConfirm: () => del(confirm),
       }));
   }

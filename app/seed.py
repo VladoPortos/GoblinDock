@@ -626,11 +626,14 @@ def maybe_seed_proxmox() -> None:
 def seed_templates() -> None:
     """A public starter template so AI dev boxes are one click away. The hostname
     block is ask-on-deploy — the demo shows off deploy-time prompts out of the box.
-    Base-image/connection wiring is added by the templates-only seed task — until then
-    the template is editable but not deployable."""
+    Wired to the seeded Ubuntu base image; deployable the moment a Proxmox connection
+    exists (the dev seed's connection is linked when present)."""
     with session_scope() as s:
         if s.exec(select(Template).where(Template.name == "AI Dev Box")).first():
             return
+        base = s.exec(select(Image).where(
+            Image.kind == "base", Image.os_family == "ubuntu")).first()
+        conn = s.exec(select(Connection)).first()
         recipe = [
             {"id": "s-os", "name": "OS Setup", "blocks": [
                 {"ref": "b-hostname", "name": "Set Hostname",
@@ -652,6 +655,8 @@ def seed_templates() -> None:
             name="AI Dev Box",
             description="Node.js + Claude Code + OpenAI Codex + a global CLAUDE.md — a ready-to-code box.",
             os_family="ubuntu", recipe_json=json.dumps(recipe),
+            base_image_id=base.id if base else None,
+            connection_id=conn.id if conn else None,
             default_cpu=1, default_ram=2, default_disk=20, public=True, owner_id=None,
         ))
 
@@ -669,8 +674,8 @@ def seed_default_networks() -> None:
 
 def run_all_seeds() -> None:
     seed_blocks()
-    seed_templates()
     seed_base_image()
     maybe_seed_admin()
     maybe_seed_proxmox()
+    seed_templates()          # after seed_base_image + maybe_seed_proxmox so the template can wire both
     seed_default_networks()   # after maybe_seed_proxmox so the seeded connection gets one
