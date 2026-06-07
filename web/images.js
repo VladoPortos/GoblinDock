@@ -39,6 +39,7 @@
         h('button', { className: 'card-act', onClick: () => go('builder', { imageId: img.imgId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
         h('button', { className: 'card-act', onClick: () => onRebuild(img), disabled: img.state === 'building' }, h(Icon, { name: 'rebuild', size: 14 }), 'Rebuild'),
         h(Menu, { align: 'right', items: [
+          { label: 'New template from this image', icon: 'template', onClick: () => go('newtemplate', { goldenImageId: img.imgId }) },
           { label: 'Delete image', icon: 'trash', danger: true, onClick: () => onDelete(img) },
         ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' } }, h(Icon, { name: 'more', size: 16 })))));
   }
@@ -118,12 +119,16 @@
             h('button', { className: 'btn primary', onClick: () => go('builder') }, h(Icon, { name: 'hammer', size: 16 }), 'New golden image')))
         : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 } },
             golden.map((img) => h(GoldenCard, { key: img.id, img, go, onRebuild: (x) => setRebuildC(x), onDelete: (x) => setConfirm(x) }))),
-      confirm && h(ConfirmModal, {
-        onClose: () => setConfirm(null), tone: 'danger', icon: 'trash',
-        title: 'Delete ' + confirm.name + '?',
-        body: 'Destroys the Proxmox template (vmid ' + (confirm.vmid || '—') + ') and removes it. Already-deployed VMs are unaffected. Cannot be undone.',
-        confirmLabel: 'Delete image', onConfirm: () => del(confirm),
-      }),
+      confirm && (function () {
+        const refs = ((window.GD.TEMPLATES) || []).filter((t) => t.goldenImageId === confirm.imgId).length;
+        return h(ConfirmModal, {
+          onClose: () => setConfirm(null), tone: 'danger', icon: 'trash',
+          title: 'Delete ' + confirm.name + '?',
+          body: 'Destroys the Proxmox template (vmid ' + (confirm.vmid || '—') + ') and removes it. Already-deployed VMs are unaffected. Cannot be undone.'
+            + (refs ? ' ' + refs + ' template' + (refs === 1 ? '' : 's') + ' reference this image — they keep working but lose one-click deploy until re-pointed.' : ''),
+          confirmLabel: 'Delete image', onConfirm: () => del(confirm),
+        });
+      })(),
       rebuildC && h(ConfirmModal, {
         onClose: () => setRebuildC(null), tone: 'danger', icon: 'rebuild',
         title: 'Rebuild ' + rebuildC.name + '?',
