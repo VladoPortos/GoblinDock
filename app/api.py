@@ -1409,7 +1409,7 @@ def get_job(job_id: int, user: User = Depends(current_user), session: Session = 
         raise HTTPException(404, "not found")
     if not _job_owned(job, user):
         raise HTTPException(403, "not your job")
-    return S.job_detail(session, job)
+    return S.job_detail(session, job, viewer=user)
 
 
 @router.post("/jobs/{job_id}/cancel")
@@ -1490,7 +1490,7 @@ async def stream_job(job_id: int, request: Request, user: User = Depends(current
                 # Only load+send the FULL log on the first frame; afterwards send just
                 # the new lines so each tick is O(new), not O(total) — the client
                 # appends `newLogs` to what it already has (see web/job.js).
-                detail = S.job_detail(session, job, include_log=first)
+                detail = S.job_detail(session, job, include_log=first, viewer=user)
                 if first:
                     last_event_id = detail.get("lastEventId", 0)
                     new_logs = []

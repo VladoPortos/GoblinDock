@@ -331,23 +331,55 @@ def test_wait_task_timeout_stops_task():
 
 def test_job_detail_waiting_for():
     from app import serialize as S
-    from app.models import Job
+    from app.models import Job, User
     from sqlmodel import select
     # neutralise any running/queued leftovers from earlier tests in the shared DB
     with session_scope() as s:
         for j in s.exec(select(Job).where(Job.status.in_(("running", "queued")))).all():
             j.status = "succeeded"
             s.add(j)
+
+    # create two users: uid_a (owner of the running job) and uid_b (unrelated non-admin)
+    uid_a = _mk_user("t10-wf-a@example.com")
+    uid_b = _mk_user("t10-wf-b@example.com")
+    uid_adm = _mk_user("t10-wf-adm@example.com", role="admin")
+
     with session_scope() as s:
-        running = Job(type="image_sync", title="Syncing Big Image → pve", status="running")
+        running = Job(type="image_sync", title="Syncing Big Image → pve",
+                      status="running", created_by=uid_a)
         queued = Job(type="deploy", title="Deploying wf-test", status="queued")
         s.add(running); s.add(queued); s.flush()
         rid, qid = running.id, queued.id
+
+    # viewer = owner of the running job → full title revealed
+    with session_scope() as s:
+        viewer_a = s.get(User, uid_a)
+        d = S.job_detail(s, s.get(Job, qid), include_log=False, viewer=viewer_a)
+        assert d.get("waitingFor") == "Syncing Big Image → pve", d.get("waitingFor")
+
+    # viewer = unrelated non-admin → generic placeholder
+    with session_scope() as s:
+        viewer_b = s.get(User, uid_b)
+        d = S.job_detail(s, s.get(Job, qid), include_log=False, viewer=viewer_b)
+        assert d.get("waitingFor") == "another job", d.get("waitingFor")
+
+    # viewer = admin → full title revealed
+    with session_scope() as s:
+        viewer_adm = s.get(User, uid_adm)
+        d = S.job_detail(s, s.get(Job, qid), include_log=False, viewer=viewer_adm)
+        assert d.get("waitingFor") == "Syncing Big Image → pve", d.get("waitingFor")
+
+    # viewer omitted (None) → safe generic default
     with session_scope() as s:
         d = S.job_detail(s, s.get(Job, qid), include_log=False)
-        assert d.get("waitingFor") == "Syncing Big Image → pve", d.get("waitingFor")
+        assert d.get("waitingFor") == "another job", d.get("waitingFor")
+
+    # running job's own detail → waitingFor is None (unchanged)
+    with session_scope() as s:
         d2 = S.job_detail(s, s.get(Job, rid), include_log=False)
-        assert d2.get("waitingFor") is None
+        assert d2.get("waitingFor") is None, d2.get("waitingFor")
+
+    # cleanup
     with session_scope() as s:
         for jid in (rid, qid):
             j = s.get(Job, jid)

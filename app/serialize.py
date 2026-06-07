@@ -186,7 +186,7 @@ def job_brief(session: Session, job: Job) -> dict:
 
 
 def job_detail(session: Session, job: Job, include_log: bool = True,
-               log_limit: int = 2000) -> dict:
+               log_limit: int = 2000, viewer: Optional["User"] = None) -> dict:
     steps = session.exec(
         select(JobStep).where(JobStep.job_id == job.id).order_by(JobStep.seq)
     ).all()
@@ -206,7 +206,13 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
         running = session.exec(
             select(Job).where(Job.status == "running").order_by(Job.id)
         ).first()
-        waiting_for = running.title if running else None
+        if running:
+            # titles carry tenant-owned names — only reveal a title the viewer may
+            # see (their own job, or any job for admins); else stay generic
+            if viewer is not None and (viewer.role == "admin" or running.created_by == viewer.id):
+                waiting_for = running.title
+            else:
+                waiting_for = "another job"
     phase_sets = {
         "deploy": ["Allocate", "Prepare image", "Create", "Configure", "Boot"],
         "rebuild": ["Destroy", "Allocate", "Prepare image", "Create", "Configure", "Boot"],
