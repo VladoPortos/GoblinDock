@@ -201,6 +201,12 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
         logs = list(reversed(logs))
     status_map = {"running": "working", "queued": "working", "succeeded": "done",
                   "failed": "error", "canceled": "error"}
+    waiting_for = None
+    if job.status == "queued":
+        running = session.exec(
+            select(Job).where(Job.status == "running").order_by(Job.id)
+        ).first()
+        waiting_for = running.title if running else None
     phase_sets = {
         "deploy": ["Allocate", "Prepare image", "Create", "Configure", "Boot"],
         "rebuild": ["Destroy", "Allocate", "Prepare image", "Create", "Configure", "Boot"],
@@ -224,6 +230,7 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
         ],
         "log": [{"cls": e.log_class, "text": e.line} for e in logs],
         "lastEventId": logs[-1].id if logs else 0,
+        "waitingFor": waiting_for,
     }
 
 

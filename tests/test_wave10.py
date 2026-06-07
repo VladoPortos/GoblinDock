@@ -329,6 +329,33 @@ def test_wait_task_timeout_stops_task():
     print("test_wait_task_timeout_stops_task OK")
 
 
+def test_job_detail_waiting_for():
+    from app import serialize as S
+    from app.models import Job
+    from sqlmodel import select
+    # neutralise any running/queued leftovers from earlier tests in the shared DB
+    with session_scope() as s:
+        for j in s.exec(select(Job).where(Job.status.in_(("running", "queued")))).all():
+            j.status = "succeeded"
+            s.add(j)
+    with session_scope() as s:
+        running = Job(type="image_sync", title="Syncing Big Image → pve", status="running")
+        queued = Job(type="deploy", title="Deploying wf-test", status="queued")
+        s.add(running); s.add(queued); s.flush()
+        rid, qid = running.id, queued.id
+    with session_scope() as s:
+        d = S.job_detail(s, s.get(Job, qid), include_log=False)
+        assert d.get("waitingFor") == "Syncing Big Image → pve", d.get("waitingFor")
+        d2 = S.job_detail(s, s.get(Job, rid), include_log=False)
+        assert d2.get("waitingFor") is None
+    with session_scope() as s:
+        for jid in (rid, qid):
+            j = s.get(Job, jid)
+            j.status = "succeeded"
+            s.add(j)
+    print("test_job_detail_waiting_for OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
@@ -338,4 +365,5 @@ if __name__ == "__main__":
     test_cached_images_endpoint()
     test_sync_endpoint()
     test_wait_task_timeout_stops_task()
+    test_job_detail_waiting_for()
     print("\nALL WAVE 10 UNIT TESTS PASSED")
