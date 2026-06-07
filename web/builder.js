@@ -72,7 +72,7 @@
   }
 
   // ---------- Canvas ----------
-  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mode }) {
+  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }) {
     return h('div', { className: 'bpane', style: { flex: 1, background: 'var(--bg)' } },
       h('div', { style: { overflowY: 'auto', flex: 1, padding: '20px 24px 60px' } },
         h('div', { style: { maxWidth: 620, margin: '0 auto', display: 'flex', flexDirection: 'column' } },
@@ -108,7 +108,7 @@
                         })(),
                         warnOf(b) && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none', padding: '1px 6px', fontSize: 10 } },
                           h(Icon, { name: 'warn', size: 11 }), 'needs input'),
-                        mode === 'template' && (b.ask || []).length > 0 && h('span', { className: 'badge', style: { background: 'var(--info-ghost)', color: 'var(--info)', border: 'none', padding: '1px 6px', fontSize: 10 } },
+                        (b.ask || []).length > 0 && h('span', { className: 'badge', style: { background: 'var(--info-ghost)', color: 'var(--info)', border: 'none', padding: '1px 6px', fontSize: 10 } },
                           h(Icon, { name: 'info', size: 11 }), 'asks at deploy')),
                       h('div', { className: 'hint mono', style: { fontSize: 11, marginTop: 2 } }, summaryOf(b))),
                     h('div', { className: 'pb-actions' },
@@ -200,38 +200,32 @@
   }
 
   // ---------- Inspector ----------
-  function Inspector({ sections, sel, mode, meta, setInput, setAsk }) {
+  function Inspector({ sections, sel, meta, setInput, setAsk }) {
     let block = null, secId = null;
     sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; secId = s.id; } }));
     if (!block) {
       return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
-        h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, mode === 'golden' ? 'Golden image' : 'Template')),
+        h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, 'Template')),
         h('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 14 } },
-          h(SpecField, { icon: 'tag', label: mode === 'golden' ? 'Image name' : 'Template name' },
+          h(SpecField, { icon: 'tag', label: 'Template name' },
             h(Field, { value: meta.name, onChange: meta.setName, mono: true })),
-          mode === 'template' && h(SpecField, { icon: 'info', label: 'Description' },
+          h(SpecField, { icon: 'info', label: 'Description' },
             h(TextArea, { value: meta.desc, onChange: meta.setDesc, rows: 2 })),
           meta.imageSelect && h(SpecField, { icon: meta.imageSelect.icon || 'disk', label: meta.imageSelect.label },
-            h(SelectField, { value: meta.imageSelect.value || '', onChange: (v) => meta.imageSelect.set(Number(v) || null), options: meta.imageSelect.options })),
+            h(SelectField, { value: meta.imageSelect.value || '', onChange: (v) => meta.imageSelect.set(v || null), options: meta.imageSelect.options })),
           meta.locationSelect && h(SpecField, { icon: meta.locationSelect.icon || 'server', label: meta.locationSelect.label },
             h(SelectField, { value: meta.locationSelect.value || '', onChange: (v) => meta.locationSelect.set(Number(v) || null), options: meta.locationSelect.options })),
-          mode === 'golden' && !meta.imageSelect && h(SpecField, { icon: 'disk', label: 'Base image' },
-            h('div', { className: 'row', style: { gap: 8, padding: '8px 10px', background: 'var(--inset)', borderRadius: 9, border: '1px solid var(--border)' } },
-              h(OSGlyph, { os: meta.os, size: 18 }), h('span', { className: 'mono', style: { fontSize: 12.5 } }, meta.base))),
+          meta.networkSelect && h(SpecField, { icon: meta.networkSelect.icon || 'network', label: meta.networkSelect.label },
+            h(SelectField, { value: meta.networkSelect.value || '', onChange: (v) => meta.networkSelect.set(Number(v) || null), options: meta.networkSelect.options })),
           h('div', { className: 'divider' }),
-          mode === 'golden'
-            ? h(SpecField, { icon: 'cpu', label: 'Disk (GB)' },
-                h(Field, { value: meta.disk, onChange: meta.setDisk, mono: true }))
-            : h(SpecField, { icon: 'cpu', label: 'Default resources' },
-                h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 } },
-                  h(Field, { label: 'vCPU', value: meta.cpu, onChange: meta.setCpu, mono: true }),
-                  h(Field, { label: 'RAM', value: meta.mem, onChange: meta.setMem, mono: true }),
-                  h(Field, { label: 'Disk', value: meta.disk, onChange: meta.setDisk, mono: true }))),
+          h(SpecField, { icon: 'cpu', label: 'Default resources' },
+            h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 8 } },
+              h(Field, { label: 'vCPU', value: meta.cpu, onChange: meta.setCpu, mono: true }),
+              h(Field, { label: 'RAM', value: meta.mem, onChange: meta.setMem, mono: true }),
+              h(Field, { label: 'Disk', value: meta.disk, onChange: meta.setDisk, mono: true }))),
           h('div', { className: 'card', style: { padding: 13, background: 'var(--surface)', display: 'flex', gap: 10 } },
             h(Icon, { name: 'info', size: 15, style: { color: 'var(--text-faint)', flexShrink: 0, marginTop: 1 } }),
-            h('p', { className: 'hint', style: { fontSize: 11.5 } }, mode === 'golden'
-              ? 'Blocks here are baked INTO the image. Cloud-init blocks run at first boot; ansible blocks run post-boot.'
-              : 'These blocks run on every VM you deploy with this template.'))));
+            h('p', { className: 'hint', style: { fontSize: 11.5 } }, 'These blocks run on every VM you deploy with this template.'))));
     }
     const schema = paletteByKey(block.ref).schema || [];
     return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
@@ -244,7 +238,7 @@
           ? h('p', { className: 'hint', style: { fontSize: 12 } }, 'This block has no inputs.')
           : schema.map((f) => h('div', { key: f.name },
               h(SchemaField, { field: f, value: (block.inputs || {})[f.name], onChange: (v) => setInput(block.uid, f.name, v) }),
-              mode === 'template' && h('div', { style: { marginTop: 6, padding: '4px 8px', background: 'var(--inset)', borderRadius: 7 } },
+              h('div', { style: { marginTop: 6, padding: '4px 8px', background: 'var(--inset)', borderRadius: 7 } },
                 h(Toggle, { label: 'Ask on deployment', on: (block.ask || []).includes(f.name), onChange: (on) => setAsk(block.uid, f.name, on) }))))));
   }
 
@@ -296,15 +290,12 @@
   }
 
   // ---------- Shell ----------
-  function Builder({ go, mode }) {
-    // mode: 'golden' (base + location + bake-time blocks) | 'template' (runtime blocks)
+  function Builder({ go }) {
     const nav = window.GDStore.nav || {};
-    const loadedImg = mode === 'golden' && nav.imageId ? (GD.GOLDEN_IMAGES || []).find((g) => g.imgId === nav.imageId) : null;
-    const loadedTpl = mode === 'template' && nav.templateId ? (GD.TEMPLATES || []).find((r) => r.templateId === nav.templateId) : null;
-    const firstBase = (nav.baseImageId ? (GD.BASE_IMAGES || []).find((b) => b.imgId === nav.baseImageId) : null) || (GD.BASE_IMAGES || [])[0] || {};
+    const loadedTpl = nav.templateId ? (GD.TEMPLATES || []).find((r) => r.templateId === nav.templateId) : null;
 
     const initSections = () => {
-      const src = (loadedImg && loadedImg.recipe) || (loadedTpl && loadedTpl.recipe) || null;
+      const src = (loadedTpl && loadedTpl.recipe) || null;
       if (!src || !src.length) return blankSections();
       const out = blankSections();
       const byId = Object.fromEntries(out.map((s) => [s.id, s]));
@@ -322,62 +313,47 @@
     const [busy, setBusy] = useState(false);
     const busyRef = React.useRef(false);
     const [blockModal, setBlockModal] = useState(null);
-    const [rebuildAsk, setRebuildAsk] = useState(false);
-    const [buildAsk, setBuildAsk] = useState(false);
     const dragRef = React.useRef(null);
 
-    const bases = GD.BASE_IMAGES || [];
-    const conns = (GD.CONNECTIONS || []);
-    const [recipeName, setRecipeName] = useState(loadedImg ? loadedImg.name : loadedTpl ? loadedTpl.name : (mode === 'golden' ? 'gd-custom' : 'Custom template'));
+    const [recipeName, setRecipeName] = useState(loadedTpl ? loadedTpl.name : 'Custom template');
     const [cpu, setCpu] = useState(loadedTpl ? loadedTpl.cpu : 1);
     const [mem, setMem] = useState(loadedTpl ? loadedTpl.mem : 2);
-    const [disk, setDisk] = useState(loadedImg ? 20 : (loadedTpl ? loadedTpl.disk : 20));
-    // golden-mode: base + location (which Proxmox + node)
-    const [selBaseId, setSelBaseId] = useState(loadedImg ? null : (firstBase.imgId || null));
-    const [selConnId, setSelConnId] = useState(loadedImg ? loadedImg.connId : ((conns[0] && conns[0].connId) || null));
-    const [selGoldenId, setSelGoldenId] = useState(
-      mode === 'template' ? (loadedTpl ? loadedTpl.goldenImageId : (nav.goldenImageId || null)) : null);
-    const [selNetId, setSelNetId] = useState(mode === 'template' && loadedTpl ? loadedTpl.networkId : null);
-    const [desc, setDesc] = useState(mode === 'template' && loadedTpl ? (loadedTpl.desc || '') : '');
-    const selBase = bases.find((b) => b.imgId === selBaseId) || firstBase;
-    const selConn = conns.find((c) => c.connId === selConnId) || conns[0] || {};
+    const [disk, setDisk] = useState(loadedTpl ? loadedTpl.disk : 20);
+    const [selBaseId, setSelBaseId] = useState(loadedTpl ? loadedTpl.baseImageId : (nav.baseImageId || null));
+    const [selConnId, setSelConnId] = useState(loadedTpl ? loadedTpl.connectionId : null);
+    const [selNetId, setSelNetId] = useState(loadedTpl ? loadedTpl.networkId : null);
+    const [desc, setDesc] = useState(loadedTpl ? (loadedTpl.desc || '') : '');
 
-    let metaBase, metaOs, imageSelect = null, locationSelect = null;
-    if (mode === 'golden') {
-      if (loadedImg) { metaBase = loadedImg.base; metaOs = loadedImg.osFamily; }
-      else {
-        metaBase = selBase.name || 'Ubuntu 24.04 LTS'; metaOs = selBase.os || 'ubuntu';
-        imageSelect = { label: 'Base image', value: selBaseId, set: setSelBaseId,
-          options: bases.map((b) => ({ value: b.imgId, label: b.name })) };
-        locationSelect = { label: 'Location (Proxmox)', value: selConnId, set: setSelConnId,
-          options: conns.map((c) => ({ value: c.connId, label: c.name + ' · ' + (c.node || 'auto') })) };
-      }
-    } else {
-      const goldens = (GD.GOLDEN_IMAGES || []).filter((g) => g.deployable);
-      const selGold = goldens.find((g) => g.imgId === selGoldenId) || null;
-      const goldenStale = selGoldenId && !selGold;
-      metaBase = selGold ? selGold.name : ''; metaOs = selGold ? selGold.os : (loadedTpl ? loadedTpl.os : 'ubuntu');
-      imageSelect = { label: 'Golden image', icon: 'package', value: selGoldenId, set: (v) => { setSelGoldenId(v); setSelNetId(null); },
-        options: [{ value: '', label: '— pick an image to enable deploy —' },
-          ...(goldenStale ? [{ value: selGoldenId, label: '⚠ image #' + selGoldenId + ' (not deployable)' }] : []),
-          ...goldens.map((g) => ({ value: g.imgId, label: g.name + ' · ' + (g.location || '') }))] };
-      const tplNets = selGold ? (GD.NETWORKS || []).filter((n) => n.connId === selGold.connId) : [];
-      if (selGold) {
-        locationSelect = { label: 'Network', icon: 'network', value: selNetId, set: setSelNetId,
-          options: [{ value: '', label: 'Connection default' },
-            ...tplNets.map((n) => ({ value: n.netId, label: n.name + ' · ' + n.mode }))] };
-      }
+    const bases = GD.BASE_IMAGES || [];
+    const conns = GD.CONNECTIONS || [];
+    const selBase = bases.find((b) => b.imgId === selBaseId) || null;
+    const selConn = conns.find((c) => c.connId === selConnId) || null;
+    const metaBase = selBase ? selBase.name : '';
+    const metaOs = selBase ? selBase.os : (loadedTpl ? loadedTpl.os : 'ubuntu');
+    const imageSelect = { label: 'Base image (ISO)', icon: 'disk', value: selBaseId, set: setSelBaseId,
+      options: [{ value: '', label: '— pick a base image —' },
+        ...bases.map((b) => ({ value: b.imgId, label: b.name }))] };
+    const locationSelect = { label: 'Location (Proxmox)', icon: 'server', value: selConnId,
+      set: (v) => { setSelConnId(v); setSelNetId(null); },
+      options: [{ value: '', label: '— pick a connection to enable deploy —' },
+        ...conns.map((c) => ({ value: c.connId, label: c.name + ' · ' + (c.node || 'auto') }))] };
+    let networkSelect = null;
+    if (selConn) {
+      const nets = (GD.NETWORKS || []).filter((n) => n.connId === selConn.connId);
+      networkSelect = { label: 'Network', icon: 'network', value: selNetId, set: setSelNetId,
+        options: [{ value: '', label: 'Connection default' },
+          ...nets.map((n) => ({ value: n.netId, label: n.name + ' · ' + n.mode }))] };
     }
     const meta = {
       name: recipeName, setName: setRecipeName, base: metaBase, os: metaOs,
-      cpu, setCpu, mem, setMem, disk, setDisk, imageSelect, locationSelect,
+      cpu, setCpu, mem, setMem, disk, setDisk, imageSelect, locationSelect, networkSelect,
       desc, setDesc,
     };
 
     const recipePayload = () => sections.map((s) => ({
       id: s.id, name: s.name,
       blocks: s.blocks.map((b) => ({ ref: b.ref, name: b.name, inputs: b.inputs || {},
-        ...(mode === 'template' && b.ask && b.ask.length ? { ask: b.ask } : {}) })),
+        ...(b.ask && b.ask.length ? { ask: b.ask } : {}) })),
     }));
     const sectionFor = (block) => SECTION_BY_NAME[block.section] || SECTION_BY_NAME[block.cat] || 's-inst';
     const addBlock = (block, secId) => {
@@ -416,29 +392,16 @@
       try { const r = await window.API.compile(recipePayload(), recipeName); setYamlText(r.yaml); }
       catch (e) { setYamlText('# compile failed: ' + (e.message || '')); }
     };
-    const doBuildOrSave = async () => {
+    const doSave = async () => {
       if (busyRef.current) return;       // ref latch — block a double-click double-submit
       busyRef.current = true;
       setBusy(true);
       try {
-        if (mode === 'golden' && loadedImg) {
-          // editing an existing golden image: update its baked recipe, then rebuild IT
-          await window.API.editImage(loadedImg.imgId, { name: recipeName.trim(), recipe: recipePayload() });
-          const r = await window.API.rebuildGolden(loadedImg.imgId);
-          go('job', { jobId: r.jobId });
-        } else if (mode === 'golden') {
-          if (!selBase.imgId) { window.GDStore.toast('Add a base image (ISO) first', 'err'); setBusy(false); busyRef.current = false; return; }
-          const r = await window.API.buildGolden({
-            name: recipeName.trim() || 'gd-custom', os_family: selBase.os || 'ubuntu',
-            baseImageId: selBase.imgId, connectionId: selConn.connId, node: selConn.node || null,
-            recipe: recipePayload(), disk: Number(disk) || 20,
-          });
-          go('job', { jobId: r.jobId });
-        } else if (loadedTpl) {
-          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public, goldenImageId: selGoldenId || null, networkId: selNetId || null, os_family: selGold ? selGold.os : ((loadedTpl && loadedTpl.os) || 'ubuntu') });
+        if (loadedTpl) {
+          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public, os_family: selBase ? selBase.os : ((loadedTpl && loadedTpl.os) || 'ubuntu'), baseImageId: selBaseId || null, connectionId: selConnId || null, networkId: selNetId || null });
           window.GDStore.toast('Template updated', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         } else {
-          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), goldenImageId: selGoldenId || null, networkId: selNetId || null, os_family: selGold ? selGold.os : ((loadedTpl && loadedTpl.os) || 'ubuntu') });
+          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), os_family: selBase ? selBase.os : ((loadedTpl && loadedTpl.os) || 'ubuntu'), baseImageId: selBaseId || null, connectionId: selConnId || null, networkId: selNetId || null });
           window.GDStore.toast('Template saved', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         }
       } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); setBusy(false); busyRef.current = false; }
@@ -450,20 +413,20 @@
     return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%' } },
       h('div', { className: 'builder-bar' },
         h('div', { className: 'row', style: { gap: 10, minWidth: 0 } },
-          h('button', { className: 'btn ghost sm', title: 'Back', onClick: () => go(mode === 'golden' ? 'golden' : 'templates') },
-            h(Icon, { name: 'chevronL', size: 16 }), mode === 'golden' ? 'Golden Images' : 'Templates'),
-          h(Icon, { name: mode === 'golden' ? 'hammer' : 'template', size: 17, style: { color: 'var(--accent)' } }),
+          h('button', { className: 'btn ghost sm', title: 'Back', onClick: () => go('templates') },
+            h(Icon, { name: 'chevronL', size: 16 }), 'Templates'),
+          h(Icon, { name: 'template', size: 17, style: { color: 'var(--accent)' } }),
           h('input', { className: 'recipe-name mono', value: recipeName, onChange: (e) => setRecipeName(e.target.value) }),
           h('span', { className: 'chip', style: { gap: 6 } }, h(OSGlyph, { os: meta.os, size: 14 }), meta.base),
           h('span', { className: 'hint mono', style: { fontSize: 11 } }, blockCount, ' blocks'),
           warnCount > 0 && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, h(Icon, { name: 'warn', size: 12 }), warnCount, ' need input')),
         h('div', { className: 'row', style: { marginLeft: 'auto', gap: 8 } },
           h('button', { className: 'btn sm', onClick: openYaml }, h(Icon, { name: 'code', size: 15 }), 'View YAML'),
-          h('button', { className: 'btn primary sm', onClick: () => { if (mode === 'golden' && loadedImg) setRebuildAsk(true); else if (mode === 'golden') setBuildAsk(true); else doBuildOrSave(); }, disabled: busy }, h(Icon, { name: mode === 'golden' ? 'hammer' : 'check', size: 15 }), busy ? 'Working…' : (mode === 'golden' ? (loadedImg ? 'Rebuild' : 'Build image') : (loadedTpl ? 'Save changes' : 'Save template'))))),
+          h('button', { className: 'btn primary sm', onClick: doSave, disabled: busy }, h(Icon, { name: 'check', size: 15 }), busy ? 'Working…' : (loadedTpl ? 'Save changes' : 'Save template')))),
       h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
         h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({ new: true }) }),
-        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mode }),
-        h(Inspector, { sections, sel, mode, meta, setInput, setAsk })),
+        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),
+        h(Inspector, { sections, sel, meta, setInput, setAsk })),
       yaml && h(Modal, { onClose: () => setYaml(false), width: 'min(680px, 94vw)' },
         h('div', { className: 'modal-head' },
           h(Icon, { name: 'code', size: 17, style: { color: 'var(--accent)' } }),
@@ -472,21 +435,7 @@
           h('button', { className: 'icon-btn', style: { marginLeft: 'auto' }, onClick: () => setYaml(false) }, h(Icon, { name: 'x', size: 16 }))),
         h('div', { style: { padding: 0 } },
           h('pre', { className: 'logpane', style: { margin: 0, borderRadius: 0, border: 'none', maxHeight: '60vh', fontSize: 12 } }, yamlText))),
-      blockModal && h(BlockEditorModal, { initial: blockModal.initial, onClose: () => setBlockModal(null), onSaved: () => { setBlockModal(null); window.GDStore.toast('Block saved', 'ok'); window.GDStore.refresh().catch(() => {}); } }),
-      buildAsk && h(ConfirmModal, {
-        onClose: () => setBuildAsk(false), tone: 'accent', icon: 'hammer',
-        title: 'Build ' + recipeName + '?',
-        body: 'This immediately creates a temporary build VM on ' + (selConn.name || 'your Proxmox target')
-          + (selConn.node ? ' · ' + selConn.node : '')
-          + ', runs the blocks, and converts it into a reusable template. You can watch progress live.',
-        confirmLabel: 'Build image', onConfirm: () => { setBuildAsk(false); doBuildOrSave(); },
-      }),
-      rebuildAsk && h(ConfirmModal, {
-        onClose: () => setRebuildAsk(false), tone: 'danger', icon: 'rebuild',
-        title: 'Rebuild ' + recipeName + '?',
-        body: 'This deletes the current template (vmid ' + ((loadedImg && loadedImg.vmid) || '—') + ') and builds a fresh one with these blocks. Already-deployed VMs keep running and are unaffected.',
-        confirmLabel: 'Delete & rebuild', onConfirm: () => { setRebuildAsk(false); doBuildOrSave(); },
-      }));
+      blockModal && h(BlockEditorModal, { initial: blockModal.initial, onClose: () => setBlockModal(null), onSaved: () => { setBlockModal(null); window.GDStore.toast('Block saved', 'ok'); window.GDStore.refresh().catch(() => {}); } }));
   }
 
   window.Builder = Builder;

@@ -81,7 +81,7 @@
       deploy: () => h(window.Deploy, { go }),
       job: () => h(window.JobProgress, { go }),
       builder: () => h(window.Builder, { go, mode: 'golden' }),
-      newtemplate: () => h(window.Builder, { go, mode: 'template' }),
+      newtemplate: () => h(window.Builder, { go }),
       golden: () => h(window.GoldenImages, { go }),
       templates: () => h(window.TemplatesList, { go }),
       isos: () => h(window.Isos, { go }),
