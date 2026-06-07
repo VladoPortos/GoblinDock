@@ -223,8 +223,11 @@ def test_ask_map_and_merge():
     merged = merge_deploy_inputs(recipe, {"1.0": {"packages": ["nc"]}})
     assert merged[1]["blocks"][0]["inputs"]["packages"] == ["curl"]
     # junk addresses / shapes don't crash
-    assert merge_deploy_inputs(recipe, {"9.9": {"a": 1}, "x.y": {"b": 2}, "0.0": "notadict"})
+    assert merge_deploy_inputs(recipe, {"9.9": {"a": 1}, "x.y": {"b": 2}, "0.0": "notadict"}) == recipe
     assert merge_deploy_inputs(recipe, {}) == recipe
+    # malformed recipes don't crash the defense layer
+    assert ask_map(["junk", {"blocks": ["notadict"]}]) == {}
+    assert merge_deploy_inputs(["junk"], {"0.0": {"a": 1}}) == ["junk"]
     print("test_ask_map_and_merge OK")
 
 

@@ -72,7 +72,7 @@
   }
 
   // ---------- Canvas ----------
-  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }) {
+  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mode }) {
     return h('div', { className: 'bpane', style: { flex: 1, background: 'var(--bg)' } },
       h('div', { style: { overflowY: 'auto', flex: 1, padding: '20px 24px 60px' } },
         h('div', { style: { maxWidth: 620, margin: '0 auto', display: 'flex', flexDirection: 'column' } },
@@ -108,7 +108,7 @@
                         })(),
                         warnOf(b) && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none', padding: '1px 6px', fontSize: 10 } },
                           h(Icon, { name: 'warn', size: 11 }), 'needs input'),
-                        (b.ask || []).length > 0 && h('span', { className: 'badge', style: { background: 'var(--info-ghost)', color: 'var(--info)', border: 'none', padding: '1px 6px', fontSize: 10 } },
+                        mode === 'template' && (b.ask || []).length > 0 && h('span', { className: 'badge', style: { background: 'var(--info-ghost)', color: 'var(--info)', border: 'none', padding: '1px 6px', fontSize: 10 } },
                           h(Icon, { name: 'info', size: 11 }), 'asks at deploy')),
                       h('div', { className: 'hint mono', style: { fontSize: 11, marginTop: 2 } }, summaryOf(b))),
                     h('div', { className: 'pb-actions' },
@@ -395,7 +395,7 @@
       if (b && sectionFor(b) === secId) addBlock(b, secId);
     };
     const onRemove = (secId, uid) => setSections((prev) => prev.map((s) => s.id === secId ? { ...s, blocks: s.blocks.filter((b) => b.uid !== uid) } : s));
-    const onDup = (secId, b) => { const uid = 'u' + (UID++); setSections((prev) => prev.map((s) => s.id === secId ? { ...s, blocks: [...s.blocks, { ...b, uid, inputs: { ...(b.inputs || {}) } }] } : s)); };
+    const onDup = (secId, b) => { const uid = 'u' + (UID++); setSections((prev) => prev.map((s) => s.id === secId ? { ...s, blocks: [...s.blocks, { ...b, uid, inputs: { ...(b.inputs || {}) }, ask: (b.ask || []).slice() }] } : s)); };
     const onMove = (secId, uid, dir) => setSections((prev) => prev.map((s) => {
       if (s.id !== secId) return s;
       const idx = s.blocks.findIndex((b) => b.uid === uid);
@@ -462,7 +462,7 @@
           h('button', { className: 'btn primary sm', onClick: () => { if (mode === 'golden' && loadedImg) setRebuildAsk(true); else if (mode === 'golden') setBuildAsk(true); else doBuildOrSave(); }, disabled: busy }, h(Icon, { name: mode === 'golden' ? 'hammer' : 'check', size: 15 }), busy ? 'Working…' : (mode === 'golden' ? (loadedImg ? 'Rebuild' : 'Build image') : (loadedTpl ? 'Save changes' : 'Save template'))))),
       h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
         h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({ new: true }) }),
-        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),
+        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mode }),
         h(Inspector, { sections, sel, mode, meta, setInput, setAsk })),
       yaml && h(Modal, { onClose: () => setYaml(false), width: 'min(680px, 94vw)' },
         h('div', { className: 'modal-head' },

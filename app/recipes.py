@@ -139,7 +139,11 @@ def ask_map(recipe: list[dict]) -> dict[str, list[str]]:
     every placed block carrying a non-empty ``ask`` list."""
     out: dict[str, list[str]] = {}
     for si, sec in enumerate(recipe):
+        if not isinstance(sec, dict):
+            continue
         for bi, block in enumerate(sec.get("blocks") or []):
+            if not isinstance(block, dict):
+                continue
             asks = [a for a in (block.get("ask") or []) if isinstance(a, str)]
             if asks:
                 out[f"{si}.{bi}"] = asks
@@ -151,10 +155,10 @@ def merge_deploy_inputs(recipe: list[dict], overrides: dict) -> list[dict]:
     in the addressed block's own ``ask`` array are applied; unknown addresses,
     names or shapes are silently ignored (defense in depth — the API already
     validated them). Returns a deep copy; never mutates the stored recipe."""
+    out = json.loads(json.dumps(recipe))  # deep copy — never hand back the stored object
     if not overrides:
-        return recipe
+        return out
     allowed = ask_map(recipe)
-    out = json.loads(json.dumps(recipe))
     for addr, answers in overrides.items():
         names = allowed.get(addr)
         if not names or not isinstance(answers, dict):
@@ -164,6 +168,8 @@ def merge_deploy_inputs(recipe: list[dict], overrides: dict) -> list[dict]:
         except (ValueError, TypeError):
             continue
         block = out[si]["blocks"][bi]
+        if not isinstance(block, dict):
+            continue
         inputs = block.get("inputs") or {}
         for name, value in answers.items():
             if name in names:
