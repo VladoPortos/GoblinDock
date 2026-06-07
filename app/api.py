@@ -39,7 +39,7 @@ from .models import (
     User,
     utcnow,
 )
-from .proxmox import Proxmox
+from .proxmox import Proxmox, base_disk_filename
 from .recipes import ask_map, compile_playbook, lint_block, load_recipe
 from . import backup
 from .security import (
@@ -1005,6 +1005,28 @@ def add_base_image(body: BaseImageBody, user: User = Depends(require_admin),
     session.commit()
     return {"ok": True}
 
+
+@router.get("/images/cached")
+def cached_images(connectionId: int, user: User = Depends(current_user),
+                  session: Session = Depends(get_session)):
+    """Which base images are already downloaded on the connection's image storage.
+    One Proxmox listing per call; an unreachable node returns online=False with
+    HTTP 200 (the ISOs page renders 'target offline', never an error toast)."""
+    conn = session.get(Connection, connectionId)
+    if not conn:
+        raise HTTPException(404, "connection not found")
+    bases = session.exec(select(Image).where(Image.kind == "base")).all()
+    px = Proxmox(conn)
+    try:
+        vols = px.storage_volumes(node=conn.node or None)
+    except Exception:  # noqa: BLE001 — unreachable node is an expected state
+        return {"online": False, "cached": {}}
+    cached = {}
+    for img in bases:
+        if not (img.source_url or "").strip():
+            continue  # nothing to download — UI shows unknown
+        cached[str(img.id)] = px.iso_volume_path(base_disk_filename(img.source_url)) in vols
+    return {"online": True, "cached": cached}
 
 
 # --------------------------------------------------------------------------- #

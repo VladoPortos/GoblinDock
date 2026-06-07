@@ -7,7 +7,6 @@ This is the "worker" of the design's web+worker split, collapsed into one proces
 """
 from __future__ import annotations
 
-import hashlib
 import json
 import re
 import threading
@@ -37,6 +36,7 @@ from .models import (
 from .proxmox import (
     Proxmox,
     ProxmoxError,
+    base_disk_filename,
     delete_snippet_over_ssh,
     write_snippet_over_ssh,
 )
@@ -51,20 +51,6 @@ from .security import decrypt, encrypt
 
 _worker_thread: Optional[threading.Thread] = None
 _stop = threading.Event()
-
-
-def _base_disk_filename(src_url: str) -> str:
-    """Cached per-URL qcow2 name on node storage. 'import' content needs a
-    recognised extension (cloud .img files are qcow2), and the name flows into
-    the comma-delimited import-from config — strict allowlist, URL-hash namespaced."""
-    raw_name = (src_url.rsplit("/", 1)[-1] if src_url else "image") or "image"
-    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).lstrip(".-") or "image"
-    stem = safe.rsplit(".", 1)[0] or "image"
-    url_tag = hashlib.sha256((src_url or "").encode()).hexdigest()[:8]
-    filename = f"{stem}-{url_tag}.qcow2"
-    if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
-        raise RuntimeError(f"unsafe image filename derived from URL: {raw_name!r}")
-    return filename
 
 
 # --------------------------------------------------------------------------- #
@@ -364,7 +350,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")
     st = ctx.add_step("Ensure base cloud image on node storage")
     t = ctx.start_step(st)
-    filename = _base_disk_filename(src_url)
+    filename = base_disk_filename(src_url)
     if px.storage_has_volume(filename, node=node):
         ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
     else:

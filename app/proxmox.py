@@ -7,6 +7,7 @@ cloud-init snippet for baking a recipe.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import os
 import re
@@ -23,6 +24,20 @@ from .security import decrypt
 
 class ProxmoxError(RuntimeError):
     pass
+
+
+def base_disk_filename(src_url: str) -> str:
+    """Cached per-URL qcow2 name on node storage. 'import' content needs a
+    recognised extension (cloud .img files are qcow2), and the name flows into
+    the comma-delimited import-from config — strict allowlist, URL-hash namespaced."""
+    raw_name = (src_url.rsplit("/", 1)[-1] if src_url else "image") or "image"
+    safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).lstrip(".-") or "image"
+    stem = safe.rsplit(".", 1)[0] or "image"
+    url_tag = hashlib.sha256((src_url or "").encode()).hexdigest()[:8]
+    filename = f"{stem}-{url_tag}.qcow2"
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
+        raise RuntimeError(f"unsafe image filename derived from URL: {raw_name!r}")
+    return filename
 
 
 def _split_token(token_id: str) -> tuple[str, str]:
@@ -198,6 +213,14 @@ class Proxmox:
         # allowed to use it as import-from. e.g. local:import/noble.img
         return f"{self.iso_storage}:import/{filename}"
 
+    def storage_volumes(self, node: Optional[str] = None, content: str = "import") -> set:
+        """Volume ids present in the iso/import storage on `node`. RAISES on a
+        listing failure — callers that need offline-detection (the cache-status
+        endpoint) rely on the exception; tolerant callers use storage_has_volume."""
+        node = node or self.pick_node()
+        items = self.api.nodes(node).storage(self.iso_storage).content.get(content=content)
+        return {(it or {}).get("volid") for it in (items or [])}
+
     def storage_has_volume(self, filename: str, node: Optional[str] = None,
                            content: str = "import") -> bool:
         """Is `filename` already present in the iso/import storage on `node`? Used to
@@ -206,10 +229,9 @@ class Proxmox:
         node = node or self.pick_node()
         volid = self.iso_volume_path(filename)
         try:
-            items = self.api.nodes(node).storage(self.iso_storage).content.get(content=content)
+            return volid in self.storage_volumes(node=node, content=content)
         except Exception:  # noqa: BLE001
             return False
-        return any((it or {}).get("volid") == volid for it in (items or []))
 
     def create_vm_import(
         self, vmid: int, name: str, import_path: str, cores: int, ram_mb: int,

@@ -198,10 +198,58 @@ def test_seed_template_wiring():
     print("test_seed_template_wiring OK")
 
 
+def test_cached_images_endpoint():
+    from app import api
+    from app.models import Image, User
+    from app.proxmox import base_disk_filename
+    uid = _mk_user("t10-cache@example.com")
+    conn_id, base_id, net_id = _mk_conn_base_net()
+    with session_scope() as s:
+        src = s.get(Image, base_id).source_url
+        blank = Image(kind="base", name="no-url-cache", os_family="ubuntu",
+                      source_url="", build_status="ready")
+        s.add(blank); s.flush(); blank_id = blank.id
+    # unknown connection → 404
+    with session_scope() as s:
+        _expect_http(404, lambda: api.cached_images(999999, user=s.get(User, uid), session=s))
+    # stub Proxmox: exactly base_id's file is present on the node
+    class _StubPx:
+        def __init__(self, conn): pass
+        def storage_volumes(self, node=None, content="import"):
+            return {f"local:import/{base_disk_filename(src)}"}
+        def iso_volume_path(self, filename):
+            return f"local:import/{filename}"
+    orig = api.Proxmox
+    api.Proxmox = _StubPx
+    try:
+        with session_scope() as s:
+            out = api.cached_images(conn_id, user=s.get(User, uid), session=s)
+        assert out["online"] is True
+        assert out["cached"][str(base_id)] is True
+        assert str(blank_id) not in out["cached"], "blank source_url must be omitted"
+        assert all(isinstance(v, bool) for v in out["cached"].values())
+    finally:
+        api.Proxmox = orig
+    # unreachable node → online False, HTTP 200 (no exception)
+    class _DownPx:
+        def __init__(self, conn): pass
+        def storage_volumes(self, node=None, content="import"):
+            raise RuntimeError("connection refused")
+    api.Proxmox = _DownPx
+    try:
+        with session_scope() as s:
+            out = api.cached_images(conn_id, user=s.get(User, uid), session=s)
+        assert out == {"online": False, "cached": {}}
+    finally:
+        api.Proxmox = orig
+    print("test_cached_images_endpoint OK")
+
+
 if __name__ == "__main__":
     test_schema_templates_only()
     test_template_refs_validation()
     test_deploy_templates_only()
     test_legacy_rebuild_guard()
     test_seed_template_wiring()
+    test_cached_images_endpoint()
     print("\nALL WAVE 10 UNIT TESTS PASSED")
