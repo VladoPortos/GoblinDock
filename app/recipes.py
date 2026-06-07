@@ -156,7 +156,7 @@ def merge_deploy_inputs(recipe: list[dict], overrides: dict) -> list[dict]:
     names or shapes are silently ignored (defense in depth — the API already
     validated them). Returns a deep copy; never mutates the stored recipe."""
     out = json.loads(json.dumps(recipe))  # deep copy — never hand back the stored object
-    if not overrides:
+    if not overrides or not isinstance(overrides, dict):
         return out
     allowed = ask_map(recipe)
     for addr, answers in overrides.items():

@@ -564,9 +564,9 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                 v = answers[name]
                 if ftype == "bool" and not isinstance(v, bool):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a boolean")
-                if ftype == "tags" and not isinstance(v, list):
+                if ftype in ("tags", "list") and not isinstance(v, list):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a list")
-                if ftype not in ("bool", "tags") and not isinstance(v, str):
+                if ftype not in ("bool", "tags", "list") and not isinstance(v, str):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a string")
                 if ftype in ("text", "secret") and not v.strip():
                     raise HTTPException(400, f"template requires input {name!r}")

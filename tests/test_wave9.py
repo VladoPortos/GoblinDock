@@ -225,6 +225,7 @@ def test_ask_map_and_merge():
     # junk addresses / shapes don't crash
     assert merge_deploy_inputs(recipe, {"9.9": {"a": 1}, "x.y": {"b": 2}, "0.0": "notadict"}) == recipe
     assert merge_deploy_inputs(recipe, {}) == recipe
+    assert merge_deploy_inputs(recipe, [1, 2, 3]) == recipe  # non-dict overrides ignored
     # malformed recipes don't crash the defense layer
     assert ask_map(["junk", {"blocks": ["notadict"]}]) == {}
     assert merge_deploy_inputs(["junk"], {"0.0": {"a": 1}}) == ["junk"]
