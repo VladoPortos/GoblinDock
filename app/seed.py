@@ -651,7 +651,7 @@ def seed_templates() -> None:
         ]
         golden = s.exec(select(Image).where(
             Image.kind == "golden", Image.os_family == "ubuntu",
-            Image.template_vmid.is_not(None))).first()
+            Image.template_vmid.is_not(None), Image.build_status == "ready")).first()
         s.add(Template(
             name="AI Dev Box",
             description="Node.js + Claude Code + OpenAI Codex + a global CLAUDE.md — a ready-to-code box.",
