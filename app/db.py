@@ -106,7 +106,8 @@ def _migrate() -> None:
             ("widget_key_last_used", "TIMESTAMP"),
         ],
         "templates": [
-            ("golden_image_id", "INTEGER"),
+            ("base_image_id", "INTEGER"),
+            ("connection_id", "INTEGER"),
             ("network_id", "INTEGER"),
         ],
         "deployments": [
@@ -122,6 +123,7 @@ def _migrate() -> None:
         "deployments": ["last_action"],
         "blocks": ["editable"],
         "jobs": ["total_phases"],
+        "templates": ["golden_image_id"],
     }
     import logging
     log = logging.getLogger("goblindock")

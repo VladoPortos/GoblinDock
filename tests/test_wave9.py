@@ -76,7 +76,8 @@ def test_migration_renames_and_extends():
     assert "templates" in tables, tables
     assert "recipes" not in tables, tables
     tcols = _cols("templates")
-    assert {"golden_image_id", "network_id"} <= tcols, tcols
+    assert {"base_image_id", "connection_id", "network_id"} <= tcols, tcols
+    assert "golden_image_id" not in tcols, tcols
     dcols = _cols("deployments")
     assert "template_id" in dcols and "recipe_id" not in dcols, dcols
     assert "deploy_inputs_json" in dcols, dcols
@@ -86,7 +87,7 @@ def test_migration_renames_and_extends():
     with session_scope() as s:
         t = s.exec(select(Template).where(Template.name == "Legacy Recipe")).first()
         assert t is not None and t.description == "pre-rework row"
-        assert t.golden_image_id is None
+        assert t.base_image_id is None
         d = s.exec(select(Deployment).where(Deployment.name == "legacy-vm")).first()
         assert d is not None and d.template_id == 1
         assert d.deploy_inputs_json == "{}"
@@ -113,15 +114,16 @@ def _mk_user(email, role="user"):
         return u.id
 
 
-def _mk_conn_golden_net():
-    """connection + ready golden image + network on it; returns (conn_id, img_id, net_id)."""
+def _mk_conn_base_net():
+    """connection + base image + network on the connection; returns (conn_id, img_id, net_id)."""
     from app.models import Connection, Image, Network
     with session_scope() as s:
         c = Connection(name="px-test-" + os.urandom(3).hex(), host="127.0.0.1",
                        token_id="t@pve!x", node="pve")
         s.add(c); s.flush()
-        img = Image(kind="golden", name="g-ubuntu", os_family="ubuntu",
-                    connection_id=c.id, template_vmid=9001, build_status="ready")
+        img = Image(kind="base", name="g-ubuntu", os_family="ubuntu",
+                    source_url="https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img",
+                    build_status="ready")
         s.add(img); s.flush()
         net = Network(connection_id=c.id, name="lan", mode="dhcp")
         s.add(net); s.flush()
@@ -143,30 +145,24 @@ def test_template_crud_with_refs():
     from app.models import Template, User
     from sqlmodel import select
     uid = _mk_user("tpl-crud@example.com")
-    conn_id, img_id, net_id = _mk_conn_golden_net()
+    conn_id, img_id, net_id = _mk_conn_base_net()
     with session_scope() as s:
         user = s.get(User, uid)
         api.save_template(api.TemplateBody(
             name="web", description="d", recipe=[],
-            goldenImageId=img_id, networkId=net_id), user=user, session=s)
+            baseImageId=img_id, connectionId=conn_id, networkId=net_id),
+            user=user, session=s)
     with session_scope() as s:
         t = s.exec(select(Template).where(Template.name == "web")).first()
-        assert t and t.golden_image_id == img_id and t.network_id == net_id
+        assert t and t.base_image_id == img_id and t.connection_id == conn_id and t.network_id == net_id
         assert t.description == "d"
     # bad refs are rejected
     with session_scope() as s:
         user = s.get(User, uid)
         _expect_http(400, lambda: api.save_template(api.TemplateBody(
-            name="bad", recipe=[], goldenImageId=999999), user=user, session=s))
+            name="bad", recipe=[], baseImageId=999999), user=user, session=s))
         _expect_http(400, lambda: api.save_template(api.TemplateBody(
             name="bad2", recipe=[], networkId=net_id), user=user, session=s))
-    # network on a DIFFERENT connection than the image → 400
-    _conn2, _img2, other_net = _mk_conn_golden_net()
-    with session_scope() as s:
-        user = s.get(User, uid)
-        _expect_http(400, lambda: api.save_template(api.TemplateBody(
-            name="bad3", recipe=[], goldenImageId=img_id, networkId=other_net),
-            user=user, session=s))
     print("test_template_crud_with_refs OK")
 
 
@@ -175,7 +171,7 @@ def test_template_edit_refs():
     from app.models import Template, User
     from sqlmodel import select
     uid = _mk_user("tpl-edit@example.com")
-    conn_id, img_id, net_id = _mk_conn_golden_net()
+    conn_id, img_id, net_id = _mk_conn_base_net()
     with session_scope() as s:
         user = s.get(User, uid)
         api.save_template(api.TemplateBody(name="edit-me", recipe=[]), user=user, session=s)
@@ -185,17 +181,18 @@ def test_template_edit_refs():
     with session_scope() as s:
         user = s.get(User, uid)
         api.edit_template_ep(tid, api.TemplateBody(
-            name="edit-me", recipe=[], goldenImageId=img_id, networkId=net_id,
-            os_family="debian"), user=user, session=s)
+            name="edit-me", recipe=[], baseImageId=img_id, connectionId=conn_id,
+            networkId=net_id, os_family="debian"), user=user, session=s)
     with session_scope() as s:
         t = s.get(Template, tid)
-        assert t.golden_image_id == img_id and t.network_id == net_id, (t.golden_image_id, t.network_id)
+        assert t.base_image_id == img_id and t.connection_id == conn_id and t.network_id == net_id, \
+            (t.base_image_id, t.connection_id, t.network_id)
         assert t.os_family == "debian", t.os_family
     # bad image id on edit → 400
     with session_scope() as s:
         user = s.get(User, uid)
         _expect_http(400, lambda: api.edit_template_ep(tid, api.TemplateBody(
-            name="edit-me", recipe=[], goldenImageId=999999), user=user, session=s))
+            name="edit-me", recipe=[], baseImageId=999999), user=user, session=s))
     print("test_template_edit_refs OK")
 
 
@@ -232,7 +229,7 @@ def test_ask_map_and_merge():
     print("test_ask_map_and_merge OK")
 
 
-def _mk_template(img_id, net_id=None, owner=None, public=True, ask=True):
+def _mk_template(base_id, conn_id, net_id=None, owner=None, public=True, ask=True):
     from app.models import Template
     recipe = [{"id": "s-os", "name": "OS Setup", "blocks": [
         {"ref": "b-hostname", "name": "Set Hostname",
@@ -240,10 +237,20 @@ def _mk_template(img_id, net_id=None, owner=None, public=True, ask=True):
     ]}]
     with session_scope() as s:
         t = Template(name="t-" + os.urandom(3).hex(), recipe_json=json.dumps(recipe),
-                     golden_image_id=img_id, network_id=net_id,
+                     base_image_id=base_id, connection_id=conn_id, network_id=net_id,
                      owner_id=owner, public=public)
         s.add(t); s.flush()
         return t.id
+
+
+def _mk_golden(conn_id):
+    # TEMPORARY shim — removed in templates-only Task 2 when DeployBody drops goldenImageId
+    from app.models import Image
+    with session_scope() as s:
+        img = Image(kind="golden", name="g-shim-" + os.urandom(2).hex(), os_family="ubuntu",
+                    connection_id=conn_id, template_vmid=9001, build_status="ready")
+        s.add(img); s.flush()
+        return img.id
 
 
 def test_deploy_with_inputs():
@@ -253,11 +260,12 @@ def test_deploy_with_inputs():
     from sqlmodel import select
     seed_blocks()  # b-hostname schema must exist for type checks
     uid = _mk_user("deployer@example.com")
-    conn_id, img_id, net_id = _mk_conn_golden_net()
-    tid = _mk_template(img_id, net_id)
+    conn_id, base_id, net_id = _mk_conn_base_net()
+    golden_id = _mk_golden(conn_id)
+    tid = _mk_template(base_id, conn_id, net_id)
 
     def _deploy(**kw):
-        body = api.DeployBody(goldenImageId=img_id, **kw)
+        body = api.DeployBody(goldenImageId=golden_id, **kw)
         with session_scope() as s:
             return api.deploy(body, user=s.get(User, uid), session=s)
 
@@ -285,11 +293,11 @@ def test_deploy_with_inputs():
                  deployInputs={"0.0": {"hostname": ["not", "a", "string"]}}))
     # someone else's PRIVATE template → 404 (no id enumeration)
     other = _mk_user("other@example.com")
-    priv = _mk_template(img_id, owner=other, public=False)
+    priv = _mk_template(base_id, conn_id, owner=other, public=False)
     _expect_http(404, lambda: _deploy(templateId=priv, name="vm-g",
                  deployInputs={"0.0": {"hostname": "h"}}))
     # whitespace-only supplied answer → 400 even though a stored value exists
-    tid2 = _mk_template(img_id)
+    tid2 = _mk_template(base_id, conn_id)
     with session_scope() as s:
         from app.models import Template
         t = s.get(Template, tid2)

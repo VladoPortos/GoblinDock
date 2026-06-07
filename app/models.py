@@ -134,17 +134,18 @@ class Image(SQLModel, table=True):
 
 
 class Template(SQLModel, table=True):
-    """A named, reusable DEPLOYMENT PRESET: a golden image + runtime blocks +
-    size/network defaults. Deploying clones the golden image and applies the
-    blocks; per-block inputs can be flagged ask-on-deploy inside recipe_json
-    (block key ``ask: ["inputName"]``). Evolved from the v1 Recipe."""
+    """A named, reusable DEPLOYMENT PRESET: a base image + location + runtime blocks +
+    size/network defaults. Every deploy builds the VM fresh from the base image and
+    applies the blocks; per-block inputs can be flagged ask-on-deploy inside recipe_json
+    (block key ``ask: ["inputName"]``)."""
     __tablename__ = "templates"
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(index=True)
     description: str = ""
     os_family: str = "ubuntu"
     recipe_json: str = "[]"
-    golden_image_id: Optional[int] = None   # images.id (kind=golden) — nullable
+    base_image_id: Optional[int] = None     # images.id (kind=base) — the ISO/cloud image
+    connection_id: Optional[int] = None     # deploy target (which Proxmox)
     network_id: Optional[int] = None        # default network for one-click deploy
     default_cpu: int = 1
     default_ram: int = 2       # GB

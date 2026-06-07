@@ -275,6 +275,10 @@ def base_image_dict(img: Image) -> dict:
 def template_dict(session: Session, t: Template) -> dict:
     used = session.exec(select(Deployment).where(Deployment.template_id == t.id)).all()
     recipe = json.loads(t.recipe_json or "[]")
+    base = session.get(Image, t.base_image_id) if t.base_image_id else None
+    if base and base.kind != "base":
+        base = None
+    conn = session.get(Connection, t.connection_id) if t.connection_id else None
     return {
         "id": f"t-{t.id}",
         "templateId": t.id,
@@ -288,8 +292,12 @@ def template_dict(session: Session, t: Template) -> dict:
         "public": t.public,
         "blocks": recipe_block_chips(recipe),
         "recipe": recipe,
-        "goldenImageId": t.golden_image_id,
+        "baseImageId": t.base_image_id,
+        "connectionId": t.connection_id,
         "networkId": t.network_id,
+        "base": base.name if base else None,
+        "deployable": bool(base and conn),
+        "location": ((conn.name + (" · " + conn.node if conn.node else "")) if conn else None),
     }
 
 

@@ -1124,38 +1124,44 @@ class TemplateBody(BaseModel):
     ram: int = Field(default=2, ge=1, le=1024)        # GB
     disk: int = Field(default=20, ge=1, le=16384)     # GB
     public: bool = True
-    goldenImageId: Optional[int] = None
+    baseImageId: Optional[int] = None
+    connectionId: Optional[int] = None
     networkId: Optional[int] = None
 
 
-def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int]]:
-    """Resolve goldenImageId/networkId or 400. The network must belong to the
-    golden image's connection — quick-deploy uses both together."""
-    if body.networkId is not None and not body.goldenImageId:
-        raise HTTPException(400, "networkId requires goldenImageId")
-    gid = nid = None
-    if body.goldenImageId:
-        img = session.get(Image, body.goldenImageId)
-        if not img or img.kind != "golden":
-            raise HTTPException(400, "goldenImageId must reference a golden image")
-        gid = img.id
-        if body.networkId:
-            net = session.get(Network, body.networkId)
-            if not net or net.connection_id != img.connection_id:
-                raise HTTPException(400, "network does not belong to the image's connection")
-            nid = net.id
-    return gid, nid
+def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:
+    """Resolve baseImageId/connectionId/networkId or 400. The network must belong
+    to the template's connection — deploys use them together."""
+    bid = cid = nid = None
+    if body.baseImageId is not None:
+        img = session.get(Image, body.baseImageId)
+        if not img or img.kind != "base":
+            raise HTTPException(400, "baseImageId must reference a base image (ISO)")
+        bid = img.id
+    if body.connectionId is not None:
+        conn = session.get(Connection, body.connectionId)
+        if not conn:
+            raise HTTPException(400, "connectionId not found")
+        cid = conn.id
+    if body.networkId is not None:
+        if cid is None:
+            raise HTTPException(400, "networkId requires connectionId")
+        net = session.get(Network, body.networkId)
+        if not net or net.connection_id != cid:
+            raise HTTPException(400, "network does not belong to the template's connection")
+        nid = net.id
+    return bid, cid, nid
 
 
 @router.post("/templates")
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    gid, nid = _validate_template_refs(session, body)
+    bid, cid, nid = _validate_template_refs(session, body)
     rc = Template(name=body.name.strip() or "template", description=body.description,
                 os_family=body.os_family, recipe_json=json.dumps(body.recipe or []),
                 default_cpu=min(body.cpu, settings.max_cores),
                 default_ram=min(body.ram, settings.max_ram_mb // 1024),
                 default_disk=body.disk, public=body.public, owner_id=user.id,
-                golden_image_id=gid, network_id=nid)
+                base_image_id=bid, connection_id=cid, network_id=nid)
     session.add(rc)
     record_audit(session, user, "template.create", "template", "-", rc.name)
     session.commit()
@@ -1181,7 +1187,7 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
     rc.default_ram = min(body.ram, settings.max_ram_mb // 1024)
     rc.default_disk = body.disk
     rc.public = body.public
-    rc.golden_image_id, rc.network_id = _validate_template_refs(session, body)
+    rc.base_image_id, rc.connection_id, rc.network_id = _validate_template_refs(session, body)
     session.add(rc)
     record_audit(session, user, "template.update", "template", rc.id, rc.name)
     session.commit()
