@@ -258,9 +258,22 @@
         }))));
   }
 
+  function SizeField({ icon, label, value, set, min, max, step, unit }) {
+    const span = Math.max(1, max - min);
+    const pct = ((value - min) / span) * 100;
+    return React.createElement('div', null,
+      React.createElement('div', { className: 'row', style: { marginBottom: 10, color: 'var(--text-dim)' } },
+        React.createElement(Icon, { name: icon, size: 15 }),
+        React.createElement('span', { className: 'field-label', style: { margin: 0 } }, label),
+        React.createElement('span', { className: 'mono', style: { marginLeft: 'auto', fontSize: 14, fontWeight: 700, color: 'var(--text)' } }, value, unit ? ' ' + unit : '')),
+      React.createElement('input', { type: 'range', className: 'range', min, max, step: step || 1, value, disabled: max <= min,
+        onChange: (e) => set(Number(e.target.value)), style: { '--pct': pct + '%' } }));
+  }
+
   window.UI = {
     OSGlyph, StatusBadge, CopyField, Meter, Modal, ConfirmModal, Menu,
     Field, TextArea, SelectField, Toggle, TagInput, FormModal,
     collectAsks, initAskAnswers, asksMissing, AskInputs,
+    SizeField,
   };
 })();

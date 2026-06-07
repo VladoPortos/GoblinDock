@@ -52,7 +52,7 @@
       React.createElement('span', { onClick: (e) => e.stopPropagation() },
         React.createElement(Menu, { items: [
           { label: 'Rename / tags', icon: 'edit', onClick: () => onAct('edit', vm) },
-          { label: 'Rebuild', icon: 'rebuild', onClick: () => onAct('rebuild', vm) },
+          { label: 'Rebuild', icon: 'rebuild', onClick: () => onAct('rebuild', vm), disabled: !vm.templateId, title: 'legacy VM — redeploy from a template' },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onAct('delete', vm) },
         ]}, React.createElement('button', { className: 'icon-btn', title: 'More' }, React.createElement(Icon, { name: 'more', size: 16 }))))
@@ -168,6 +168,7 @@
     const [q, setQ] = useState('');
     const [confirm, setConfirm] = useState(null);
     const [edit, setEdit] = useState(null);
+    const [deploying, setDeploying] = React.useState(false);
     const [sel, setSel] = useState(() => new Set());
     const [bulkBusy, setBulkBusy] = useState(false);
     const [bulkDel, setBulkDel] = useState(false);
@@ -260,7 +261,7 @@
           )
         ),
         React.createElement('div', { className: 'spacer' }),
-        React.createElement('button', { className: 'btn primary', onClick: () => go('deploy') },
+        React.createElement('button', { className: 'btn primary', onClick: () => setDeploying(true) },
           React.createElement(Icon, { name: 'plus', size: 16 }), 'Deploy VM')
       ),
 
@@ -318,7 +319,7 @@
             React.createElement('div', { className: 'glyph' }, React.createElement(Icon, { name: 'server', size: 30 })),
             React.createElement('h3', null, (q || tag !== 'all' || status !== 'all') ? 'No VMs match' : 'No VMs yet'),
             React.createElement('p', null, (q || tag !== 'all' || status !== 'all') ? 'Try clearing the filters above.' : 'Deploy your first one — GoblinDock names and tracks it for you.'),
-            React.createElement('button', { className: 'btn primary', onClick: () => go('deploy') },
+            React.createElement('button', { className: 'btn primary', onClick: () => setDeploying(true) },
               React.createElement(Icon, { name: 'plus', size: 16 }), 'Deploy your first VM')))
         : view === 'table'
           ? React.createElement(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll })
@@ -357,7 +358,9 @@
 
       savingView && React.createElement(SaveViewModal, { views, onClose: () => setSavingView(false), onSave: onSaveView, onDelete: onDeleteView }),
 
-      edit && React.createElement(VmEditModal, { vm: edit, onClose: () => setEdit(null), onDone: () => { setEdit(null); window.GDStore.toast('VM updated', 'ok'); window.GDStore.refresh().catch(() => {}); } })
+      edit && React.createElement(VmEditModal, { vm: edit, onClose: () => setEdit(null), onDone: () => { setEdit(null); window.GDStore.toast('VM updated', 'ok'); window.GDStore.refresh().catch(() => {}); } }),
+
+      deploying && React.createElement(window.DeployModal, { go, onClose: () => setDeploying(false) })
     );
   }
 
