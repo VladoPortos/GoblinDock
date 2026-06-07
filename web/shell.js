@@ -75,8 +75,6 @@
         React.createElement('span', { className: 'mono' }, t[1])
       ),
       React.createElement('div', { className: 'topbar-right' },
-        React.createElement('button', { className: 'btn primary sm', onClick: () => go('deploy') },
-          React.createElement(Icon, { name: 'plus', size: 15 }), 'Deploy VM'),
         (function () {
           const jobs = GD.JOBS || [];
           const total = jobs.length;
