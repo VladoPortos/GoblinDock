@@ -98,6 +98,8 @@ window.API = (function () {
     addBaseImage: (p) => req('POST', '/api/images/base', p),
     editImage: (id, p) => req('PUT', `/api/images/${id}`, p),
     deleteImage: (id) => req('DELETE', `/api/images/${id}`),
+    cachedImages: (connId) => req('GET', `/api/images/cached?connectionId=${connId}`),
+    syncImage: (id, p) => req('POST', `/api/images/${id}/sync`, p),
 
     // templates (deployment presets: base image + blocks + defaults)
     saveTemplate: (p) => req('POST', '/api/templates', p),
