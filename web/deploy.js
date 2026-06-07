@@ -3,7 +3,7 @@
   const { useState, useEffect } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { OSGlyph } = window.UI;
+  const { OSGlyph, AskInputs, collectAsks, initAskAnswers, asksMissing } = window.UI;
   const h = React.createElement;
 
   function SectionLabel({ n, title, hint }) {
@@ -49,6 +49,7 @@
     const maxDisk = _conn.maxDiskGb || 500;
 
     const [templateId, setTemplateId] = useState(null);
+    const [answers, setAnswers] = useState({});
     const [cpu, setCpu] = useState(maxCpu);
     const [mem, setMem] = useState(maxMem);
     const [disk, setDisk] = useState(Math.min(20, maxDisk));
@@ -62,11 +63,19 @@
     const [busy, setBusy] = useState(false);
     const busyRef = React.useRef(false);
 
-    const tpl = templates.find(r => r.templateId === templateId);
+    const tpl = templates.find((t) => t.templateId === templateId);
+    const asks = tpl ? collectAsks(tpl) : [];
     const pickTemplate = (id) => {
       setTemplateId(id);
-      const t = templates.find(x => x.templateId === id);
-      if (t) { setCpu(Math.min(t.cpu, maxCpu)); setMem(Math.min(t.mem, maxMem)); setDisk(Math.min(t.disk, maxDisk)); }
+      const t = templates.find((x) => x.templateId === id);
+      if (!t) { setAnswers({}); return; }
+      // template pre-selects its golden image (still changeable below)
+      const g = t.goldenImageId ? goldens.find((x) => x.imgId === t.goldenImageId) : null;
+      if (g) setGold(g);
+      const connId = (g || gold).connId;
+      setCpu(Math.min(t.cpu, maxCpu)); setMem(Math.min(t.mem, maxMem)); setDisk(Math.min(t.disk, maxDisk));
+      if (t.networkId && (GD.NETWORKS || []).some((n) => n.netId === t.networkId && n.connId === connId)) setNetId(t.networkId);
+      setAnswers(initAskAnswers(collectAsks(t)));
     };
 
     // network from the golden image's connection (the template lives there)
@@ -77,15 +86,19 @@
     useEffect(() => { setCpu(c => Math.min(c, maxCpu)); setMem(m => Math.min(m, maxMem)); setDisk(d => Math.min(d, maxDisk)); }, [gold && gold.connId]);
     const netObj = nets.find(n => n.netId === netId) || nets[0] || {};
 
+    const missing = asksMissing(asks, answers);
+
     const doDeploy = async () => {
       // ref latch: a fast double-click fires two onClicks before the disabled-button
       // re-render commits; without this both would POST and create two VMs.
       if (busyRef.current) return;
+      if (missing.length) { window.GDStore.toast('Required: ' + missing.join(', '), 'warn'); return; }
       busyRef.current = true;
       setBusy(true);
       try {
         const r = await window.API.deploy({
           goldenImageId: gold.imgId, templateId: templateId || null,
+          deployInputs: answers,
           networkId: netObj.netId || null, name: name.trim(), cpu, ram: mem, disk,
           tags,
         });
@@ -119,11 +132,14 @@
 
           // 2. template (optional)
           h('div', { className: 'card card-pad' },
-            h(SectionLabel, { n: '2', title: 'Template', hint: 'optional preset' }),
+            h(SectionLabel, { n: '2', title: 'Template', hint: 'optional — pre-fills blocks, size and inputs' }),
             h('select', { className: 'select', value: templateId || '', onChange: (e) => pickTemplate(e.target.value ? Number(e.target.value) : null) },
               h('option', { value: '' }, 'None — plain VM from the golden image'),
-              templates.map(t => h('option', { key: t.id, value: t.templateId }, t.name + ' (' + (t.blocks || []).length + ' blocks)'))),
-            tpl && h('div', { className: 'hint', style: { marginTop: 8, fontSize: 12 } }, tpl.desc || 'Applied on top of the deployed VM.')),
+              templates.map((t) => h('option', { key: t.id, value: t.templateId }, t.name + ' (' + (t.blocks || []).length + ' blocks)'))),
+            tpl && h('div', { className: 'hint', style: { marginTop: 8, fontSize: 12 } }, tpl.desc || 'Applied on top of the deployed VM.'),
+            asks.length > 0 && h('div', { style: { marginTop: 14 } },
+              h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Required inputs'),
+              h(AskInputs, { asks, answers, setAnswers }))),
 
           // 3. where + size
           h('div', { className: 'card card-pad' },
@@ -171,7 +187,7 @@
             h(Row, { k: 'Network', v: netObj.name || 'DHCP' }),
             h(Row, { k: 'Resources', v: cpu + ' vCPU · ' + mem + ' GB · ' + disk + ' GB' }),
             h('div', { className: 'divider' }),
-            h('button', { className: 'btn primary', style: { width: '100%', height: 42, fontSize: 13.5 }, onClick: doDeploy, disabled: busy },
+            h('button', { className: 'btn primary', style: { width: '100%', height: 42, fontSize: 13.5 }, onClick: doDeploy, disabled: busy || missing.length > 0 },
               h(Icon, { name: 'play', size: 16 }), busy ? 'Starting…' : ('Deploy ' + (name || 'VM'))),
             h('p', { className: 'hint', style: { fontSize: 11, textAlign: 'center' } }, 'Takes you straight to live progress.')))));
   }
