@@ -1118,7 +1118,7 @@ def delete_template_ep(rid: int, user: User = Depends(current_user), session: Se
 
 class CompileBody(BaseModel):
     recipe: list = []
-    name: str = "recipe"
+    name: str = "template"
 
 
 @router.post("/templates/compile")
