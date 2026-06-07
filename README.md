@@ -36,15 +36,18 @@ GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
 - **🧱 Templates from blocks** — assemble a base cloud image + a stack of customization
   blocks into a reusable **template** (e.g. *AI Dev Box*, *MySQL node*). Cloud-init blocks
   run at the VM's first boot; ansible blocks run post-boot — all compiled from the canvas.
-- **🚀 One-click deploy** — pick a template, size, and target, and GoblinDock provisions,
-  configures, and tracks the VM — reporting its IP back via the guest agent.
+- **🚀 One-click deploy** — pick a template, name the VM, answer any inputs the template
+  asks for at deploy time (a fresh hostname, a password…), optionally tweak the size — and
+  GoblinDock provisions, configures, and tracks the VM, reporting its IP back via the
+  guest agent. The target node, network and defaults all come from the template.
 - **🖥️ Per-VM detail page** — live CPU / RAM / disk usage, full config, guest-agent OS
   & network info, the deployment log, and a built-in **console** (graphical VGA *and*
   serial — the same noVNC console Proxmox uses).
 - **🛠️ Lifecycle** — start / stop / restart / **rebuild** / **destroy**, all from the
   dashboard or detail page.
 - **📺 Live jobs** — every long action is a job with a step checklist, progress bar, and
-  a streaming log over SSE.
+  a streaming log over SSE — including live download progress while a node pulls a cloud
+  image, and queued jobs say which running job they're waiting for.
 - **👥 Multi-user** — first-run admin setup, Admin / User roles, per-user VM isolation,
   per-target resource limits, and an audit log.
 
@@ -75,7 +78,7 @@ open http://localhost:8080
 
 > The image is published at **`ghcr.io/vladoportos/goblindock`** — multi-arch
 > (amd64 · arm64). Tags: `latest` (newest release), `main` (rolling, from the default
-> branch), and semver (`1.0.0`, `1.0`). The compose files pull `:latest` by default.
+> branch), and semver (`2.0.0`, `2.0`). The compose files pull `:latest` by default.
 
 The first load shows **"Create the first admin account"**. With the dev override the
 Proxmox connection is auto-seeded from `PROXMOX_*` (`GOBLINDOCK_SEED_PROXMOX=true`); in
@@ -90,8 +93,8 @@ throttle see the real client address.
 | Thing | What it is |
 |------|------------|
 | **Connection (target)** | A Proxmox node/cluster + token. Each target sets its own **per-VM ceilings** (max vCPU / RAM / disk). |
-| **ISO / base image** | A public cloud image (e.g. Ubuntu 24.04) — the raw material every deploy builds from. |
-| **Template** | A named deployment preset: a base cloud image + location + blocks + default resources (e.g. *AI Dev Box*, *MySQL node*). Deploy in one click. |
+| **ISO / base image** | A public cloud image (e.g. Ubuntu 24.04) — the raw material every deploy builds from. The ISOs page shows whether it's already cached on a node and can **pre-sync** it there ahead of the first deploy. |
+| **Template** | A named deployment preset: a base cloud image + location + blocks + default resources (e.g. *AI Dev Box*, *MySQL node*). Block inputs can be flagged **ask on deployment** — every deploy then prompts for fresh values (hostname, password…). Deploy in one click. |
 | **Block** | One customization step (install a package, write a file, run a script, install Claude Code…). 29 built-ins + your own. |
 | **Secret / Variable** | Reusable values referenced as `{{ secrets.NAME }}` (encrypted) or `{{ variable.NAME }}` (plaintext, visible). |
 
@@ -165,8 +168,10 @@ You can see the exact generated playbook any time with **View YAML** in the buil
 
 Every deploy builds the VM **fresh from the base cloud image** — cloud-init blocks run
 at first boot (timezone, users, boot scripts), ansible blocks run post-boot (packages,
-Docker, Claude Code, etc.). No pre-baked template image is needed. A deploy typically
-takes a few minutes; you can watch every step live on the job page.
+Docker, Claude Code, etc.). No pre-baked template image is needed. The first deploy from
+a given base image downloads it onto the node (cached per node afterwards — or pre-sync
+it from the ISOs page); a deploy typically takes a few minutes, and the job page streams
+every step live, download progress included.
 
 ### Engines & plumbing
 
@@ -178,7 +183,8 @@ takes a few minutes; you can watch every step live on the job page.
   line *or* an Ansible `shell:` command is shell-quoted (and YAML-quoted where it lands in
   a playbook scalar), so a password or value containing shell metacharacters can't break
   the run or inject. Only the explicit *Run Script* / launcher-command fields are
-  intentionally arbitrary shell — on your own VM.
+  intentionally arbitrary shell — on your own VM. Password-typed inputs are masked in the
+  builder (with a confirm box) and replaced with `********` in the YAML preview.
 - `{{ secrets.NAME }}` / `{{ variable.NAME }}` are resolved at run time (secrets stay
   server-side and are masked in previews/logs).
 
