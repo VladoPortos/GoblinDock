@@ -1,0 +1,15 @@
+# Categories for GitHub's auto-generated release notes (used by `gh release --generate-notes`).
+changelog:
+  categories:
+    - title: 🚀 Features
+      labels: ["enhancement", "feature"]
+    - title: 🐛 Fixes
+      labels: ["bug", "fix"]
+    - title: 🔒 Security
+      labels: ["security"]
+    - title: 📝 Documentation
+      labels: ["documentation", "docs"]
+    - title: 🧹 Maintenance
+      labels: ["chore", "dependencies", "refactor"]
+    - title: Other Changes
+      labels: ["*"]

@@ -1,0 +1,32 @@
+version: 2
+updates:
+  # Python deps. requirements.txt is the hash-locked lock generated from
+  # requirements.in (uv pip compile … --generate-hashes); see CONTRIBUTING.md.
+  - package-ecosystem: pip
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    groups:
+      python:
+        patterns: ["*"]
+
+  # Base image in the Dockerfile (pinned by digest).
+  - package-ecosystem: docker
+    directory: "/"
+    schedule:
+      interval: weekly
+    ignore:
+      # Stay on the stable Python 3.12 line; still take digest/patch refreshes of
+      # 3.12-slim, but don't propose jumping to 3.13/3.14.
+      - dependency-name: "python"
+        update-types: ["version-update:semver-major", "version-update:semver-minor"]
+
+  # GitHub Actions used by the workflows below.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    groups:
+      actions:
+        patterns: ["*"]

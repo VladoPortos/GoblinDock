@@ -1,0 +1,7 @@
+name: GoblinDock CodeQL config
+
+# The frontend is a vendored, no-build-step React prototype — don't analyze the
+# third-party bundles or fonts, only GoblinDock's own code.
+paths-ignore:
+  - web/vendor
+  - web/fonts

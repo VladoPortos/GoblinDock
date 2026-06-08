@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Website
+    url: https://goblindock.com
+    about: Project website and documentation.
+  - name: Security vulnerability
+    url: https://github.com/VladoPortos/GoblinDock/security/advisories/new
+    about: Report a security issue privately (please do NOT open a public issue).

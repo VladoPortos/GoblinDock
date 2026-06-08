@@ -1,0 +1,32 @@
+# Dev override — layer ON TOP of docker-compose.yml for a local box:
+#   docker compose -f docker-compose.yml -f docker-compose.dev.yml up -d
+# (this inherits the base image ghcr.io/vladoportos/goblindock:latest; add `--build`
+#  to build from this source tree instead of pulling).
+#
+# Re-enables the conveniences that are intentionally OFF in the production default:
+#   • GOBLINDOCK_DEV=1   → allows an ephemeral key + non-Secure cookies (http://localhost)
+#   • auto-seed the test Proxmox connection from .secrets/proxmox-test.env
+#   • publish on all interfaces for LAN access
+# NEVER use this override on an internet-facing host.
+services:
+  goblindock:
+    # !override REPLACES the base ports (which bind loopback only) instead of appending,
+    # so we don't end up with two conflicting bindings on host port 8080.
+    ports: !override
+      - "8080:8080"
+    environment:
+      GOBLINDOCK_DEV: "1"
+      # Auto-seed the test Proxmox connection from the env_file below.
+      GOBLINDOCK_SEED_PROXMOX: "true"
+      PROXMOX_HOST: "${PROXMOX_HOST:-}"
+      PROXMOX_NODE: "${PROXMOX_NODE:-pve}"
+      PROXMOX_STORAGE: "${PROXMOX_STORAGE:-local-zfs}"
+      PROXMOX_ISO_STORAGE: "local"
+      PROXMOX_SNIPPET_STORAGE: "local"
+      PROXMOX_BRIDGE: "${PROXMOX_BRIDGE:-vmbr0}"
+      PROXMOX_SSH_HOST: "${PROXMOX_SSH_HOST:-}"
+      PROXMOX_SSH_USER: "${PROXMOX_SSH_USER:-root}"
+      PROXMOX_SSH_KEY: "/run/secrets/pve_key"
+    env_file:
+      # Provides PROXMOX_TOKEN_ID + PROXMOX_TOKEN (gitignored).
+      - .secrets/proxmox-test.env

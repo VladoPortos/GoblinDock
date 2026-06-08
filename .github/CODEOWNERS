@@ -1,0 +1,8 @@
+# Default owner for everything in the repo.
+*                  @VladoPortos
+
+# Security-sensitive areas — always review changes here carefully.
+/app/security.py   @VladoPortos
+/app/proxmox.py    @VladoPortos
+/app/api.py        @VladoPortos
+/.github/          @VladoPortos

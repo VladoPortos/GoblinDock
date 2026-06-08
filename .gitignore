@@ -1,0 +1,33 @@
+# secrets — NEVER commit
+.secrets/
+*.env
+!*.env.example
+*.key
+*.pem
+id_ed25519*
+id_rsa*
+
+# python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# data / runtime
+*.sqlite
+*.sqlite3
+*.db
+data/
+
+# os
+.DS_Store
+
+# tooling
+.playwright-mcp/
+*.png
+!web/assets/*.png
+!docs/**/*.png
+
+# LLM planning / spec / plan docs — local only, NEVER pushed (remote = finished code)
+docs/superpowers/
+.planning/

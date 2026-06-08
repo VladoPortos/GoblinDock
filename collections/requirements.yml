@@ -1,0 +1,15 @@
+# Ansible collections used by the pre-built blocks (controller-side, installed into
+# the image at build time, pinned for reproducibility). Modules used:
+#   ansible.posix          -> authorized_key, sysctl
+#   community.general      -> ufw
+#   community.docker       -> docker_container
+#   community.postgresql   -> postgresql_user, postgresql_db
+collections:
+  - name: ansible.posix
+    version: "==2.2.0"
+  - name: community.general
+    version: "==13.0.1"
+  - name: community.docker
+    version: "==5.2.1"
+  - name: community.postgresql
+    version: "==4.2.0"
