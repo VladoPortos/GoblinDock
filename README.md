@@ -25,7 +25,7 @@ all from a single container backed by one SQLite file.
 
 </div>
 
-![The block builder — compose a template from typed blocks](docs/screenshots/builder.png)
+![The dashboard — live VM cards with CPU/RAM sparklines, one VM stopped, all auto-refreshing](docs/screenshots/dashboard.png)
 
 ---
 
@@ -54,7 +54,7 @@ GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
 - **👥 Multi-user** — first-run admin setup, Admin / User roles, per-user VM isolation,
   per-target resource limits, and an audit log.
 
-![Block library — built-in + custom blocks, each tagged cloud-init or ansible](docs/screenshots/blocks.png)
+![The VM detail page — live metrics, guest-agent info, snapshots, and the deployment log](docs/screenshots/vm-detail.png)
 
 ---
 
@@ -81,7 +81,7 @@ open http://localhost:8080
 
 > The image is published at **`ghcr.io/vladoportos/goblindock`** — multi-arch
 > (amd64 · arm64). Tags: `latest` (newest release), `main` (rolling, from the default
-> branch), and semver (`2.0.0`, `2.0`). The compose files pull `:latest` by default.
+> branch), and semver (`2.1.2`, `2.1`). The compose files pull `:latest` by default.
 
 The first load shows **"Create the first admin account"**. With the dev override the
 Proxmox connection is auto-seeded from `PROXMOX_*` (`GOBLINDOCK_SEED_PROXMOX=true`); in
@@ -103,12 +103,21 @@ throttle see the real client address.
 
 The flow: **add a base image (or use the seeded ones) → build a template (blocks + location + size) → deploy.**
 
+![The deploy modal — pick a template, name the VM, answer its asked inputs, see live node capacity](docs/screenshots/deploy.png)
+
 ---
 
 ## How the customization actually runs
 
 This is the part people are curious about. When you stack several blocks, GoblinDock
 **doesn't run them one-by-one as separate executions** — it *compiles* them.
+
+![The block builder — palette, canvas with phase-tagged blocks, and the typed-input inspector](docs/screenshots/builder.png)
+
+There are 29 built-in blocks (plus your own forks and custom ones), each tagged with the
+phase it runs in:
+
+![Block library — built-in + custom blocks, each tagged cloud-init or ansible](docs/screenshots/blocks.png)
 
 ### Two phases
 
@@ -175,6 +184,8 @@ Docker, Claude Code, etc.). No pre-baked template image is needed. The first dep
 a given base image downloads it onto the node (cached per node afterwards — or pre-sync
 it from the ISOs page); a deploy typically takes a few minutes, and the job page streams
 every step live, download progress included.
+
+![A deploy in flight — phase bar, step checklist, and the ansible log streaming live](docs/screenshots/job.png)
 
 ### Engines & plumbing
 
