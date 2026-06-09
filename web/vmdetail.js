@@ -39,6 +39,12 @@
   };
 
   // ---------- xterm serial console ----------
+  // Shared status pill for both consoles — maps connection status to a tone + dot.
+  function ConsoleStatusBadge({ status, label }) {
+    const tone = status === 'open' ? 'running' : status === 'connecting' ? 'working' : 'error';
+    return h('span', { className: 'badge ' + tone }, h('span', { className: 'dot ' + tone }), label);
+  }
+
   function VmConsole({ depId, tall }) {
     const host = useRef(null);
     const termRef = useRef(null);
@@ -88,13 +94,11 @@
       if (termRef.current) termRef.current.focus();
     };
     const copy = () => writeClipboard(termRef.current ? termRef.current.getSelection() : '');
-    const tone = status === 'open' ? 'running' : status === 'connecting' ? 'working' : 'error';
     const label = status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…' : status === 'noterm' ? 'unavailable' : 'Disconnected';
     return h('div', null,
       h('div', { className: 'row', style: { marginBottom: 9, gap: 8 } },
         h('span', { className: 'panel-title' }, 'Serial console'),
-        h('span', { className: 'badge ' + (tone === 'running' ? 'running' : tone === 'working' ? 'working' : 'error') },
-          h('span', { className: 'dot ' + tone }), label),
+        h(ConsoleStatusBadge, { status, label }),
         h('span', { className: 'hint', style: { marginLeft: 'auto', fontSize: 11 } }, 'Press Enter if the prompt looks blank')),
       ConsoleBar([
         h('button', { key: 'c', className: 'btn ghost sm', onClick: copy, title: 'Copy selection' }, h(Icon, { name: 'copy', size: 13 }), 'Copy'),
@@ -141,14 +145,12 @@
       try { rfb.clipboardPasteFrom(text); toast('Pasted to console', 'ok'); rfb.focus && rfb.focus(); }
       catch (e) { toast('Paste failed', 'err'); }
     };
-    const tone = status === 'open' ? 'running' : status === 'connecting' ? 'working' : 'error';
     const label = status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…'
       : status === 'norfb' ? 'unavailable' : status === 'authfail' ? 'Auth failed' : 'Disconnected';
     return h('div', null,
       h('div', { className: 'row', style: { marginBottom: 9, gap: 8 } },
         h('span', { className: 'panel-title' }, 'Graphical console'),
-        h('span', { className: 'badge ' + (tone === 'running' ? 'running' : tone === 'working' ? 'working' : 'error') },
-          h('span', { className: 'dot ' + tone }), label),
+        h(ConsoleStatusBadge, { status, label }),
         h('span', { className: 'hint', style: { marginLeft: 'auto', fontSize: 11 } }, 'Click the screen, then type')),
       ConsoleBar([
         h('button', { key: 'p', className: 'btn ghost sm', onClick: paste, title: 'Paste clipboard into the console' }, h(Icon, { name: 'file', size: 13 }), 'Paste'),

@@ -81,14 +81,12 @@
     const [treatment, setTreatment] = useState('checklist');
     const [wrap, setWrap] = useState(true);
     const [showLog, setShowLog] = useState(true);
-    const esRef = useRef(null);
 
     useEffect(() => {
       if (!jobId) return undefined;
       let closed = false;
       window.API.job(jobId).then(d => { if (!closed) setJob(d); }).catch(() => {});
       const es = new EventSource(`/api/jobs/${jobId}/stream`);
-      esRef.current = es;
       es.onmessage = (e) => {
         try {
           const d = JSON.parse(e.data);

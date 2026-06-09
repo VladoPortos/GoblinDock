@@ -78,7 +78,6 @@ def test_deploy_bumps_statebus():
     from app.seed import seed_blocks
     # minimal connection + base image + template (mirrors wave10 helpers)
     from app.models import Connection, Image, Network, Template
-    import json as _json
     seed_blocks()
     with session_scope() as s:
         u = User(email="w11-deploy@example.com", name="U",

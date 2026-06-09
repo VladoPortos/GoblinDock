@@ -1,6 +1,6 @@
 /* GoblinDock — Image Builder / Templates block canvas (working inputs). */
 (function () {
-  const { useState, useEffect } = React;
+  const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
   const { Modal, OSGlyph, Field, TextArea, SelectField, Toggle, TagInput, FormModal } = window.UI;
@@ -446,7 +446,7 @@
           h('button', { className: 'btn sm', onClick: openYaml }, h(Icon, { name: 'code', size: 15 }), 'View YAML'),
           h('button', { className: 'btn primary sm', onClick: doSave, disabled: busy }, h(Icon, { name: 'check', size: 15 }), busy ? 'Working…' : (loadedTpl ? 'Save changes' : 'Save template')))),
       h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
-        h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({ new: true }) }),
+        h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({}) }),
         h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),
         h(Inspector, { sections, sel, meta, setInput, setAsk })),
       yaml && h(Modal, { onClose: () => setYaml(false), width: 'min(680px, 94vw)' },

@@ -362,12 +362,9 @@ def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
     return filename
 
 
-def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5) -> None:
-    # phase_base/phase_total let a rebuild present this as a continuation (e.g. phases
-    # 2..6 of 6) instead of resetting the progress bar to "Phase 1 of 5".
-    def _ph(n: int) -> int:
-        return phase_base + n
-    cfg = json.loads(job.context_json or "{}")
+def _load_job_targets(job: Job) -> tuple[Connection, Deployment]:
+    """Load the job's Connection + Deployment and detach them into fresh in-memory
+    copies that outlive the session scope. Raises if either row is missing."""
     with session_scope() as s:
         conn = s.get(Connection, job.connection_id)
         dep = s.get(Deployment, job.deployment_id)
@@ -375,6 +372,16 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         dep = Deployment(**dep.model_dump()) if dep else None
     if not conn or not dep:
         raise RuntimeError("missing connection or deployment")
+    return conn, dep
+
+
+def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5) -> None:
+    # phase_base/phase_total let a rebuild present this as a continuation (e.g. phases
+    # 2..6 of 6) instead of resetting the progress bar to "Phase 1 of 5".
+    def _ph(n: int) -> int:
+        return phase_base + n
+    cfg = json.loads(job.context_json or "{}")
+    conn, dep = _load_job_targets(job)
 
     px = Proxmox(conn)
     # Build on the deployment's node — set at deploy-creation from the template's connection.
@@ -562,13 +569,7 @@ def _wait_for_ip(ctx: JobCtx, px: Proxmox, vmid: int, node: str, timeout: int = 
 
 
 def _run_rebuild(ctx: JobCtx, job: Job) -> None:
-    with session_scope() as s:
-        conn = s.get(Connection, job.connection_id)
-        dep = s.get(Deployment, job.deployment_id)
-        conn = Connection(**conn.model_dump()) if conn else None
-        dep = Deployment(**dep.model_dump()) if dep else None
-    if not conn or not dep:
-        raise RuntimeError("missing connection or deployment")
+    conn, dep = _load_job_targets(job)
     # rebuild destroys the existing VM first — honour a cancel that landed after claim
     if ctx.cancelled():
         raise RuntimeError("canceled before rebuild")
@@ -600,13 +601,7 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
 
 
 def _run_destroy(ctx: JobCtx, job: Job) -> None:
-    with session_scope() as s:
-        conn = s.get(Connection, job.connection_id)
-        dep = s.get(Deployment, job.deployment_id)
-        conn = Connection(**conn.model_dump()) if conn else None
-        dep = Deployment(**dep.model_dump()) if dep else None
-    if not conn or not dep:
-        raise RuntimeError("missing connection or deployment")
+    conn, dep = _load_job_targets(job)
     # Honour a cancel requested before the first (irreversible) destroy op — the claim
     # filter catches still-queued cancels; this catches one that landed just after claim.
     if ctx.cancelled():

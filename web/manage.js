@@ -10,7 +10,7 @@
   const toast = (m, t) => window.GDStore.toast(m, t);
 
   /* ============ BLOCKS LIBRARY ============ */
-  function BlocksLib({ go }) {
+  function BlocksLib() {
     const [q, setQ] = useState('');
     const [editor, setEditor] = useState(null);     // {initial?}
     const [confirm, setConfirm] = useState(null);

@@ -1,6 +1,5 @@
 /* GoblinDock — app shell: sidebar, topbar, activity drawer */
 (function () {
-  const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
   const { Menu } = window.UI;
@@ -22,7 +21,7 @@
     ]},
   ];
 
-  function Sidebar({ route, go, collapsed, setCollapsed, runningJobs }) {
+  function Sidebar({ route, go, collapsed, setCollapsed }) {
     return React.createElement('aside', { className: 'sidebar' + (collapsed ? ' collapsed' : '') },
       React.createElement('div', { className: 'brand' },
         React.createElement('img', { src: 'assets/goblindock-logo.png', alt: 'GoblinDock',
@@ -66,7 +65,7 @@
     settings: ['Manage', 'Settings'], profile: ['Account', 'Profile'],
   };
 
-  function TopBar({ route, go, theme, setTheme, openDrawer, runningJobs }) {
+  function TopBar({ route, go, theme, setTheme, openDrawer }) {
     const t = TITLES[route] || ['', route];
     return React.createElement('header', { className: 'topbar' },
       React.createElement('div', { className: 'crumb' },

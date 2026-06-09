@@ -83,8 +83,6 @@
     }
 
     const { Sidebar, TopBar, ActivityDrawer } = window.Shell;
-    const GD = window.GD;
-    const runningJobs = (GD.JOBS || []).filter((j) => j.status === 'working').length;
 
     const SCREENS = {
       dashboard: () => h(window.Dashboard, { go }),
@@ -104,9 +102,9 @@
     const fullBleed = route === 'newtemplate';
 
     return h('div', { className: 'app' },
-      h(Sidebar, { route, go, collapsed, setCollapsed, runningJobs }),
+      h(Sidebar, { route, go, collapsed, setCollapsed }),
       h('div', { className: 'main' },
-        h(TopBar, { route, go, theme, setTheme, openDrawer: () => setDrawer(true), runningJobs }),
+        h(TopBar, { route, go, theme, setTheme, openDrawer: () => setDrawer(true) }),
         // key by navKey: poll re-renders keep state; navigation remounts the screen.
         h('div', { className: 'content', key: navKey, style: fullBleed ? { overflow: 'hidden' } : null }, Screen())),
       drawer && h(ActivityDrawer, { onClose: () => setDrawer(false), go }),

@@ -14,7 +14,7 @@
     { v: 90, label: '90 days' },
   ];
 
-  function History({ go }) {
+  function History() {
     const isAdmin = window.GD.me && window.GD.me.isAdmin;
     const [rows, setRows] = useState(null);
     const [open, setOpen] = useState(null);   // jobId whose log is expanded

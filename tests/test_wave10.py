@@ -461,7 +461,6 @@ def test_seed_blocks_resync():
 
 
 def test_password_input_type():
-    import yaml as _yaml
     from app import api
     from app.models import Block, User
     from app.recipes import compile_playbook, load_recipe

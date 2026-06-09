@@ -1664,7 +1664,6 @@ async def stream_job(job_id: int, request: Request, user: User = Depends(current
         last_event_id = 0
         last_sig = None
         first = True
-        idle = 0
         while True:
             if await request.is_disconnected():
                 break
@@ -1700,9 +1699,6 @@ async def stream_job(job_id: int, request: Request, user: User = Depends(current
                     payload = {k: v for k, v in detail.items() if k != "log"}
                     payload["newLogs"] = [{"cls": e.log_class, "text": e.line} for e in new_logs]
                 yield f"data: {json.dumps(payload)}\n\n"
-                idle = 0
-            else:
-                idle += 1
             if detail["rawStatus"] in ("succeeded", "failed", "canceled"):
                 yield "event: done\ndata: {}\n\n"
                 break
