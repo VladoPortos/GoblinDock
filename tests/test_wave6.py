@@ -3,6 +3,7 @@
 Run: GOBLINDOCK_SECRET_KEY=<64hex> .venv/bin/python tests/test_wave6.py
 (or just GOBLINDOCK_DEV=1 .venv/bin/python tests/test_wave6.py)
 """
+import json
 import os
 import sqlite3
 import sys
@@ -171,6 +172,56 @@ def test_create_block_accepts_good():
         made = s.exec(select(Block).where(Block.key == out["key"])).first()
         assert made and made.kind == "custom", "block not persisted"
     print("test_create_block_accepts_good OK")
+
+
+def test_lint_accepts_tags_and_toggle_types():
+    # "tags" is a real type used by builtin blocks (b-apt.packages, b-user.groups)
+    schema = [{"name": "packages", "type": "tags", "default": ["git"]}]
+    assert lint_block("ansible", schema, GOOD_ANSIBLE, "") == [], "tags type rejected"
+    # synonyms the linter deliberately tolerates
+    schema = [{"name": "on", "type": "toggle"}, {"name": "flag", "type": "boolean"}]
+    assert lint_block("ansible", schema, GOOD_ANSIBLE, "") == [], "toggle/boolean rejected"
+    print("test_lint_accepts_tags_and_toggle_types OK")
+
+
+def test_fork_builtin_with_tags_field_saves():
+    # Regression: forking b-apt (tags-typed input) then saving the copy unchanged
+    # used to 400 because the linter didn't know the "tags" type.
+    seed.seed_blocks()
+    admin = _admin()
+    with session_scope() as s:
+        key = api.fork_block("b-apt", user=admin, session=s)["key"]
+    with session_scope() as s:
+        b = s.exec(select(Block).where(Block.key == key)).first()
+        body = api.BlockBody(name=b.name, phase=b.phase,
+                             input_schema=json.loads(b.input_schema_json or "[]"),
+                             ansible_template=b.ansible_template,
+                             cloudinit_template=b.cloudinit_template)
+        assert api.edit_block(key, body, user=admin, session=s)["ok"]
+    print("test_fork_builtin_with_tags_field_saves OK")
+
+
+def test_deploy_inputs_accept_toggle_bool():
+    from app.api import _validate_deploy_inputs
+    from app.models import Template
+    admin = _admin()
+    with session_scope() as s:
+        b = Block(key="t6toggle", kind="custom", builtin=False, name="T6 Toggle",
+                  category="c", section="s", phase="ansible",
+                  input_schema_json=json.dumps([{"name": "flag", "type": "toggle"}]),
+                  ansible_template=GOOD_ANSIBLE, owner_id=admin.id)
+        s.add(b); s.flush()
+        recipe = [{"id": "s0", "name": "S", "blocks": [
+            {"ref": "t6toggle", "name": "T", "inputs": {}, "ask": ["flag"]}]}]
+        tpl = Template(name="t6-tpl", recipe_json=json.dumps(recipe))
+        out = _validate_deploy_inputs(s, tpl, {"0.0": {"flag": True}})
+        assert json.loads(out) == {"0.0": {"flag": True}}, out
+        try:
+            _validate_deploy_inputs(s, tpl, {"0.0": {"flag": "yes"}})
+            raise AssertionError("string answer accepted for toggle input")
+        except HTTPException as e:
+            assert e.status_code == 400, e.detail
+    print("test_deploy_inputs_accept_toggle_bool OK")
 
 
 # --------------------------------------------------------------------------- #

@@ -299,7 +299,7 @@ def compile_cloudinit(
 # block on a cosmetic type label.
 _ALLOWED_INPUT_TYPES = {
     "text", "code", "number", "password", "secret",
-    "select", "list", "bool", "boolean", "toggle",
+    "select", "list", "tags", "bool", "boolean", "toggle",
 }
 _INPUT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
@@ -311,7 +311,7 @@ def _lint_sample(field: dict):
     default = field.get("default")
     if default not in (None, ""):
         return default
-    if t == "list":
+    if t in ("list", "tags"):
         return ["sample"]
     if t in ("bool", "boolean", "toggle"):
         return True
