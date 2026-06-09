@@ -2,7 +2,8 @@
 (function () {
   const { useState, useEffect, useRef } = React;
   const Icon = window.Icon;
-  const { OSGlyph, ConfirmModal, StatusBadge, copyToClipboard, readClipboard, fmtBytes } = window.UI;
+  const { OSGlyph, ConfirmModal, StatusBadge, FormModal, Field, Toggle, Menu,
+          copyToClipboard, readClipboard, fmtBytes, useFetched } = window.UI;
   const h = React.createElement;
   const toast = (m, t) => window.GDStore.toast(m, t);
 
@@ -165,6 +166,90 @@
         h('i', { style: { width: Math.min(100, Math.max(2, pct)) + '%', background: tone || 'var(--accent)' } })));
   }
 
+  // ---------- snapshots (Proxmox-native, per VM) ----------
+  function SnapModal({ depId, running, onClose, onDone }) {
+    const [name, setName] = useState('');
+    const [desc, setDesc] = useState('');
+    const [ram, setRam] = useState(false);
+    const [busy, setBusy] = useState(false);
+    const submit = async () => {
+      setBusy(true);
+      try {
+        const r = await window.API.createSnapshot(depId, { name: name.trim(), description: desc, includeRam: ram });
+        toast('Snapshot ' + r.name + ' created', 'ok');
+        onDone();
+      } catch (e) { toast(e.message || 'snapshot failed', 'err'); setBusy(false); }
+    };
+    return h(FormModal, { title: 'Take snapshot', icon: 'save', onClose, onSubmit: submit, busy, submitLabel: 'Snapshot' },
+      h(Field, { label: 'Name', value: name, onChange: setName, mono: true, placeholder: 'auto (snap-YYYYMMDD-HHMMSS)',
+        hint: 'Starts with a letter; letters, digits, - and _ only.' }),
+      h(Field, { label: 'Description', value: desc, onChange: setDesc, placeholder: 'before upgrading…' }),
+      running && h(Toggle, { label: 'Include RAM (resume exactly here after rollback)', on: ram, onChange: setRam }),
+      h('p', { className: 'hint', style: { fontSize: 11.5 } },
+        'Snapshots live on the Proxmox node next to the VM disk. Rolling back discards everything written since.'));
+  }
+
+  function Snapshots({ depId, running }) {
+    const [bump, setBump] = useState(0);
+    const [taking, setTaking] = useState(false);
+    const [confirm, setConfirm] = useState(null);   // { kind: 'rollback' | 'delete', snap }
+    const data = useFetched(() => window.API.vmSnapshots(depId), [depId, bump], { error: true });
+    const reload = () => setBump((b) => b + 1);
+
+    const run = (kind, snap) => async () => {
+      // toast + rethrow: ConfirmModal stays open for retry on failure
+      try {
+        if (kind === 'rollback') {
+          await window.API.rollbackSnapshot(depId, snap.name);
+          toast('Rolled back to ' + snap.name + (snap.vmstate ? '' : ' — VM is stopped, start it again'), 'ok');
+        } else {
+          await window.API.deleteSnapshot(depId, snap.name);
+          toast('Snapshot ' + snap.name + ' deleted', 'ok');
+        }
+        reload();
+        window.GDStore.refresh().catch(() => {});
+      } catch (e) { toast(e.message || (kind + ' failed'), 'err'); throw e; }
+    };
+
+    let body;
+    if (data === null) body = h('div', { className: 'hint', style: { fontSize: 12.5, padding: '4px 0' } }, 'Loading snapshots…');
+    else if (data.error) body = h('div', { className: 'hint', style: { fontSize: 12.5, padding: '4px 0' } }, 'Snapshots unavailable (VM not provisioned or node offline).');
+    else if (!(data.snapshots || []).length) body = h('div', { className: 'hint', style: { fontSize: 12.5, padding: '4px 0' } },
+      'No snapshots yet. Take one before risky changes — rollback is instant.');
+    else body = h('div', null, (data.snapshots || []).map((s) => h('div', {
+      key: s.name, className: 'row', style: { gap: 9, padding: '7px 0', borderBottom: '1px solid var(--border-soft)' } },
+        h(Icon, { name: 'save', size: 14, style: { color: 'var(--accent)', flexShrink: 0 } }),
+        h('div', { style: { minWidth: 0, flex: 1 } },
+          h('div', { className: 'row', style: { gap: 7 } },
+            h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 12.5 } }, s.name),
+            s.current && h('span', { className: 'badge accent', style: { fontSize: 10 } }, 'current'),
+            s.vmstate && h('span', { className: 'badge', style: { fontSize: 10 } }, 'RAM')),
+          h('div', { className: 'hint', style: { fontSize: 11 } }, s.created, s.description ? ' · ' + s.description : '')),
+        h(Menu, { items: [
+          { label: 'Roll back', icon: 'history', onClick: () => setConfirm({ kind: 'rollback', snap: s }) },
+          { sep: true },
+          { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm({ kind: 'delete', snap: s }) },
+        ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 15 }))))));
+
+    return h(React.Fragment, null,
+      Card('Snapshots', body,
+        h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTaking(true),
+          disabled: !!(data && data.error) }, h(Icon, { name: 'plus', size: 13 }), 'Take snapshot')),
+      taking && h(SnapModal, { depId, running, onClose: () => setTaking(false), onDone: () => { setTaking(false); reload(); } }),
+      confirm && h(ConfirmModal, {
+        onClose: () => setConfirm(null),
+        tone: 'danger',
+        icon: confirm.kind === 'rollback' ? 'history' : 'trash',
+        title: (confirm.kind === 'rollback' ? 'Roll back to ' : 'Delete ') + confirm.snap.name + '?',
+        body: confirm.kind === 'rollback'
+          ? 'The VM disk reverts to this snapshot — everything written since is lost.'
+            + (confirm.snap.vmstate ? ' The VM resumes from the saved RAM state.' : ' The VM ends up stopped; start it afterwards.')
+          : 'Removes the snapshot from the node. The VM itself is not affected.',
+        confirmLabel: confirm.kind === 'rollback' ? 'Roll back' : 'Delete snapshot',
+        onConfirm: run(confirm.kind, confirm.snap),
+      }));
+  }
+
   function Row({ k, v, mono, copy }) {
     return h('div', { className: 'row', style: { justifyContent: 'space-between', gap: 12, padding: '5px 0' } },
       h('span', { className: 'hint', style: { fontSize: 12.5 } }, k),
@@ -294,6 +379,7 @@
                       h('div', { className: 'copy mono', style: { fontSize: 11.5 } }, (ifc.ips || []).join(', ') || '—')))))
             : Card('Guest agent', h('div', { className: 'hint', style: { fontSize: 12.5, padding: '4px 0' } },
                 running ? 'Waiting for qemu-guest-agent… (installed by GoblinDock on first boot)' : 'Start the VM to read guest info.')),
+          h(Snapshots, { depId, running }),
           Card('Deployment log', h(DeployLog, { jobId: d.jobId }),
             d.jobId && h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => go('job', { jobId: d.jobId }) }, 'Open full log')))),
 

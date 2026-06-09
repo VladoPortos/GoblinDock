@@ -94,6 +94,12 @@ window.API = (function () {
     vmDetail: (id) => req('GET', `/api/vms/${id}/detail`),
     vncProxy: (id) => req('POST', `/api/vms/${id}/vncproxy`),
 
+    // snapshots
+    vmSnapshots: (id) => req('GET', `/api/vms/${id}/snapshots`),
+    createSnapshot: (id, p) => req('POST', `/api/vms/${id}/snapshots`, p),
+    deleteSnapshot: (id, name) => req('DELETE', `/api/vms/${id}/snapshots/${encodeURIComponent(name)}`),
+    rollbackSnapshot: (id, name) => req('POST', `/api/vms/${id}/snapshots/${encodeURIComponent(name)}/rollback`),
+
     // images
     addBaseImage: (p) => req('POST', '/api/images/base', p),
     editImage: (id, p) => req('PUT', `/api/images/${id}`, p),

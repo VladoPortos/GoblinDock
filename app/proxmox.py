@@ -48,6 +48,17 @@ def _split_token(token_id: str) -> tuple[str, str]:
     return token_id, ""
 
 
+# Proxmox snapshot names are config-ids (letter first, then letters/digits/-/_).
+# They flow into API URL paths, so enforce the shape at the client like guard_vmid.
+_SNAPNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,39}")
+
+
+def guard_snapname(name) -> str:
+    if not isinstance(name, str) or not _SNAPNAME_RE.fullmatch(name or ""):
+        raise ProxmoxError(f"invalid snapshot name {name!r}")
+    return name
+
+
 def guard_vmid(vmid) -> int:
     """HARD guard rail: GoblinDock must only ever touch VMIDs in its own window.
     Enforced at the client so no code path (even a corrupt DB row) can stop or
@@ -184,6 +195,32 @@ class Proxmox:
             .qemu(vmid)
             .delete(purge=1, **{"destroy-unreferenced-disks": 1})
         )
+
+    # ---- snapshots ------------------------------------------------------
+    def list_snapshots(self, vmid: int, node: Optional[str] = None) -> list[dict]:
+        """Raw snapshot list incl. the synthetic 'current' entry (its parent is the
+        snapshot the VM currently sits on)."""
+        guard_vmid(vmid)
+        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot.get()
+
+    def create_snapshot(self, vmid: int, name: str, description: str = "",
+                        vmstate: bool = False, node: Optional[str] = None) -> str:
+        guard_vmid(vmid)
+        guard_snapname(name)
+        params: dict[str, Any] = {"snapname": name, "vmstate": 1 if vmstate else 0}
+        if description:
+            params["description"] = description
+        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot.post(**params)
+
+    def delete_snapshot(self, vmid: int, name: str, node: Optional[str] = None) -> str:
+        guard_vmid(vmid)
+        guard_snapname(name)
+        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot(name).delete()
+
+    def rollback_snapshot(self, vmid: int, name: str, node: Optional[str] = None) -> str:
+        guard_vmid(vmid)
+        guard_snapname(name)
+        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot(name).rollback.post()
 
     # ---- vmid allocation ----------------------------------------------
     def next_free_vmid(self, lo: int, hi: int, node: Optional[str] = None) -> int:

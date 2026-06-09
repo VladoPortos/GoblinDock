@@ -45,6 +45,9 @@ GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
   serial — the same noVNC console Proxmox uses).
 - **🛠️ Lifecycle** — start / stop / restart / **rebuild** / **destroy**, all from the
   dashboard or detail page.
+- **📸 Snapshots** — take, roll back and delete Proxmox-native snapshots (optionally
+  with RAM state) right from the VM detail page — snapshot before risky changes,
+  roll back in seconds.
 - **📺 Live jobs** — every long action is a job with a step checklist, progress bar, and
   a streaming log over SSE — including live download progress while a node pulls a cloud
   image, and queued jobs say which running job they're waiting for.

@@ -10,7 +10,7 @@ import re
 import socket
 import threading
 import time
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -790,6 +790,110 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         except Exception:  # noqa: BLE001
             pass
     return out
+
+
+# --------------------------------------------------------------------------- #
+# snapshots                                                                     #
+# --------------------------------------------------------------------------- #
+_SNAPNAME_RE = re.compile(r"[A-Za-z][A-Za-z0-9_-]{0,39}")
+
+
+class SnapshotBody(BaseModel):
+    name: str = ""
+    description: str = ""
+    includeRam: bool = False
+
+
+def _snapshot_px(session: Session, dep: Deployment) -> tuple[Proxmox, str]:
+    conn = session.get(Connection, dep.connection_id)
+    if not conn or not dep.vmid:
+        raise HTTPException(400, "VM not provisioned")
+    px = Proxmox(conn)
+    return px, dep.node or conn.node or px.pick_node()
+
+
+@router.get("/vms/{dep_id}/snapshots")
+def list_vm_snapshots(dep_id: int, user: User = Depends(current_user),
+                      session: Session = Depends(get_session)):
+    dep = _owned_deployment(session, dep_id, user)
+    px, node = _snapshot_px(session, dep)
+    try:
+        raw = px.list_snapshots(dep.vmid, node)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"proxmox: {e}")
+    # Proxmox includes a synthetic 'current' entry whose parent is the snapshot the
+    # VM currently sits on — surface that as a "current" flag instead of a row.
+    on_snap = next((s.get("parent") for s in raw if s.get("name") == "current"), None)
+    snaps = [{
+        "name": s.get("name", ""),
+        "description": (s.get("description") or "").strip(),
+        "created": S._rel(datetime.fromtimestamp(s["snaptime"], tz=timezone.utc)) if s.get("snaptime") else "—",
+        "snaptime": s.get("snaptime") or 0,
+        "vmstate": bool(s.get("vmstate")),
+        "current": s.get("name") == on_snap,
+    } for s in raw if s.get("name") != "current"]
+    snaps.sort(key=lambda s: s["snaptime"], reverse=True)
+    return {"snapshots": snaps}
+
+
+@router.post("/vms/{dep_id}/snapshots")
+def create_vm_snapshot(dep_id: int, body: SnapshotBody, user: User = Depends(current_user),
+                       session: Session = Depends(get_session)):
+    dep = _owned_deployment(session, dep_id, user)
+    name = (body.name or "").strip() or "snap-" + utcnow().strftime("%Y%m%d-%H%M%S")
+    if not _SNAPNAME_RE.fullmatch(name):
+        raise HTTPException(400, "snapshot name must start with a letter and contain only "
+                                 "letters, digits, '-' or '_' (max 40 chars)")
+    px, node = _snapshot_px(session, dep)
+    try:
+        upid = px.create_snapshot(dep.vmid, name, description=(body.description or "")[:200],
+                                  vmstate=body.includeRam, node=node)
+        px.wait_task(upid, node=node, timeout=300)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"proxmox: {e}")
+    record_audit(session, user, "vm.snapshot.create", "deployment", dep.id,
+                 f"{dep.name} · {name}")
+    session.commit()
+    statebus.bump()
+    return {"ok": True, "name": name}
+
+
+@router.delete("/vms/{dep_id}/snapshots/{snapname}")
+def delete_vm_snapshot(dep_id: int, snapname: str, user: User = Depends(current_user),
+                       session: Session = Depends(get_session)):
+    dep = _owned_deployment(session, dep_id, user)
+    if not _SNAPNAME_RE.fullmatch(snapname or ""):
+        raise HTTPException(400, "invalid snapshot name")
+    px, node = _snapshot_px(session, dep)
+    try:
+        upid = px.delete_snapshot(dep.vmid, snapname, node=node)
+        px.wait_task(upid, node=node, timeout=300)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"proxmox: {e}")
+    record_audit(session, user, "vm.snapshot.delete", "deployment", dep.id,
+                 f"{dep.name} · {snapname}")
+    session.commit()
+    statebus.bump()
+    return {"ok": True}
+
+
+@router.post("/vms/{dep_id}/snapshots/{snapname}/rollback")
+def rollback_vm_snapshot(dep_id: int, snapname: str, user: User = Depends(current_user),
+                         session: Session = Depends(get_session)):
+    dep = _owned_deployment(session, dep_id, user)
+    if not _SNAPNAME_RE.fullmatch(snapname or ""):
+        raise HTTPException(400, "invalid snapshot name")
+    px, node = _snapshot_px(session, dep)
+    try:
+        upid = px.rollback_snapshot(dep.vmid, snapname, node=node)
+        px.wait_task(upid, node=node, timeout=300)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(502, f"proxmox: {e}")
+    record_audit(session, user, "vm.snapshot.rollback", "deployment", dep.id,
+                 f"{dep.name} · {snapname}")
+    session.commit()
+    statebus.bump()
+    return {"ok": True}
 
 
 def _ws_origin_ok(ws: WebSocket) -> bool:
