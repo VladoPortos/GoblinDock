@@ -14,7 +14,7 @@
     OS_COLORS, OS_LABEL,
     // identity + limits (filled on bootstrap)
     me: null,
-    limits: { maxCores: 1, maxRam: 2, vmidMin: 8000, vmidMax: 8099 },
+    limits: { maxCores: 1, maxRam: 2, maxDisk: 0, vmidMin: 8000, vmidMax: 8099 },
     // dynamic collections (filled from /api/state)
     VMS: [],
     BASE_IMAGES: [],

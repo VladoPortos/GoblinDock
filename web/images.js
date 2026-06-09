@@ -67,7 +67,11 @@
     const [modal, setModal] = useState(null);   // 'add' | {img}
     const [confirm, setConfirm] = useState(null);
     const bases = GD.BASE_IMAGES || [];
-    const del = async (img) => { await window.API.deleteImage(img.imgId); toast('Base image removed', 'ok'); refresh(); };
+    // toast + rethrow: ConfirmModal keeps itself open for retry when the handler throws
+    const del = async (img) => {
+      try { await window.API.deleteImage(img.imgId); toast('Base image removed', 'ok'); refresh(); }
+      catch (e) { toast(e.message || 'delete failed', 'err'); throw e; }
+    };
 
     const conns = GD.CONNECTIONS || [];
     const [targetId, setTargetId] = useState((conns[0] && conns[0].connId) || null);

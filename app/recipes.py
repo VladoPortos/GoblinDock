@@ -1,6 +1,5 @@
 """Compile a block recipe into (a) a readable Ansible playbook for the YAML
-viewer and (b) cloud-init runcmd shell lines used to actually bake a golden
-image / configure a deploy.
+viewer and (b) cloud-init runcmd shell lines used to configure a deploy.
 
 Templates are stored on each Block as strings with ``{key}`` placeholders that
 are filled from the placed block's inputs (plus ``{{ secrets.NAME }}`` refs which
@@ -69,7 +68,8 @@ def _schema_types(block: Block) -> dict:
     return {f["name"]: f.get("type", "text") for f in schema if isinstance(f, dict) and "name" in f}
 
 
-def render_shell(template: str, inputs: dict, types: dict, secret_lookup: Callable[[str], str]) -> str:
+def render_shell(template: str, inputs: dict, types: dict,
+                 secret_lookup: Callable[[str, str], str]) -> str:
     """Render a block's cloud-init template treating inputs as DATA: every value
     is secret-resolved then shell-quoted, EXCEPT 'code' fields (the Run Script
     body, which is intentionally arbitrary shell on the user's own VM)."""
@@ -201,7 +201,7 @@ def _merged_inputs(block: Block, placed: dict) -> dict:
 
 
 def _ansible_playbook(recipe: list[dict], blocks_by_key: dict[str, Block],
-                      name: str, secret_lookup: Optional[Callable[[str], str]] = None) -> str:
+                      name: str, secret_lookup: Optional[Callable[[str, str], str]] = None) -> str:
     """Build an Ansible playbook from the phase='ansible' blocks (post-boot)."""
     # Defense-in-depth at the SINK: even though create/patch validate names, a
     # stored/legacy/preview name could carry a newline that would inject sibling YAML
@@ -238,7 +238,7 @@ def _ansible_playbook(recipe: list[dict], blocks_by_key: dict[str, Block],
 
 
 def compile_ansible(recipe: list[dict], blocks_by_key: dict[str, Block],
-                    secret_lookup: Callable[[str], str], name: str = "goblindock") -> str:
+                    secret_lookup: Callable[[str, str], str], name: str = "goblindock") -> str:
     """Runnable Ansible playbook (secrets resolved) for ansible-phase blocks."""
     return _ansible_playbook(recipe, blocks_by_key, name, secret_lookup)
 
@@ -252,10 +252,11 @@ def has_ansible_blocks(recipe: list[dict], blocks_by_key: dict[str, Block]) -> b
     return False
 
 
-def compile_playbook(recipe: list[dict], blocks_by_key: dict[str, Block], image_name: str = "recipe") -> str:
+def compile_playbook(recipe: list[dict], blocks_by_key: dict[str, Block],
+                     template_name: str = "recipe") -> str:
     """Read-only preview: the Ansible playbook (post-boot) + a comment listing the
     cloud-init (first-boot) steps. Secrets are masked."""
-    pb = _ansible_playbook(recipe, blocks_by_key, image_name)
+    pb = _ansible_playbook(recipe, blocks_by_key, template_name)
     ci = []
     for section in recipe:
         for placed in section.get("blocks", []):
@@ -270,7 +271,7 @@ def compile_playbook(recipe: list[dict], blocks_by_key: dict[str, Block], image_
 def compile_cloudinit(
     recipe: list[dict],
     blocks_by_key: dict[str, Block],
-    secret_lookup: Callable[[str], str],
+    secret_lookup: Callable[[str, str], str],
 ) -> list[str]:
     """Shell command lines for cloud-init runcmd — only phase='cloudinit' blocks
     (run as root at first boot). Inputs/secrets are shell-quoted (injection-safe)."""

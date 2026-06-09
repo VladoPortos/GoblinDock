@@ -43,7 +43,8 @@
 
     const purgeAll = () => window.API.purgeAllJobs()
       .then((r) => { load(); window.GDStore.toast('Purged ' + (r.purged || 0) + ' job(s)', 'ok'); })
-      .catch((e) => window.GDStore.toast(e.message || 'purge failed', 'err'));
+      // toast + rethrow: ConfirmModal stays open for retry when the purge fails
+      .catch((e) => { window.GDStore.toast(e.message || 'purge failed', 'err'); throw e; });
 
     const expand = (id) => {
       if (open === id) { setOpen(null); setLog(null); return; }
@@ -84,7 +85,7 @@
       return h('div', { key: j.jobId, style: { borderBottom: '1px solid var(--border)' } }, header, body);
     };
 
-    if (rows === null) return h('div', { className: 'page' }, h('p', { className: 'hint' }, 'Loading…'));
+    if (rows === null) return h('div', { className: 'page fadein' }, h('p', { className: 'hint' }, 'Loading…'));
 
     const controls = h('div', { className: 'row', style: { gap: 10, alignItems: 'center', flexShrink: 0 } },
       isAdmin && retention !== null && h('label', { className: 'row', style: { gap: 6, alignItems: 'center' } },
@@ -106,7 +107,7 @@
           h('p', null, 'Deploy a VM or sync an image and it shows up here automatically.')))
       : h('div', { className: 'card', style: { overflow: 'hidden' } }, rows.map(renderRow));
 
-    return h('div', { className: 'page' }, head, list,
+    return h('div', { className: 'page fadein' }, head, list,
       confirming && h(ConfirmModal, {
         title: 'Purge all history?',
         body: 'Permanently delete every finished job and its logs' + (isAdmin ? ' (all users)' : ' you own') +

@@ -46,7 +46,8 @@
     const gl = GD.limits || {};
     const maxCpu = conn.maxCores || gl.maxCores || 1;
     const maxMem = conn.maxRamGb || gl.maxRam || 2;
-    const maxDisk = conn.maxDiskGb || 500;
+    // connection cap → global cap → 500 GB slider default when neither is set
+    const maxDisk = conn.maxDiskGb || gl.maxDisk || 500;
 
     const pick = (id) => {
       setTplId(id);

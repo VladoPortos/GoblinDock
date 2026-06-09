@@ -8,8 +8,7 @@ import secrets as _secrets
 from functools import lru_cache
 
 from argon2 import PasswordHasher
-from argon2.exceptions import VerifyMismatchError
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 
@@ -25,7 +24,7 @@ def hash_password(password: str) -> str:
 def verify_password(password: str, password_hash: str) -> bool:
     try:
         return _ph.verify(password_hash, password)
-    except (VerifyMismatchError, Exception):  # noqa: BLE001
+    except Exception:  # noqa: BLE001  (VerifyMismatchError, malformed hash, …)
         return False
 
 
@@ -65,8 +64,8 @@ def decrypt(token: str) -> str:
         return ""
     try:
         return _fernet().decrypt(token.encode("ascii")).decode("utf-8")
-    except (InvalidToken, Exception):  # noqa: BLE001
-        return ""  # rotated/corrupt — fail closed
+    except Exception:  # noqa: BLE001  (InvalidToken on rotated/corrupt — fail closed)
+        return ""
 
 
 def mask(value: str, keep: int = 4) -> str:

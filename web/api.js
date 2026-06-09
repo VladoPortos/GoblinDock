@@ -116,7 +116,7 @@ window.API = (function () {
     // secrets
     addSecret: (p) => req('POST', '/api/secrets', p),
     editSecret: (id, p) => req('PUT', `/api/secrets/${id}`, p),
-    delSecret: (id) => req('DELETE', `/api/secrets/${id}`),
+    deleteSecret: (id) => req('DELETE', `/api/secrets/${id}`),
     revealSecret: (id) => req('POST', `/api/secrets/${id}/reveal`),
 
     // variables (plaintext, visible)
@@ -140,7 +140,7 @@ window.API = (function () {
     addUser: (p) => req('POST', '/api/users', p),
     editUser: (id, p) => req('PUT', `/api/users/${id}`, p),
     deleteUser: (id) => req('DELETE', `/api/users/${id}`),
-    resetUserPassword: (id, value) => req('POST', `/api/users/${id}/password`, { name: '', value }),
+    resetUserPassword: (id, value) => req('POST', `/api/users/${id}/password`, { value }),
 
     // jobs + audit
     job: (id) => req('GET', `/api/jobs/${id}`),

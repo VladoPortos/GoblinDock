@@ -4,6 +4,7 @@
   const Icon = window.Icon;
   const GD = window.GD;
   const { OSGlyph, StatusBadge, CopyField, Meter, Menu, ConfirmModal, FormModal, Field } = window.UI;
+  const h = React.createElement;
 
   const VIEWS_KEY = 'gd.savedViews';
   function parseTags(s) { return (s || '').split(',').map((t) => t.trim()).filter(Boolean); }
@@ -20,54 +21,54 @@
       try { await window.API.patchVm(vm.depId, { name: name.trim(), tags, notes }); onDone(); }
       catch (e) { window.GDStore.toast(e.message, 'err'); setBusy(false); }
     };
-    return React.createElement(FormModal, { title: 'Edit ' + vm.name, icon: 'edit', onClose, onSubmit: submit, busy },
-      React.createElement(Field, { label: 'Name', value: name, onChange: setName, mono: true }),
-      React.createElement(Field, { label: 'Tags', value: tags, onChange: setTags, placeholder: 'project:atlas, env:dev' }),
-      React.createElement(Field, { label: 'Notes', value: notes, onChange: setNotes }));
+    return h(FormModal, { title: 'Edit ' + vm.name, icon: 'edit', onClose, onSubmit: submit, busy },
+      h(Field, { label: 'Name', value: name, onChange: setName, mono: true }),
+      h(Field, { label: 'Tags', value: tags, onChange: setTags, placeholder: 'project:atlas, env:dev' }),
+      h(Field, { label: 'Notes', value: notes, onChange: setNotes }));
   }
 
   // Name the current filter set as a reusable saved view; also lists/deletes existing ones.
   function SaveViewModal({ views, onClose, onSave, onDelete }) {
     const [name, setName] = useState('');
-    return React.createElement(FormModal, {
+    return h(FormModal, {
       title: 'Saved views', icon: 'filter', onClose, submitLabel: 'Save view',
       onSubmit: () => { const n = name.trim(); if (n) onSave(n); },
     },
-      React.createElement(Field, { label: 'Save current filters as', value: name, onChange: setName, placeholder: 'my running web VMs' }),
-      views.length > 0 && React.createElement('div', null,
-        React.createElement('div', { className: 'panel-title', style: { marginBottom: 6 } }, 'Existing views'),
-        React.createElement('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
-          views.map((v) => React.createElement('div', { key: v.name, className: 'row', style: { justifyContent: 'space-between', padding: '3px 0' } },
-            React.createElement('span', { className: 'mono', style: { fontSize: 12.5 } }, v.name),
-            React.createElement('button', { className: 'icon-btn', title: 'Delete view', onClick: () => onDelete(v.name) }, React.createElement(Icon, { name: 'trash', size: 14 })))))));
+      h(Field, { label: 'Save current filters as', value: name, onChange: setName, placeholder: 'my running web VMs' }),
+      views.length > 0 && h('div', null,
+        h('div', { className: 'panel-title', style: { marginBottom: 6 } }, 'Existing views'),
+        h('div', { style: { display: 'flex', flexDirection: 'column', gap: 2 } },
+          views.map((v) => h('div', { key: v.name, className: 'row', style: { justifyContent: 'space-between', padding: '3px 0' } },
+            h('span', { className: 'mono', style: { fontSize: 12.5 } }, v.name),
+            h('button', { className: 'icon-btn', title: 'Delete view', onClick: () => onDelete(v.name) }, h(Icon, { name: 'trash', size: 14 })))))));
   }
 
   function ActionCluster({ vm, onAct }) {
     const running = vm.status === 'running';
-    return React.createElement('div', { className: 'row', style: { gap: 2, justifyContent: 'flex-end' } },
+    return h('div', { className: 'row', style: { gap: 2, justifyContent: 'flex-end' } },
       running
-        ? React.createElement('button', { className: 'icon-btn', title: 'Stop', onClick: (e) => { e.stopPropagation(); onAct('stop', vm); } }, React.createElement(Icon, { name: 'stop', size: 16 }))
-        : React.createElement('button', { className: 'icon-btn', title: 'Start', onClick: (e) => { e.stopPropagation(); onAct('start', vm); } }, React.createElement(Icon, { name: 'play', size: 15 })),
-      React.createElement('button', { className: 'icon-btn', title: 'Restart', onClick: (e) => { e.stopPropagation(); onAct('restart', vm); } }, React.createElement(Icon, { name: 'restart', size: 16 })),
-      React.createElement('span', { onClick: (e) => e.stopPropagation() },
-        React.createElement(Menu, { items: [
+        ? h('button', { className: 'icon-btn', title: 'Stop', onClick: (e) => { e.stopPropagation(); onAct('stop', vm); } }, h(Icon, { name: 'stop', size: 16 }))
+        : h('button', { className: 'icon-btn', title: 'Start', onClick: (e) => { e.stopPropagation(); onAct('start', vm); } }, h(Icon, { name: 'play', size: 15 })),
+      h('button', { className: 'icon-btn', title: 'Restart', onClick: (e) => { e.stopPropagation(); onAct('restart', vm); } }, h(Icon, { name: 'restart', size: 16 })),
+      h('span', { onClick: (e) => e.stopPropagation() },
+        h(Menu, { items: [
           { label: 'Rename / tags', icon: 'edit', onClick: () => onAct('edit', vm) },
           { label: 'Rebuild', icon: 'rebuild', onClick: () => onAct('rebuild', vm), disabled: !vm.templateId, title: 'legacy VM — redeploy from a template' },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onAct('delete', vm) },
-        ]}, React.createElement('button', { className: 'icon-btn', title: 'More' }, React.createElement(Icon, { name: 'more', size: 16 }))))
+        ]}, h('button', { className: 'icon-btn', title: 'More' }, h(Icon, { name: 'more', size: 16 }))))
     );
   }
 
   function JobChip({ vm, go }) {
-    return React.createElement('button', {
+    return h('button', {
       className: 'badge working', style: { cursor: 'pointer', border: 'none' },
       onClick: (e) => { e.stopPropagation(); go('job', { jobId: vm.job.jobId }); },
-    }, React.createElement('span', { className: 'dot working' }), vm.job.label, '… ', vm.job.step, '/', vm.job.total, React.createElement(Icon, { name: 'chevronR', size: 12 }));
+    }, h('span', { className: 'dot working' }), vm.job.label, '… ', vm.job.step, '/', vm.job.total, h(Icon, { name: 'chevronR', size: 12 }));
   }
 
   function SelBox({ checked, onToggle, title }) {
-    return React.createElement('input', {
+    return h('input', {
       type: 'checkbox', checked: !!checked, title: title || 'Select',
       onClick: (e) => e.stopPropagation(),
       onChange: (e) => { e.stopPropagation(); onToggle(); },
@@ -76,43 +77,43 @@
   }
 
   function TableView({ vms, go, onAct, sel, toggleSel, allSel, toggleAll }) {
-    return React.createElement('div', { className: 'card', style: { overflow: 'hidden' } },
-      React.createElement('div', { style: { overflowX: 'auto' } },
-        React.createElement('table', { className: 'tbl' },
-          React.createElement('thead', null, React.createElement('tr', null,
-            React.createElement('th', { style: { width: 34 } }, React.createElement(SelBox, { checked: allSel, onToggle: toggleAll, title: 'Select all' })),
+    return h('div', { className: 'card', style: { overflow: 'hidden' } },
+      h('div', { style: { overflowX: 'auto' } },
+        h('table', { className: 'tbl' },
+          h('thead', null, h('tr', null,
+            h('th', { style: { width: 34 } }, h(SelBox, { checked: allSel, onToggle: toggleAll, title: 'Select all' })),
             ['', 'Name', 'IP', 'Lineage', 'Connection', 'CPU', 'RAM', 'Uptime', ''].map((hh, i) =>
-              React.createElement('th', { key: i, style: i === 0 ? { width: 36 } : null }, hh)))),
-          React.createElement('tbody', null, vms.map(vm =>
-            React.createElement('tr', { key: vm.id, style: { cursor: 'pointer' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
-              React.createElement('td', { onClick: (e) => e.stopPropagation() }, React.createElement(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
-              React.createElement('td', null, React.createElement('span', { className: 'dot ' + vm.status, title: vm.status })),
-              React.createElement('td', null,
-                React.createElement('div', { className: 'mono', style: { fontWeight: 600, fontSize: 13.5 } }, vm.name),
+              h('th', { key: i, style: i === 0 ? { width: 36 } : null }, hh)))),
+          h('tbody', null, vms.map(vm =>
+            h('tr', { key: vm.id, style: { cursor: 'pointer' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
+              h('td', { onClick: (e) => e.stopPropagation() }, h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
+              h('td', null, h('span', { className: 'dot ' + vm.status, title: vm.status })),
+              h('td', null,
+                h('div', { className: 'mono', style: { fontWeight: 600, fontSize: 13.5 } }, vm.name),
                 vm.job
-                  ? React.createElement('div', { style: { marginTop: 4 } }, React.createElement(JobChip, { vm, go }))
+                  ? h('div', { style: { marginTop: 4 } }, h(JobChip, { vm, go }))
                   : vm.err
-                    ? React.createElement('div', { className: 'hint mono', style: { color: 'var(--err)', fontSize: 11, marginTop: 2 } }, vm.err)
-                    : React.createElement('div', { className: 'hint', style: { fontSize: 11.5 } }, vm.ownerName)
+                    ? h('div', { className: 'hint mono', style: { color: 'var(--err)', fontSize: 11, marginTop: 2 } }, vm.err)
+                    : h('div', { className: 'hint', style: { fontSize: 11.5 } }, vm.ownerName)
               ),
-              React.createElement('td', null, React.createElement(CopyField, { value: vm.ip })),
-              React.createElement('td', null,
-                React.createElement('div', { className: 'row', style: { gap: 7 } },
-                  React.createElement(OSGlyph, { os: vm.os || 'generic', size: 16 }),
-                  React.createElement('div', null,
-                    React.createElement('div', { className: 'mono', style: { fontSize: 12 } }, vm.image),
-                    React.createElement('div', { className: 'hint', style: { fontSize: 10.5 } }, vm.template)))),
-              React.createElement('td', null, React.createElement('span', { className: 'chip' }, vm.conn)),
-              React.createElement('td', { style: { width: 96 } },
-                React.createElement('div', { className: 'row', style: { gap: 7 } },
-                  React.createElement('div', { style: { width: 50 } }, React.createElement(Meter, { value: vm.cpu })),
-                  React.createElement('span', { className: 'mono hint', style: { fontSize: 11, minWidth: 28 } }, vm.cpu, '%'))),
-              React.createElement('td', { style: { width: 96 } },
-                React.createElement('div', { className: 'row', style: { gap: 7 } },
-                  React.createElement('div', { style: { width: 50 } }, React.createElement(Meter, { value: vm.ram })),
-                  React.createElement('span', { className: 'mono hint', style: { fontSize: 11, minWidth: 28 } }, vm.ram, '%'))),
-              React.createElement('td', { className: 'mono hint', style: { fontSize: 12 } }, vm.uptime),
-              React.createElement('td', null, React.createElement(ActionCluster, { vm, onAct }))
+              h('td', null, h(CopyField, { value: vm.ip })),
+              h('td', null,
+                h('div', { className: 'row', style: { gap: 7 } },
+                  h(OSGlyph, { os: vm.os || 'generic', size: 16 }),
+                  h('div', null,
+                    h('div', { className: 'mono', style: { fontSize: 12 } }, vm.image),
+                    h('div', { className: 'hint', style: { fontSize: 10.5 } }, vm.template)))),
+              h('td', null, h('span', { className: 'chip' }, vm.conn)),
+              h('td', { style: { width: 96 } },
+                h('div', { className: 'row', style: { gap: 7 } },
+                  h('div', { style: { width: 50 } }, h(Meter, { value: vm.cpu })),
+                  h('span', { className: 'mono hint', style: { fontSize: 11, minWidth: 28 } }, vm.cpu, '%'))),
+              h('td', { style: { width: 96 } },
+                h('div', { className: 'row', style: { gap: 7 } },
+                  h('div', { style: { width: 50 } }, h(Meter, { value: vm.ram })),
+                  h('span', { className: 'mono hint', style: { fontSize: 11, minWidth: 28 } }, vm.ram, '%'))),
+              h('td', { className: 'mono hint', style: { fontSize: 12 } }, vm.uptime),
+              h('td', null, h(ActionCluster, { vm, onAct }))
             )))
         )
       )
@@ -120,56 +121,56 @@
   }
 
   function CardView({ vms, go, onAct, sel, toggleSel }) {
-    return React.createElement('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(310px, 1fr))', gap: 14 } },
-      vms.map(vm => React.createElement('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
-        React.createElement('div', { className: 'row' },
-          React.createElement(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
-          React.createElement('span', { className: 'dot ' + vm.status }),
-          React.createElement('span', { className: 'mono', style: { fontWeight: 700, fontSize: 15 } }, vm.name),
-          React.createElement('div', { style: { marginLeft: 'auto' } }, React.createElement(StatusBadge, { status: vm.status }))
+    return h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(310px, 1fr))', gap: 14 } },
+      vms.map(vm => h('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
+        h('div', { className: 'row' },
+          h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
+          h('span', { className: 'dot ' + vm.status }),
+          h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 15 } }, vm.name),
+          h('div', { style: { marginLeft: 'auto' } }, h(StatusBadge, { status: vm.status }))
         ),
-        vm.job && React.createElement(JobChip, { vm, go }),
-        vm.err && React.createElement('div', { style: { fontSize: 11.5, color: 'var(--err)', background: 'var(--err-ghost)', padding: '7px 9px', borderRadius: 8 }, className: 'mono' }, vm.err),
-        React.createElement('div', { className: 'row', style: { gap: 8, color: 'var(--text-dim)' } },
-          React.createElement(Icon, { name: 'globe', size: 14 }),
-          React.createElement(CopyField, { value: vm.ip }),
-          React.createElement('span', { className: 'chip', style: { marginLeft: 'auto' } }, vm.conn)
+        vm.job && h(JobChip, { vm, go }),
+        vm.err && h('div', { style: { fontSize: 11.5, color: 'var(--err)', background: 'var(--err-ghost)', padding: '7px 9px', borderRadius: 8 }, className: 'mono' }, vm.err),
+        h('div', { className: 'row', style: { gap: 8, color: 'var(--text-dim)' } },
+          h(Icon, { name: 'globe', size: 14 }),
+          h(CopyField, { value: vm.ip }),
+          h('span', { className: 'chip', style: { marginLeft: 'auto' } }, vm.conn)
         ),
-        React.createElement('div', { className: 'row', style: { gap: 8 } },
-          React.createElement(OSGlyph, { os: vm.os || 'generic', size: 18 }),
-          React.createElement('div', { style: { minWidth: 0 } },
-            React.createElement('div', { className: 'mono', style: { fontSize: 12 } }, vm.image, ' → ', vm.template))),
-        React.createElement('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, paddingTop: 4 } },
-          React.createElement(StatBlock, { label: 'CPU', value: vm.cpu, on: vm.status === 'running' }),
-          React.createElement(StatBlock, { label: 'RAM', value: vm.ram, on: vm.status === 'running' })),
-        React.createElement('div', { className: 'divider' }),
-        React.createElement('div', { className: 'row' },
-          React.createElement('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
-          React.createElement('div', { style: { marginLeft: 'auto' } }, React.createElement(ActionCluster, { vm, onAct }))
+        h('div', { className: 'row', style: { gap: 8 } },
+          h(OSGlyph, { os: vm.os || 'generic', size: 18 }),
+          h('div', { style: { minWidth: 0 } },
+            h('div', { className: 'mono', style: { fontSize: 12 } }, vm.image, ' → ', vm.template))),
+        h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, paddingTop: 4 } },
+          h(StatBlock, { label: 'CPU', value: vm.cpu, on: vm.status === 'running' }),
+          h(StatBlock, { label: 'RAM', value: vm.ram, on: vm.status === 'running' })),
+        h('div', { className: 'divider' }),
+        h('div', { className: 'row' },
+          h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
+          h('div', { style: { marginLeft: 'auto' } }, h(ActionCluster, { vm, onAct }))
         )
       ))
     );
   }
 
   function StatBlock({ label, value, on }) {
-    return React.createElement('div', null,
-      React.createElement('div', { className: 'row', style: { justifyContent: 'space-between', marginBottom: 5 } },
-        React.createElement('span', { className: 'panel-title', style: { fontSize: 10 } }, label),
-        React.createElement('span', { className: 'mono', style: { fontSize: 11.5, color: on ? 'var(--text)' : 'var(--text-faint)' } }, on ? value + '%' : '—')),
-      React.createElement(Meter, { value: on ? value : 0 })
+    return h('div', null,
+      h('div', { className: 'row', style: { justifyContent: 'space-between', marginBottom: 5 } },
+        h('span', { className: 'panel-title', style: { fontSize: 10 } }, label),
+        h('span', { className: 'mono', style: { fontSize: 11.5, color: on ? 'var(--text)' : 'var(--text-faint)' } }, on ? value + '%' : '—')),
+      h(Meter, { value: on ? value : 0 })
     );
   }
 
   // One row of the first-run checklist: a numbered/checked bubble + title/desc + optional CTA.
   // Module-scoped (closes over nothing) so it isn't redefined on every Dashboard render.
   function Step({ done, n, title, desc, cta, onCta, disabled }) {
-    return React.createElement('div', { className: 'row', style: { gap: 12, alignItems: 'flex-start', padding: '10px 0', borderBottom: '1px solid var(--border)' } },
-      React.createElement('div', { style: { width: 24, height: 24, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: done ? 'var(--accent)' : 'var(--surface)', border: '1px solid var(--border)', color: done ? 'var(--accent-ink)' : 'var(--text)', fontSize: 12, fontWeight: 700 } },
-        done ? React.createElement(Icon, { name: 'check', size: 14 }) : n),
-      React.createElement('div', { style: { flex: 1, minWidth: 0 } },
-        React.createElement('div', { style: { fontWeight: 600, fontSize: 13 } }, title),
-        React.createElement('div', { className: 'hint', style: { fontSize: 12 } }, desc)),
-      cta && !done && React.createElement('button', { className: 'btn sm', disabled: !!disabled, onClick: onCta }, cta));
+    return h('div', { className: 'row', style: { gap: 12, alignItems: 'flex-start', padding: '10px 0', borderBottom: '1px solid var(--border)' } },
+      h('div', { style: { width: 24, height: 24, borderRadius: '50%', flexShrink: 0, display: 'grid', placeItems: 'center', background: done ? 'var(--accent)' : 'var(--surface)', border: '1px solid var(--border)', color: done ? 'var(--accent-ink)' : 'var(--text)', fontSize: 12, fontWeight: 700 } },
+        done ? h(Icon, { name: 'check', size: 14 }) : n),
+      h('div', { style: { flex: 1, minWidth: 0 } },
+        h('div', { style: { fontWeight: 600, fontSize: 13 } }, title),
+        h('div', { className: 'hint', style: { fontSize: 12 } }, desc)),
+      cta && !done && h('button', { className: 'btn sm', disabled: !!disabled, onClick: onCta }, cta));
   }
 
   function FirstRunChecklist({ go }) {
@@ -182,22 +183,22 @@
 
     // Non-admins can't add connections / sync images — just show the deploy step.
     if (!isAdmin) {
-      return React.createElement('div', { className: 'card card-pad' },
-        React.createElement('h3', { style: { marginTop: 0 } }, 'Get started'),
-        React.createElement(Step, { done: false, n: 1, title: 'Deploy your first VM',
+      return h('div', { className: 'card card-pad' },
+        h('h3', { style: { marginTop: 0 } }, 'Get started'),
+        h(Step, { done: false, n: 1, title: 'Deploy your first VM',
           desc: 'Pick a template and launch — GoblinDock names and tracks it for you.',
           cta: 'Deploy', onCta: () => go('templates') }));
     }
 
-    return React.createElement('div', { className: 'card card-pad' },
-      React.createElement('h3', { style: { marginTop: 0 } }, 'Welcome to GoblinDock — 3 steps to your first VM'),
-      React.createElement(Step, { done: hasConn, n: 1, title: 'Connect a Proxmox node',
+    return h('div', { className: 'card card-pad' },
+      h('h3', { style: { marginTop: 0 } }, 'Welcome to GoblinDock — 3 steps to your first VM'),
+      h(Step, { done: hasConn, n: 1, title: 'Connect a Proxmox node',
         desc: 'Add your Proxmox host so GoblinDock can build and run VMs.',
         cta: 'Add connection', onCta: () => go('settings') }),
-      React.createElement(Step, { done: imgDone, n: 2, title: 'Pre-sync a base image',
+      h(Step, { done: imgDone, n: 2, title: 'Pre-sync a base image',
         desc: 'Download a cloud image to the node so the first deploy is fast.',
         cta: 'Open ISOs', onCta: () => go('isos'), disabled: !hasConn }),
-      React.createElement(Step, { done: false, n: 3, title: 'Deploy your first VM',
+      h(Step, { done: false, n: 3, title: 'Deploy your first VM',
         desc: 'Create a template, then launch it.',
         cta: 'Templates', onCta: () => go('templates'), disabled: !hasConn }));
   }
@@ -280,84 +281,84 @@
       error: GD.VMS.filter(v => v.status === 'error').length,
     };
 
-    return React.createElement('div', { className: 'page fadein' },
-      React.createElement('div', { className: 'page-head' },
-        React.createElement('div', null,
-          React.createElement('h1', { className: 'page-title' }, 'Virtual Machines'),
-          React.createElement('div', { className: 'page-sub' },
-            React.createElement('span', { className: 'mono' }, counts.running), ' running · ',
-            React.createElement('span', { className: 'mono' }, counts.working), ' working · ',
-            React.createElement('span', { className: 'mono', style: counts.error ? { color: 'var(--err)' } : null }, counts.error), ' error',
-            React.createElement('span', { style: { marginLeft: 10, color: 'var(--text-faint)' } }, '· auto-refreshing'),
-            React.createElement('span', { className: 'dot running', style: { marginLeft: 6, width: 6, height: 6, display: 'inline-block', verticalAlign: 'middle' } })
+    return h('div', { className: 'page fadein' },
+      h('div', { className: 'page-head' },
+        h('div', null,
+          h('h1', { className: 'page-title' }, 'Virtual Machines'),
+          h('div', { className: 'page-sub' },
+            h('span', { className: 'mono' }, counts.running), ' running · ',
+            h('span', { className: 'mono' }, counts.working), ' working · ',
+            h('span', { className: 'mono', style: counts.error ? { color: 'var(--err)' } : null }, counts.error), ' error',
+            h('span', { style: { marginLeft: 10, color: 'var(--text-faint)' } }, '· auto-refreshing'),
+            h('span', { className: 'dot running', style: { marginLeft: 6, width: 6, height: 6, display: 'inline-block', verticalAlign: 'middle' } })
           )
         ),
-        React.createElement('div', { className: 'spacer' }),
-        React.createElement('button', { className: 'btn primary', onClick: () => setDeploying(true) },
-          React.createElement(Icon, { name: 'plus', size: 16 }), 'Deploy VM')
+        h('div', { className: 'spacer' }),
+        h('button', { className: 'btn primary', onClick: () => setDeploying(true) },
+          h(Icon, { name: 'plus', size: 16 }), 'Deploy VM')
       ),
 
-      React.createElement('div', { className: 'row wrap', style: { marginBottom: 16, gap: 10 } },
-        React.createElement('div', { className: 'seg' },
-          React.createElement('button', { className: scope === 'mine' ? 'active' : '', onClick: () => setScope('mine') }, 'My VMs'),
-          React.createElement('button', { className: scope === 'all' ? 'active' : '', onClick: () => setScope('all') }, 'All VMs')
+      h('div', { className: 'row wrap', style: { marginBottom: 16, gap: 10 } },
+        h('div', { className: 'seg' },
+          h('button', { className: scope === 'mine' ? 'active' : '', onClick: () => setScope('mine') }, 'My VMs'),
+          h('button', { className: scope === 'all' ? 'active' : '', onClick: () => setScope('all') }, 'All VMs')
         ),
-        React.createElement('select', { className: 'select', style: { width: 'auto', minWidth: 140 }, value: status, onChange: (e) => setStatus(e.target.value) },
-          React.createElement('option', { value: 'all' }, 'All statuses'),
-          React.createElement('option', { value: 'running' }, 'Running'),
-          React.createElement('option', { value: 'stopped' }, 'Stopped'),
-          React.createElement('option', { value: 'working' }, 'Working'),
-          React.createElement('option', { value: 'error' }, 'Error')
+        h('select', { className: 'select', style: { width: 'auto', minWidth: 140 }, value: status, onChange: (e) => setStatus(e.target.value) },
+          h('option', { value: 'all' }, 'All statuses'),
+          h('option', { value: 'running' }, 'Running'),
+          h('option', { value: 'stopped' }, 'Stopped'),
+          h('option', { value: 'working' }, 'Working'),
+          h('option', { value: 'error' }, 'Error')
         ),
-        allTags.length > 0 && React.createElement('select', { className: 'select', style: { width: 'auto', minWidth: 120 }, value: tag, onChange: (e) => setTag(e.target.value), title: 'Filter by tag' },
-          React.createElement('option', { value: 'all' }, 'All tags'),
-          allTags.map((t) => React.createElement('option', { key: t, value: t }, t))
+        allTags.length > 0 && h('select', { className: 'select', style: { width: 'auto', minWidth: 120 }, value: tag, onChange: (e) => setTag(e.target.value), title: 'Filter by tag' },
+          h('option', { value: 'all' }, 'All tags'),
+          allTags.map((t) => h('option', { key: t, value: t }, t))
         ),
-        React.createElement('div', { className: 'search', style: { flex: 1, maxWidth: 260 } },
-          React.createElement(Icon, { name: 'search', size: 15 }),
-          React.createElement('input', { placeholder: 'Search VMs…', value: q, onChange: (e) => setQ(e.target.value) })
+        h('div', { className: 'search', style: { flex: 1, maxWidth: 260 } },
+          h(Icon, { name: 'search', size: 15 }),
+          h('input', { placeholder: 'Search VMs…', value: q, onChange: (e) => setQ(e.target.value) })
         ),
-        React.createElement('div', { className: 'row', style: { gap: 6 } },
-          React.createElement('select', {
+        h('div', { className: 'row', style: { gap: 6 } },
+          h('select', {
             className: 'select', style: { width: 'auto', minWidth: 128 }, value: '',
             onChange: (e) => { const v = views.find(x => x.name === e.target.value); if (v) applyView(v); },
             title: 'Apply a saved view',
           },
-            React.createElement('option', { value: '' }, views.length ? 'Saved views…' : 'No saved views'),
-            views.map((v) => React.createElement('option', { key: v.name, value: v.name }, v.name))),
-          React.createElement('button', { className: 'btn sm', title: 'Save current filters as a view', onClick: () => setSavingView(true) },
-            React.createElement(Icon, { name: 'save', size: 14 }), 'Save')),
-        React.createElement('div', { className: 'seg', style: { marginLeft: 'auto' } },
-          React.createElement('button', { className: view === 'table' ? 'active' : '', onClick: () => setView('table'), title: 'Table' },
-            React.createElement(Icon, { name: 'dashboard', size: 15 }), 'Table'),
-          React.createElement('button', { className: view === 'cards' ? 'active' : '', onClick: () => setView('cards'), title: 'Cards' },
-            React.createElement(Icon, { name: 'blocks', size: 15 }), 'Cards')
+            h('option', { value: '' }, views.length ? 'Saved views…' : 'No saved views'),
+            views.map((v) => h('option', { key: v.name, value: v.name }, v.name))),
+          h('button', { className: 'btn sm', title: 'Save current filters as a view', onClick: () => setSavingView(true) },
+            h(Icon, { name: 'save', size: 14 }), 'Save')),
+        h('div', { className: 'seg', style: { marginLeft: 'auto' } },
+          h('button', { className: view === 'table' ? 'active' : '', onClick: () => setView('table'), title: 'Table' },
+            h(Icon, { name: 'dashboard', size: 15 }), 'Table'),
+          h('button', { className: view === 'cards' ? 'active' : '', onClick: () => setView('cards'), title: 'Cards' },
+            h(Icon, { name: 'blocks', size: 15 }), 'Cards')
         )
       ),
 
       // ---- bulk action bar (appears when something is selected) ----
-      sel.size > 0 && React.createElement('div', { className: 'card card-pad', style: { marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', borderColor: 'var(--accent)' } },
-        React.createElement('span', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, sel.size, ' selected'),
-        React.createElement('div', { className: 'spacer' }),
-        React.createElement('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('start') }, React.createElement(Icon, { name: 'play', size: 14 }), 'Start'),
-        React.createElement('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('stop') }, React.createElement(Icon, { name: 'stop', size: 14 }), 'Stop'),
-        React.createElement('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('restart') }, React.createElement(Icon, { name: 'restart', size: 14 }), 'Restart'),
-        React.createElement('button', { className: 'btn sm danger', disabled: bulkBusy, onClick: () => setBulkDel(true) }, React.createElement(Icon, { name: 'trash', size: 14 }), 'Delete'),
-        React.createElement('button', { className: 'btn ghost sm', disabled: bulkBusy, onClick: clearSel }, 'Clear')
+      sel.size > 0 && h('div', { className: 'card card-pad', style: { marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', borderColor: 'var(--accent)' } },
+        h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, sel.size, ' selected'),
+        h('div', { className: 'spacer' }),
+        h('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('start') }, h(Icon, { name: 'play', size: 14 }), 'Start'),
+        h('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('stop') }, h(Icon, { name: 'stop', size: 14 }), 'Stop'),
+        h('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('restart') }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
+        h('button', { className: 'btn sm danger', disabled: bulkBusy, onClick: () => setBulkDel(true) }, h(Icon, { name: 'trash', size: 14 }), 'Delete'),
+        h('button', { className: 'btn ghost sm', disabled: bulkBusy, onClick: clearSel }, 'Clear')
       ),
 
       vms.length === 0
         ? ((q || tag !== 'all' || status !== 'all')
-            ? React.createElement('div', { className: 'card' }, React.createElement('div', { className: 'empty' },
-                React.createElement('div', { className: 'glyph' }, React.createElement(Icon, { name: 'server', size: 30 })),
-                React.createElement('h3', null, 'No VMs match'),
-                React.createElement('p', null, 'Try clearing the filters above.')))
-            : React.createElement(FirstRunChecklist, { go }))
+            ? h('div', { className: 'card' }, h('div', { className: 'empty' },
+                h('div', { className: 'glyph' }, h(Icon, { name: 'server', size: 30 })),
+                h('h3', null, 'No VMs match'),
+                h('p', null, 'Try clearing the filters above.')))
+            : h(FirstRunChecklist, { go }))
         : view === 'table'
-          ? React.createElement(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll })
-          : React.createElement(CardView, { vms, go, onAct, sel, toggleSel }),
+          ? h(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll })
+          : h(CardView, { vms, go, onAct, sel, toggleSel }),
 
-      confirm && React.createElement(ConfirmModal, {
+      confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null),
         tone: confirm.action === 'delete' ? 'danger' : 'accent',
         icon: confirm.action === 'delete' ? 'trash' : 'rebuild',
@@ -367,6 +368,7 @@
           : 'Re-clones from image ' + confirm.vm.image + ', keeping the name and IP (' + confirm.vm.ip + '). Anything written on disk is lost.',
         confirmLabel: confirm.action === 'delete' ? 'Delete VM' : 'Rebuild',
         onConfirm: async () => {
+          // toast + rethrow: ConfirmModal stays open for retry when the call fails
           try {
             if (confirm.action === 'rebuild') {
               const r = await window.API.vmRebuild(confirm.vm.depId);
@@ -376,11 +378,11 @@
               window.GDStore.toast('Destroying ' + confirm.vm.name, 'warn');
               go('job', { jobId: r.jobId });
             }
-          } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
+          } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); throw e; }
         },
       }),
 
-      bulkDel && React.createElement(ConfirmModal, {
+      bulkDel && h(ConfirmModal, {
         onClose: () => setBulkDel(false), tone: 'danger', icon: 'trash',
         title: 'Destroy ' + sel.size + ' VM' + (sel.size === 1 ? '' : 's') + '?',
         body: 'This destroys ' + sel.size + ' VM' + (sel.size === 1 ? '' : 's') + ' and their disks, returning their IPs to the pool. This cannot be undone.',
@@ -388,11 +390,11 @@
         onConfirm: bulkDelete,
       }),
 
-      savingView && React.createElement(SaveViewModal, { views, onClose: () => setSavingView(false), onSave: onSaveView, onDelete: onDeleteView }),
+      savingView && h(SaveViewModal, { views, onClose: () => setSavingView(false), onSave: onSaveView, onDelete: onDeleteView }),
 
-      edit && React.createElement(VmEditModal, { vm: edit, onClose: () => setEdit(null), onDone: () => { setEdit(null); window.GDStore.toast('VM updated', 'ok'); window.GDStore.refresh().catch(() => {}); } }),
+      edit && h(VmEditModal, { vm: edit, onClose: () => setEdit(null), onDone: () => { setEdit(null); window.GDStore.toast('VM updated', 'ok'); window.GDStore.refresh().catch(() => {}); } }),
 
-      deploying && React.createElement(window.DeployModal, { go, onClose: () => setDeploying(false) })
+      deploying && h(window.DeployModal, { go, onClose: () => setDeploying(false) })
     );
   }
 

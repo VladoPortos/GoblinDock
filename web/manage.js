@@ -124,7 +124,7 @@
   function Secrets() {
     const [modal, setModal] = useState(null);   // 'add' | {secret}
     const [confirm, setConfirm] = useState(null);
-    const del = async (s) => { try { await window.API.delSecret(s.secId); toast('Secret deleted', 'ok'); refresh(); } catch (e) { toast(e.message, 'err'); } };
+    const del = async (s) => { try { await window.API.deleteSecret(s.secId); toast('Secret deleted', 'ok'); refresh(); } catch (e) { toast(e.message, 'err'); } };
     return h('div', { className: 'page fadein' },
       h('div', { className: 'page-head' },
         h('div', null,

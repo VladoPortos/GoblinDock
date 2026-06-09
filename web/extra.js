@@ -190,7 +190,11 @@
     const [confirm, setConfirm] = useState(null);
     const [deploying, setDeploying] = useState(null);
     const templates = GD.TEMPLATES || [];
-    const del = async (t) => { await window.API.deleteTemplate(t.templateId); window.GDStore.toast('Template deleted', 'ok'); window.GDStore.refresh().catch(() => {}); };
+    // toast + rethrow: ConfirmModal keeps itself open for retry when the handler throws
+    const del = async (t) => {
+      try { await window.API.deleteTemplate(t.templateId); window.GDStore.toast('Template deleted', 'ok'); window.GDStore.refresh().catch(() => {}); }
+      catch (e) { window.GDStore.toast(e.message || 'delete failed', 'err'); throw e; }
+    };
     return h('div', { className: 'page fadein' },
       h('div', { className: 'page-head' },
         h('div', null,

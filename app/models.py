@@ -175,7 +175,7 @@ class Deployment(SQLModel, table=True):
     disk: int = 20        # GB
     ip: str = ""
     mac: str = ""
-    status: str = "working"  # running | stopped | working | error | unknown
+    status: str = "working"  # running | stopped | working | error (live "unknown" serializes as stopped)
     tags: str = ""
     notes: str = ""
     error: str = ""
@@ -185,7 +185,7 @@ class Deployment(SQLModel, table=True):
 class Job(SQLModel, table=True):
     __tablename__ = "jobs"
     id: Optional[int] = Field(default=None, primary_key=True)
-    type: str = "deploy"   # deploy | rebuild | destroy
+    type: str = "deploy"   # deploy | rebuild | destroy | image_sync
     title: str = ""
     deployment_id: Optional[int] = None
     image_id: Optional[int] = None

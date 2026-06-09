@@ -1,8 +1,8 @@
 """Run a compiled Ansible playbook against a VM via ansible-runner.
 
-Used for the POST-BOOT (phase='ansible') blocks of a recipe — both when baking a
-golden image (against the temporary build VM) and when configuring a freshly
-deployed VM. First-boot (phase='cloudinit') blocks go through cloud-init instead.
+Used for the POST-BOOT (phase='ansible') blocks of a recipe when configuring a
+freshly deployed VM. First-boot (phase='cloudinit') blocks go through cloud-init
+instead.
 """
 from __future__ import annotations
 

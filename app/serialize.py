@@ -173,6 +173,7 @@ def job_brief(session: Session, job: Job) -> dict:
         "id": f"j-{job.id}",
         "jobId": job.id,
         "title": job.title,
+        "type": job.type,
         "status": _UI_STATUS.get(job.status, "working"),
         "pct": job.pct,
         "phase": job.phase or job.status.title(),

@@ -466,6 +466,7 @@ def state(request: Request, user: User = Depends(current_user), session: Session
         "me": S.me_dict(user),
         "csrf": ensure_csrf(request),
         "limits": {"maxCores": settings.max_cores, "maxRam": settings.max_ram_mb // 1024,
+                   "maxDisk": settings.max_disk_gb,  # 0 = no global cap
                    "vmidMin": settings.vmid_min, "vmidMax": settings.vmid_max},
         "VMS": vms,
         "BASE_IMAGES": base,
@@ -680,6 +681,8 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
         raise
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"proxmox: {e}")
+    record_audit(session, user, f"vm.{body.action}", "deployment", dep.id, dep.name)
+    session.commit()
     statebus.bump()
     return {"ok": True}
 
@@ -704,6 +707,7 @@ def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session
               connection_id=dep.connection_id, created_by=user.id, status="queued",
               context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id))
     session.add(job)
+    record_audit(session, user, "vm.rebuild", "deployment", dep.id, dep.name)
     session.commit()
     session.refresh(job)
     statebus.bump()
@@ -719,6 +723,7 @@ def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session
               connection_id=dep.connection_id, created_by=user.id, status="queued",
               context_json="{}")
     session.add(job)
+    record_audit(session, user, "vm.destroy", "deployment", dep.id, dep.name)
     session.commit()
     session.refresh(job)
     statebus.bump()
@@ -1058,6 +1063,7 @@ def sync_image(img_id: int, body: SyncBody, user: User = Depends(current_user),
     record_audit(session, user, "image.sync", "image", img.id, img.name)
     session.commit()
     session.refresh(job)
+    statebus.bump()
     return {"ok": True, "jobId": job.id}
 
 
@@ -1102,13 +1108,24 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
     return bid, cid, nid
 
 
+def _template_ceilings(session: Session, cid: Optional[int]) -> tuple[int, int]:
+    """Template defaults clamp like deploys do: the target connection's own ceilings
+    (when set) beat the global caps, so a high-limit target can carry matching
+    template defaults. Returns (max_cores, max_ram_gb)."""
+    conn = session.get(Connection, cid) if cid else None
+    cores = conn.max_cores if conn and conn.max_cores else settings.max_cores
+    ram_mb = conn.max_ram_mb if conn and conn.max_ram_mb else settings.max_ram_mb
+    return cores, ram_mb // 1024
+
+
 @router.post("/templates")
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     bid, cid, nid = _validate_template_refs(session, body)
+    max_cpu, max_ram = _template_ceilings(session, cid)
     rc = Template(name=body.name.strip() or "template", description=body.description,
                 os_family=body.os_family, recipe_json=json.dumps(body.recipe or []),
-                default_cpu=min(body.cpu, settings.max_cores),
-                default_ram=min(body.ram, settings.max_ram_mb // 1024),
+                default_cpu=min(body.cpu, max_cpu),
+                default_ram=min(body.ram, max_ram),
                 default_disk=body.disk, public=body.public, owner_id=user.id,
                 base_image_id=bid, connection_id=cid, network_id=nid)
     session.add(rc)
@@ -1132,11 +1149,12 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
     rc.description = body.description
     rc.os_family = body.os_family
     rc.recipe_json = json.dumps(body.recipe or [])
-    rc.default_cpu = min(body.cpu, settings.max_cores)
-    rc.default_ram = min(body.ram, settings.max_ram_mb // 1024)
+    rc.base_image_id, rc.connection_id, rc.network_id = _validate_template_refs(session, body)
+    max_cpu, max_ram = _template_ceilings(session, rc.connection_id)
+    rc.default_cpu = min(body.cpu, max_cpu)
+    rc.default_ram = min(body.ram, max_ram)
     rc.default_disk = body.disk
     rc.public = body.public
-    rc.base_image_id, rc.connection_id, rc.network_id = _validate_template_refs(session, body)
     session.add(rc)
     record_audit(session, user, "template.update", "template", rc.id, rc.name)
     session.commit()
@@ -1217,6 +1235,7 @@ def add_secret(body: SecretBody, user: User = Depends(current_user), session: Se
     sec = Secret(name=name, value_enc=encrypt(body.value), scope=scope,
                  owner_id=owner, created_by=user.id)
     session.add(sec)
+    record_audit(session, user, "secret.create", "secret", "-", name)
     session.commit()
     return {"ok": True}
 
@@ -1229,6 +1248,7 @@ def del_secret(sec_id: int, user: User = Depends(current_user), session: Session
     if not _scoped_owned(sec, user):
         raise HTTPException(403, "not yours")
     session.delete(sec)
+    record_audit(session, user, "secret.delete", "secret", sec_id, sec.name)
     session.commit()
     return {"ok": True}
 
@@ -1345,6 +1365,7 @@ def add_connection(body: ConnBody, user: User = Depends(require_admin), session:
                    max_cores=max(0, body.max_cores), max_ram_mb=max(0, body.max_ram_gb) * 1024,
                    max_disk_gb=max(0, body.max_disk_gb), created_by=user.id)
     session.add(c)
+    record_audit(session, user, "connection.create", "connection", "-", c.name)
     session.commit()
     session.refresh(c)
     # give it a default DHCP network now (so GET /state never has to write one)
@@ -2012,11 +2033,14 @@ def edit_user(uid: int, body: UserEditBody, user: User = Depends(require_admin),
     return {"ok": True}
 
 
+class PasswordResetBody(BaseModel):
+    value: str
+
+
 @router.post("/users/{uid}/password")
-def reset_user_password(uid: int, body: SecretBody, request: Request,
+def reset_user_password(uid: int, body: PasswordResetBody, request: Request,
                         user: User = Depends(require_admin),
                         session: Session = Depends(get_session)):
-    # reuse SecretBody.value as the new password (name ignored)
     u = session.get(User, uid)
     if not u:
         raise HTTPException(404, "not found")
