@@ -5,9 +5,9 @@
 (function () {
   const OS_COLORS = {
     ubuntu: '#E95420', debian: '#A80030', alpine: '#0D597F',
-    rocky: '#10B981', windows: '#0078D4', generic: '#888',
+    rocky: '#10B981', generic: '#888',
   };
-  const OS_LABEL = { ubuntu: 'Ubuntu', debian: 'Debian', alpine: 'Alpine', rocky: 'Rocky', windows: 'Windows', generic: 'Linux' };
+  const OS_LABEL = { ubuntu: 'Ubuntu', debian: 'Debian', alpine: 'Alpine', rocky: 'Rocky', generic: 'Linux' };
 
   window.GD = {
     // static

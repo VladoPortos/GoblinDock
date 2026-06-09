@@ -90,9 +90,6 @@ def _migrate() -> None:
             ("max_ram_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("max_disk_gb", "INTEGER NOT NULL DEFAULT 0"),
         ],
-        "images": [
-            ("disk_gb", "INTEGER NOT NULL DEFAULT 20"),
-        ],
         "audit": [
             ("ip", "TEXT NOT NULL DEFAULT ''"),
         ],
@@ -123,7 +120,11 @@ def _migrate() -> None:
     # NOT NULL with no server default, so an INSERT from the new (column-less)
     # model would violate the constraint and crash startup/seeding.
     drops = {
-        "images": ["audit_log_json"],
+        # images: golden-era build columns nothing reads or writes anymore. node/
+        # storage/recipe_json/disk_gb/progress are NOT NULL with no server default,
+        # so they MUST go or inserts from the new model crash on upgraded DBs.
+        "images": ["audit_log_json", "node", "storage", "base_image_id",
+                   "recipe_json", "disk_gb", "progress", "built_at"],
         "deployments": ["last_action"],
         "blocks": ["editable"],
         "jobs": ["total_phases"],

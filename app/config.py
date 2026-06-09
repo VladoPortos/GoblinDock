@@ -68,9 +68,6 @@ class Settings:
             os.environ.get("GOBLINDOCK_COOKIE_SECURE"), not self.dev_mode
         )
 
-        self.host = os.environ.get("GOBLINDOCK_HOST", "0.0.0.0")
-        self.port = int(os.environ.get("GOBLINDOCK_PORT", "8080"))
-
         # Reverse-proxy trust: which direct-peer IPs are allowed to set the real
         # client address via X-Forwarded-For. Empty = trust nobody (use the socket
         # peer). "*" = trust any upstream (only safe when nothing untrusted can reach

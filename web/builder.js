@@ -223,8 +223,8 @@
 
   // ---------- Inspector ----------
   function Inspector({ sections, sel, meta, setInput, setAsk }) {
-    let block = null, secId = null;
-    sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; secId = s.id; } }));
+    let block = null;
+    sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; } }));
     if (!block) {
       return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
         h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, 'Template')),

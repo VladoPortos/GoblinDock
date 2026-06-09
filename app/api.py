@@ -1203,19 +1203,6 @@ def compile_template(body: CompileBody, user: User = Depends(current_user), sess
 
 
 # --------------------------------------------------------------------------- #
-# blocks                                                                        #
-# --------------------------------------------------------------------------- #
-@router.get("/blocks")
-def list_blocks(user: User = Depends(current_user), session: Session = Depends(get_session)):
-    # Same visibility rule as /state: a non-admin only sees built-in blocks and
-    # their own custom blocks — never another user's private blocks.
-    blocks = session.exec(select(Block).order_by(Block.id)).all()
-    if user.role != "admin":
-        blocks = [b for b in blocks if b.builtin or b.owner_id == user.id]
-    return [S.block_dict(b) for b in blocks]
-
-
-# --------------------------------------------------------------------------- #
 # secrets                                                                        #
 # --------------------------------------------------------------------------- #
 class SecretBody(BaseModel):

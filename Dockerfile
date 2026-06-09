@@ -5,8 +5,7 @@ FROM python:3.12-slim@sha256:090ba77e2958f6af52a5341f788b50b032dd4ca28377d2893dc
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
     PIP_NO_CACHE_DIR=1 \
-    GOBLINDOCK_DATA_DIR=/data \
-    GOBLINDOCK_PORT=8080
+    GOBLINDOCK_DATA_DIR=/data
 
 # ca-certificates for TLS; openssh-client because ansible shells out to `ssh` to
 # reach VMs; libnss-wrapper fakes a passwd entry for the arbitrary runtime uid so

@@ -34,10 +34,9 @@
           collapsed && React.createElement('div', { style: { height: 10 } }),
           sec.items.filter(it => !it.admin || (GD.me && GD.me.isAdmin)).map(it => React.createElement('div', {
             key: it.id,
-            className: 'nav-item' + (route === it.id ? ' active' : '') + (it.primary ? ' primary-nav' : ''),
+            className: 'nav-item' + (route === it.id ? ' active' : ''),
             onClick: () => go(it.id),
             title: collapsed ? it.label : null,
-            style: it.primary && route !== it.id ? { color: 'var(--accent)' } : null,
           },
             React.createElement(Icon, { name: it.icon, size: 18 }),
             !collapsed && React.createElement('span', null, it.label),

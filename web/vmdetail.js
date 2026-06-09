@@ -49,7 +49,6 @@
     const host = useRef(null);
     const termRef = useRef(null);
     const wsRef = useRef(null);
-    const fitRef = useRef(null);
     const [status, setStatus] = useState('connecting');
     useEffect(() => {
       if (!window.Terminal || !host.current) { setStatus('noterm'); return undefined; }
@@ -59,7 +58,7 @@
       });
       termRef.current = term;
       let fit = null;
-      try { fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); fitRef.current = fit; } catch (e) { /* no fit */ }
+      try { fit = new window.FitAddon.FitAddon(); term.loadAddon(fit); } catch (e) { /* no fit */ }
       term.open(host.current);
       try { fit && fit.fit(); } catch (e) { /* */ }
       const proto = location.protocol === 'https:' ? 'wss' : 'ws';
@@ -83,7 +82,7 @@
         try { dDisp.dispose(); rDisp.dispose(); } catch (e) {}
         try { ws.close(); } catch (e) {}
         try { term.dispose(); } catch (e) {}
-        termRef.current = null; wsRef.current = null; fitRef.current = null;
+        termRef.current = null; wsRef.current = null;
       };
     }, [depId]);
     const paste = async () => {

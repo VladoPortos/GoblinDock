@@ -146,14 +146,6 @@ body {
   border-bottom: 1px solid var(--border-soft);
   flex-shrink: 0;
 }
-.brand-mark {
-  width: 30px; height: 30px; border-radius: 9px; flex-shrink: 0;
-  display: grid; place-items: center;
-  background: linear-gradient(150deg, var(--accent-hi), var(--accent-lo));
-  color: var(--accent-ink);
-  box-shadow: 0 2px 8px var(--accent-ghost), inset 0 1px 0 oklch(1 0 0 / .25);
-  position: relative;
-}
 .brand-word {
   font-family: 'JetBrains Mono', monospace; font-weight: 700;
   font-size: 15px; letter-spacing: -0.02em; white-space: nowrap;
@@ -404,10 +396,8 @@ body {
 /* avatar */
 .avatar { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; font-family: 'JetBrains Mono', monospace; font-weight: 700; font-size: 12px; background: var(--surface-3); color: var(--text); border: 1px solid var(--border); cursor: pointer; }
 
-/* grid helpers */
-.grid { display: grid; gap: 14px; }
+/* layout helpers */
 .row { display: flex; align-items: center; gap: 10px; }
-.col { display: flex; flex-direction: column; }
 .wrap { flex-wrap: wrap; }
 
 /* log pane */
@@ -424,7 +414,6 @@ body {
 
 /* misc */
 .kbd { font-family: 'JetBrains Mono', monospace; font-size: 10.5px; padding: 1px 5px; border-radius: 5px; background: var(--surface-2); border: 1px solid var(--border); color: var(--text-faint); }
-@keyframes pagein { from { opacity: .85; } to { opacity: 1; } }
 .fadein { /* entrance handled instantly; no container animation (keeps SPA snappy) */ }
 a { color: var(--accent); text-decoration: none; }
 

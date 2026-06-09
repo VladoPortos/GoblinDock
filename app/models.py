@@ -113,24 +113,17 @@ class Block(SQLModel, table=True):
 class Image(SQLModel, table=True):
     __tablename__ = "images"
     id: Optional[int] = Field(default=None, primary_key=True)
-    kind: str = "base"          # base | golden
+    kind: str = "base"          # base | golden (golden = legacy pre-templates rows, kept read-only)
     name: str = Field(index=True)
     os_family: str = "ubuntu"
-    connection_id: Optional[int] = None     # golden: which Proxmox the template lives on
-    node: str = ""                          # golden: target node (location)
-    storage: str = ""                       # golden: target VM-disk storage (location)
-    base_image_id: Optional[int] = None
+    connection_id: Optional[int] = None     # legacy golden: which Proxmox the template lives on
     source_url: str = ""
     checksum: str = ""
-    recipe_json: str = "[]"     # bake-time blocks (ordered sections of placed blocks)
-    disk_gb: int = 20           # golden: disk size baked in (so a rebuild reuses it)
-    template_vmid: Optional[int] = None
-    build_status: str = "none"  # none | building | ready | failed | importing
-    progress: int = 0
+    template_vmid: Optional[int] = None     # legacy golden: baked Proxmox template (worker refuses to destroy it)
+    build_status: str = "none"  # none | ready | failed ("building" only on legacy golden rows)
     size: str = ""
     created_by: Optional[int] = None
     created_at: datetime = Field(default_factory=utcnow)
-    built_at: Optional[datetime] = None
 
 
 class Template(SQLModel, table=True):

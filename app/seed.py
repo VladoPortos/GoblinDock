@@ -544,7 +544,7 @@ def seed_blocks() -> None:
     with session_scope() as s:
         existing = {b.key: b for b in s.exec(select(Block)).all()}
         for spec in BUILTIN_BLOCKS:
-            phase = spec.get("phase") or ("cloudinit" if spec["key"] in _CLOUDINIT_BLOCKS else "ansible")
+            phase = "cloudinit" if spec["key"] in _CLOUDINIT_BLOCKS else "ansible"
             cur = existing.get(spec["key"])
             if cur is not None:
                 # Re-sync GoblinDock's own built-in blocks with the code on every boot so
@@ -569,8 +569,7 @@ def seed_blocks() -> None:
                 input_schema_json=json.dumps(spec.get("input_schema", [])),
                 ansible_template=spec.get("ansible", ""),
                 cloudinit_template=spec.get("cloudinit", ""),
-                builtin=spec.get("builtin", True),
-                kind="builtin" if spec.get("builtin", True) else "custom",
+                builtin=True, kind="builtin",
             ))
 
 
