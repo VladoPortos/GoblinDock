@@ -138,7 +138,8 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         steps = session.exec(select(JobStep).where(JobStep.job_id == active.id)).all()
         done = sum(1 for s in steps if s.state in ("done", "skipped"))
         label = {"deploy": "Deploying", "rebuild": "Rebuilding", "destroy": "Destroying"}.get(active.type, "Working")
-        job_chip = {"label": label, "step": done, "total": max(len(steps), 1), "jobId": active.id}
+        job_chip = {"label": label, "step": done, "total": max(len(steps), 1), "jobId": active.id,
+                    "phase": active.phase or "", "pct": active.pct or 0}
         status = "working"
 
     owner = users.get(dep.owner_id)

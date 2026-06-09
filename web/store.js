@@ -3,6 +3,27 @@ window.GDStore = (function () {
   let onChange = null;
   let inflight = null;
 
+  // Per-VM CPU/RAM ring buffer fed by every state refresh — powers the dashboard
+  // sparklines. Client-side and best-effort by design: it shows the trend since
+  // this tab opened, no backend storage. Samples are throttled so a burst of
+  // statebus pings doesn't compress the time axis.
+  const HIST_LEN = 40;
+  const HIST_MIN_GAP_MS = 4000;
+  const history = {};   // depId -> [{t, cpu, ram}]
+  function recordHistory() {
+    const now = Date.now();
+    const seen = new Set();
+    (window.GD.VMS || []).forEach((v) => {
+      seen.add(v.depId);
+      const h = history[v.depId] || (history[v.depId] = []);
+      const last = h[h.length - 1];
+      if (last && now - last.t < HIST_MIN_GAP_MS) return;
+      h.push({ t: now, cpu: v.status === 'running' ? (v.cpu || 0) : 0, ram: v.status === 'running' ? (v.ram || 0) : 0 });
+      if (h.length > HIST_LEN) h.shift();
+    });
+    Object.keys(history).forEach((k) => { if (!seen.has(Number(k))) delete history[k]; });
+  }
+
   async function refresh() {
     if (inflight) return inflight;
     inflight = (async () => {
@@ -10,6 +31,7 @@ window.GDStore = (function () {
         const s = await window.API.state();
         // mutate GD in place (preserve captured references in component IIFEs)
         Object.keys(s).forEach((k) => { window.GD[k] = s[k]; });
+        recordHistory();
         if (onChange) onChange();
         return s;
       } finally {
@@ -57,6 +79,7 @@ window.GDStore = (function () {
     toast,
     vmAction,
     signOut,
+    vmHistory: (depId) => history[depId] || [],
     nav: {},
   };
 })();

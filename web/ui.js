@@ -90,6 +90,21 @@
     }, value, h(Icon, { name: copied ? 'check' : 'copy' }));
   }
 
+  // Tiny inline trend line (0-100 scale) — used for the dashboard CPU/RAM history.
+  function Sparkline({ data, width = 64, height = 16, color }) {
+    if (!data || data.length < 2) return null;
+    const n = data.length;
+    const pts = data.map((v, i) => {
+      const x = (i / (n - 1)) * width;
+      const y = height - 1 - (Math.min(100, Math.max(0, v)) / 100) * (height - 2);
+      return x.toFixed(1) + ',' + y.toFixed(1);
+    }).join(' ');
+    return h('svg', { width, height, viewBox: '0 0 ' + width + ' ' + height,
+      style: { display: 'block', opacity: 0.9 }, 'aria-hidden': true },
+      h('polyline', { points: pts, fill: 'none', stroke: color || 'var(--accent)',
+        strokeWidth: 1.5, strokeLinejoin: 'round', strokeLinecap: 'round' }));
+  }
+
   function Meter({ value, tone }) {
     const t = tone || (value > 80 ? 'err' : value > 60 ? 'warn' : 'ok');
     return h('div', { className: 'meter ' + t },
@@ -315,7 +330,7 @@
   }
 
   window.UI = {
-    OSGlyph, StatusBadge, CopyField, Meter, Modal, ConfirmModal, Menu,
+    OSGlyph, StatusBadge, CopyField, Meter, Sparkline, Modal, ConfirmModal, Menu,
     Field, TextArea, SelectField, Toggle, TagInput, FormModal,
     collectAsks, initAskAnswers, asksMissing, AskInputs,
     SizeField,

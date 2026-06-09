@@ -62,6 +62,7 @@ class JobCtx:
     def __init__(self, job_id: int):
         self.job_id = job_id
         self._seq = 0
+        self._phase = ""
 
     def cancelled(self) -> bool:
         with session_scope() as s:
@@ -69,6 +70,7 @@ class JobCtx:
             return bool(job and job.cancel_requested)
 
     def progress(self, pct: int, phase: str) -> None:
+        self._phase = phase
         with session_scope() as s:
             job = s.get(Job, self.job_id)
             if job:
@@ -77,6 +79,17 @@ class JobCtx:
                 s.add(job)
         statebus.bump()
         self._tick()
+
+    def phase_note(self, note: str) -> None:
+        """Append a transient detail to the current phase title (e.g. a live
+        download percentage) WITHOUT touching pct — each call replaces the
+        previous note, so the dashboard job chip stays current."""
+        with session_scope() as s:
+            job = s.get(Job, self.job_id)
+            if job:
+                job.phase = f"{self._phase} · {note}" if self._phase else note
+                s.add(job)
+        statebus.bump()
 
     def add_step(self, name: str) -> int:
         with session_scope() as s:
@@ -352,6 +365,11 @@ def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
             if "%" in line and line != _last["line"]:
                 _last["line"] = line
                 ctx.log(f"[{_ts()}] {line}", "l-dim")
+                # surface the % on the job phase too → live download progress in
+                # the dashboard job chip, not just the job log
+                m = re.search(r"(\d{1,3})%", line)
+                if m:
+                    ctx.phase_note(f"downloading {m.group(1)}%")
 
         px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=3600, on_poll=_progress)
         ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")

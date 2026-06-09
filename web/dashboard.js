@@ -3,7 +3,7 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { OSGlyph, StatusBadge, CopyField, Meter, Menu, ConfirmModal, FormModal, Field } = window.UI;
+  const { OSGlyph, StatusBadge, CopyField, Meter, Sparkline, Menu, ConfirmModal, FormModal, Field } = window.UI;
   const h = React.createElement;
 
   const VIEWS_KEY = 'gd.savedViews';
@@ -61,10 +61,16 @@
   }
 
   function JobChip({ vm, go }) {
+    // live detail = the last segment of the job phase ("Phase 2 of 6 · Prepare
+    // image · downloading 62%" → "downloading 62%"); falls back to step counter.
+    const detail = ((vm.job.phase || '').split('·').pop() || '').trim();
     return h('button', {
       className: 'badge working', style: { cursor: 'pointer', border: 'none' },
       onClick: (e) => { e.stopPropagation(); go('job', { jobId: vm.job.jobId }); },
-    }, h('span', { className: 'dot working' }), vm.job.label, '… ', vm.job.step, '/', vm.job.total, h(Icon, { name: 'chevronR', size: 12 }));
+    }, h('span', { className: 'dot working' }), vm.job.label,
+      detail ? ' · ' + detail : ('… ' + vm.job.step + '/' + vm.job.total),
+      vm.job.pct != null && h('span', { className: 'mono', style: { marginLeft: 4, opacity: 0.75 } }, vm.job.pct, '%'),
+      h(Icon, { name: 'chevronR', size: 12 }));
   }
 
   function SelBox({ checked, onToggle, title }) {
@@ -141,8 +147,10 @@
           h('div', { style: { minWidth: 0 } },
             h('div', { className: 'mono', style: { fontSize: 12 } }, vm.image, ' → ', vm.template))),
         h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12, paddingTop: 4 } },
-          h(StatBlock, { label: 'CPU', value: vm.cpu, on: vm.status === 'running' }),
-          h(StatBlock, { label: 'RAM', value: vm.ram, on: vm.status === 'running' })),
+          h(StatBlock, { label: 'CPU', value: vm.cpu, on: vm.status === 'running',
+            hist: window.GDStore.vmHistory(vm.depId).map((p) => p.cpu) }),
+          h(StatBlock, { label: 'RAM', value: vm.ram, on: vm.status === 'running',
+            hist: window.GDStore.vmHistory(vm.depId).map((p) => p.ram) })),
         h('div', { className: 'divider' }),
         h('div', { className: 'row' },
           h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
@@ -152,10 +160,11 @@
     );
   }
 
-  function StatBlock({ label, value, on }) {
+  function StatBlock({ label, value, on, hist }) {
     return h('div', null,
       h('div', { className: 'row', style: { justifyContent: 'space-between', marginBottom: 5 } },
         h('span', { className: 'panel-title', style: { fontSize: 10 } }, label),
+        on && (hist || []).length > 1 && h(Sparkline, { data: hist, width: 56, height: 14, color: 'var(--text-faint)' }),
         h('span', { className: 'mono', style: { fontSize: 11.5, color: on ? 'var(--text)' : 'var(--text-faint)' } }, on ? value + '%' : '—')),
       h(Meter, { value: on ? value : 0 })
     );

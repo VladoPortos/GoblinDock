@@ -202,6 +202,33 @@ def test_snapshot_rollback_delete_and_failure():
     print("test_snapshot_rollback_delete_and_failure OK")
 
 
+def test_job_chip_phase_note_and_pct():
+    """Dashboard job chips: vm_dict's chip carries the live phase + pct, and
+    JobCtx.phase_note appends a transient detail (download %) without moving pct."""
+    from app import serialize as S
+    from app.models import Deployment, Job, User
+    from app.worker import JobCtx
+    uid = _mk_user("t16-chip@example.com")
+    dep_id = _mk_dep(uid, vmid=8005)
+    with session_scope() as s:
+        job = Job(type="deploy", title="Deploying x", deployment_id=dep_id, status="running")
+        s.add(job); s.flush()
+        jid = job.id
+    ctx = JobCtx(jid)
+    ctx.progress(8, "Phase 2 of 6 · Prepare image")
+    ctx.phase_note("downloading 62%")
+    ctx.phase_note("downloading 89%")   # each note replaces the previous one
+    with session_scope() as s:
+        job = s.get(Job, jid)
+        assert job.pct == 8, job.pct
+        assert job.phase == "Phase 2 of 6 · Prepare image · downloading 89%", job.phase
+        dep = s.get(Deployment, dep_id)
+        me = s.get(User, uid)
+        chip = S.vm_dict(s, dep, me, {}, {uid: me}, {})["job"]
+        assert chip["pct"] == 8 and chip["phase"].endswith("downloading 89%"), chip
+    print("test_job_chip_phase_note_and_pct OK")
+
+
 if __name__ == "__main__":
     fns = [v for k, v in sorted(globals().items()) if k.startswith("test_") and callable(v)]
     for fn in fns:
