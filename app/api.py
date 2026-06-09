@@ -488,9 +488,14 @@ def widget_summary(user: User = Depends(widget_key_user),
         job_q = job_q.where(Job.created_by == user.id)
     jobs_active = len(session.exec(job_q).all())
 
-    tpl_rows = session.exec(select(Template).where(
+    tpl_q = select(Template).where(
         Template.base_image_id.is_not(None),
-        Template.connection_id.is_not(None))).all()
+        Template.connection_id.is_not(None))
+    if not is_admin:
+        # tenant-scope like /state: a non-admin only sees public + own templates
+        tpl_q = tpl_q.where(or_(Template.public == True,  # noqa: E712
+                                Template.owner_id == user.id))
+    tpl_rows = session.exec(tpl_q).all()
 
     return {
         "vms_total": len(statuses),
@@ -1956,6 +1961,12 @@ def edit_network(net_id: int, body: NetworkBody, user: User = Depends(require_ad
     if not n:
         raise HTTPException(404, "not found")
     _validate_network_body(body)
+    if body.connectionId != n.connection_id:
+        if not session.get(Connection, body.connectionId):
+            raise HTTPException(400, "unknown connection")
+        if session.exec(select(Deployment).where(Deployment.network_id == net_id)).first():
+            raise HTTPException(409, "network is in use by a deployment — can't move it to another connection")
+        n.connection_id = body.connectionId
     n.name = body.name.strip()
     n.mode = "static" if body.mode == "static" else "dhcp"
     n.bridge = body.bridge
