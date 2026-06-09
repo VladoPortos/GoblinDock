@@ -217,7 +217,7 @@ One Docker container, no external services:
   editor), xterm.js + noVNC (consoles) — all served from `web/`, SRI-pinned.
 
 ```
-backend:  app/*.py + app/routers/   (FastAPI app · threaded job worker · APScheduler · Proxmox client · template compiler · SQLite models)
+backend:  app/*.py   (FastAPI app + routes · threaded job worker · APScheduler · Proxmox client · template compiler · SQLite models)
 frontend: web/{index.html,styles.css,*.js, vendor/}
 ```
 
@@ -235,12 +235,22 @@ it falls back to native cloud-init.
 | `GOBLINDOCK_FORWARDED_ALLOW_IPS` | — | behind a reverse proxy, set to the proxy IP/CIDR so the real client IP is used for the login throttle + audit log |
 | `GOBLINDOCK_VMID_MIN` / `_MAX` | `8000` / `8099` | VMID window GoblinDock may ever touch |
 | `GOBLINDOCK_MAX_CORES` / `_RAM_MB` / `_DISK_GB` | `1` / `2048` / `0` | global per-VM ceilings (a connection can set its own) |
+| `GOBLINDOCK_MAX_VMS_PER_USER` | `0` | per-user VM quota (`0` = unlimited; admins exempt) |
+| `GOBLINDOCK_DATA_DIR` / `GOBLINDOCK_DB` | `./data` / `<data>/goblindock.sqlite3` | data directory and SQLite file path |
+| `GOBLINDOCK_BACKUP_ENABLED` / `_INTERVAL_HOURS` / `_KEEP` / `_DIR` | `1` / `24` / `7` / `<data>/backups` | scheduled **online SQLite backups** (WAL-safe, rotating; backups carry the same encrypted secrets and need the matching `GOBLINDOCK_SECRET_KEY` to restore) |
+| `GOBLINDOCK_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | — | optional first-run admin bootstrap (skips the setup screen) |
+| `GOBLINDOCK_CORS` | — | comma-separated extra allowed origins (CORS **and** the console WebSocket origin allow-list) |
+| `GOBLINDOCK_COOKIE_SECURE` | on (off in dev) | override the session cookie `Secure` flag |
+| `GOBLINDOCK_SSH_STRICT` / `GOBLINDOCK_SSH_KNOWN_HOSTS` | `false` / — | SSH host-key verification for snippet upload: strict rejects unknown hosts; point `_KNOWN_HOSTS` at a pinned `known_hosts` file |
 | `GOBLINDOCK_SEED_PROXMOX` | `false` | auto-create the connection from `PROXMOX_*` |
-| `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN` | — | Proxmox API token (keep in gitignored `.secrets/`) |
+| `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN` | — | Proxmox API token (keep in gitignored `.secrets/`; `PROXMOX_TOKEN_FILE` works for Docker secrets) |
 | `PROXMOX_HOST` / `_NODE` / `_STORAGE` / `_BRIDGE` | — | connection defaults |
+| `PROXMOX_ISO_STORAGE` / `_SNIPPET_STORAGE` | `local` / `local` | storage for downloaded cloud images / cloud-init snippets |
 | `PROXMOX_SSH_HOST` / `_SSH_USER` / `_SSH_KEY` | — | node SSH (enables snippet baking + IP detection) |
 | `GD_UID` / `GD_GID` | `1000` | run the container as your host user (for bind-mounted `./data` + SSH key) |
-| `GOBLINDOCK_DEV` | unset | allows http / non-Secure cookies for localhost. **Never set in prod.** |
+| `GOBLINDOCK_WEB_DIR` | `./web` | serve the SPA from a different directory |
+| `GOBLINDOCK_DEV` | unset | allows http / non-Secure cookies + an ephemeral secret key for localhost. **Never set in prod.** |
+| `GOBLINDOCK_ALLOW_EPHEMERAL_KEY` | unset | start without a stable secret key **outside** dev mode (sessions and stored secrets reset on every restart — escape hatch only) |
 
 ---
 
