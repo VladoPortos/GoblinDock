@@ -26,6 +26,7 @@ from .models import (
     Secret,
     Variable,
     User,
+    ensure_utc,
 )
 from .proxmox import Proxmox
 from .recipes import recipe_block_chips
@@ -36,6 +37,10 @@ from .security import mask
 # reuse the same VMID don't collide.
 _status_cache: dict[tuple, tuple[float, dict]] = {}
 _STATUS_TTL = 3.0
+
+# DB job status → the 3-state status vocabulary the UI renders (chips, meters).
+_UI_STATUS = {"running": "working", "queued": "working", "succeeded": "done",
+              "failed": "error", "canceled": "error"}
 
 
 def _fmt_uptime(seconds: int) -> str:
@@ -54,9 +59,7 @@ def _fmt_uptime(seconds: int) -> str:
 def _rel(dt: Optional[datetime]) -> str:
     if not dt:
         return "never"
-    if dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
-    delta = datetime.now(timezone.utc) - dt
+    delta = datetime.now(timezone.utc) - ensure_utc(dt)
     s = int(delta.total_seconds())
     if s < 60:
         return "just now"
@@ -70,11 +73,8 @@ def _rel(dt: Optional[datetime]) -> str:
 def _elapsed(start: Optional[datetime], end: Optional[datetime]) -> str:
     if not start:
         return "00:00"
-    if start.tzinfo is None:
-        start = start.replace(tzinfo=timezone.utc)
-    end = end or datetime.now(timezone.utc)
-    if end.tzinfo is None:
-        end = end.replace(tzinfo=timezone.utc)
+    start = ensure_utc(start)
+    end = ensure_utc(end) or datetime.now(timezone.utc)
     s = max(0, int((end - start).total_seconds()))
     return f"{s // 60:02d}:{s % 60:02d}"
 
@@ -169,13 +169,11 @@ def job_brief(session: Session, job: Job) -> dict:
     steps = session.exec(select(JobStep).where(JobStep.job_id == job.id)).all()
     done = sum(1 for s in steps if s.state in ("done", "skipped"))
     total = max(len(steps), 1)
-    status_map = {"running": "working", "queued": "working", "succeeded": "done",
-                  "failed": "error", "canceled": "error"}
     return {
         "id": f"j-{job.id}",
         "jobId": job.id,
         "title": job.title,
-        "status": status_map.get(job.status, "working"),
+        "status": _UI_STATUS.get(job.status, "working"),
         "pct": job.pct,
         "phase": job.phase or job.status.title(),
         "elapsed": _elapsed(job.started_at, job.finished_at),
@@ -199,8 +197,6 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
             .order_by(JobEvent.id.desc()).limit(log_limit)
         ).all()
         logs = list(reversed(logs))
-    status_map = {"running": "working", "queued": "working", "succeeded": "done",
-                  "failed": "error", "canceled": "error"}
     waiting_for = None
     if job.status == "queued":
         running = session.exec(
@@ -224,7 +220,7 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
         "id": job.id,
         "title": job.title,
         "type": job.type,
-        "status": status_map.get(job.status, "working"),
+        "status": _UI_STATUS.get(job.status, "working"),
         "rawStatus": job.status,
         "pct": job.pct,
         "phase": job.phase or job.status.title(),

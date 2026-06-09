@@ -3,7 +3,7 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { Menu, ConfirmModal, Field, CopyField, OSGlyph } = window.UI;
+  const { Menu, ConfirmModal, Field, CopyField, OSGlyph, copyToClipboard } = window.UI;
   const h = React.createElement;
 
   /* ============ PROFILE ============ */
@@ -60,11 +60,6 @@
       '        - { field: jobs_active,   label: Jobs,    format: number }',
       '        - { field: templates,     label: Templates, format: number }',
     ].join('\n');
-    const copyText = (txt, label) => {
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(txt).then(() => window.GDStore.toast(label || 'Copied', 'ok')).catch(() => {});
-      } else { window.GDStore.toast('Clipboard blocked — select & copy', 'warn'); }
-    };
     const genKey = async () => {
       setWkBusy(true);
       try {
@@ -108,7 +103,7 @@
       (freshKey || wk.present) && h('div', { style: { display: 'flex', flexDirection: 'column', gap: 8 } },
         h('button', { className: 'btn sm', style: { width: 'fit-content' }, onClick: () => setShowSnippet((s) => !s) }, (showSnippet ? '▾ ' : '▸ '), 'services.yaml snippet'),
         showSnippet && h('pre', { className: 'mono', style: { whiteSpace: 'pre', overflowX: 'auto', background: 'rgba(127,127,127,0.10)', border: '1px solid var(--border, rgba(127,127,127,0.22))', padding: 12, borderRadius: 8, fontSize: 11.5, margin: 0, lineHeight: 1.5 } }, wkSnippet(freshKey)),
-        showSnippet && h('button', { className: 'btn sm', style: { width: 'fit-content' }, onClick: () => copyText(wkSnippet(freshKey), 'Snippet copied') }, h(Icon, { name: 'copy', size: 13 }), 'Copy snippet')),
+        showSnippet && h('button', { className: 'btn sm', style: { width: 'fit-content' }, onClick: () => copyToClipboard(wkSnippet(freshKey), 'Snippet copied') }, h(Icon, { name: 'copy', size: 13 }), 'Copy snippet')),
       wkConfirm === 'regen' && h(ConfirmModal, { onClose: () => setWkConfirm(null), tone: 'danger', icon: 'refresh', title: 'Regenerate widget key?', body: 'The current key stops working immediately. Update your Homepage config with the new key.', confirmLabel: 'Regenerate', onConfirm: genKey }),
       wkConfirm === 'revoke' && h(ConfirmModal, { onClose: () => setWkConfirm(null), tone: 'danger', icon: 'trash', title: 'Revoke widget key?', body: 'The key stops working immediately; the Homepage widget will stop updating until you generate a new one.', confirmLabel: 'Revoke', onConfirm: revokeKey }));
 
@@ -151,7 +146,7 @@
           h('div', { className: 'row', style: { justifyContent: 'space-between' } }, h('span', { className: 'hint' }, 'Last login'), h('span', { className: 'mono', style: { fontSize: 12 } }, me.lastLogin || '—')),
           h('div', { className: 'row', style: { justifyContent: 'space-between' } }, h('span', { className: 'hint' }, 'Role'), h('span', { className: 'mono', style: { fontSize: 12 } }, me.role)),
           h('div', { className: 'divider' }),
-          h('button', { className: 'btn danger sm', style: { width: 'fit-content' }, onClick: async () => { try { await window.API.logout(); } catch (e) {} window.GD._csrf = null; go('login'); } }, h(Icon, { name: 'logout', size: 14 }), 'Sign out')))),
+          h('button', { className: 'btn danger sm', style: { width: 'fit-content' }, onClick: () => window.GDStore.signOut(go) }, h(Icon, { name: 'logout', size: 14 }), 'Sign out')))),
       widgetCard);
   }
 

@@ -71,18 +71,13 @@
 
     const conns = GD.CONNECTIONS || [];
     const [targetId, setTargetId] = useState((conns[0] && conns[0].connId) || null);
-    const [cache, setCache] = useState({ online: null, cached: {} });  // online null = unknown/loading
     const [bump, setBump] = useState(0);                                // forces a cache refetch
     const syncCountRef = React.useRef(0);
 
-    React.useEffect(() => {
-      let dead = false;
-      if (!targetId) { setCache({ online: null, cached: {} }); return undefined; }
-      window.API.cachedImages(targetId)
-        .then((d) => { if (!dead) setCache(d); })
-        .catch(() => { if (!dead) setCache({ online: false, cached: {} }); });
-      return () => { dead = true; };
-    }, [targetId, bump]);
+    // online null = unknown/loading
+    const cache = window.UI.useFetched(
+      () => (targetId ? window.API.cachedImages(targetId) : { online: null, cached: {} }),
+      [targetId, bump], { online: false, cached: {} }) || { online: null, cached: {} };
 
     // when a running sync job finishes (count drops), the cache may have changed
     const workingSyncs = (GD.JOBS || []).filter((j) => j.imageId != null && j.status === 'working').length;

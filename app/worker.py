@@ -506,8 +506,6 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     try:
         px.resize_disk(new_vmid, "scsi0", f"{disk_gb}G", node=node)
         ctx.log(f"[{_ts()}] resize scsi0 → {disk_gb}G", "l-dim")
-    except ProxmoxError as e:
-        ctx.log(f"[{_ts()}] resize skipped: {e}", "l-warn")
     except Exception as e:  # noqa: BLE001
         ctx.log(f"[{_ts()}] resize skipped: {e}", "l-warn")
     ctx.finish_step(st, t)
@@ -649,13 +647,7 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
             delete_snippet_over_ssh(conn, f"gd-deploy-{dep.vmid}.yml")
         except Exception:  # noqa: BLE001
             pass
-    with session_scope() as s:
-        from .models import IpAllocation as _IpAlloc
-        for a in s.exec(select(_IpAlloc).where(_IpAlloc.deployment_id == dep.id)).all():
-            s.delete(a)
-        d = s.get(Deployment, dep.id)
-        if d:
-            s.delete(d)
+    _drop_deployment(dep.id)
     ctx.progress(100, "Complete")
 
 
@@ -917,7 +909,6 @@ def _recover_orphans() -> None:
     """Crash recovery: a job left 'running' by a previous process is dead. Fail it AND
     reconcile the resource it was mutating — otherwise the deployment stays "working"
     forever (serialize skips live-polling 'working') and the image stays "building"."""
-    from .models import IpAllocation as _IpAlloc
     with session_scope() as s:
         for job in s.exec(select(Job).where(Job.status == "running")).all():
             job.status = "failed"
@@ -931,7 +922,7 @@ def _recover_orphans() -> None:
                     dep.error = "interrupted by restart"
                     s.add(dep)
                     # free the interrupted deploy's static-IP reservation
-                    for a in s.exec(select(_IpAlloc).where(_IpAlloc.deployment_id == dep.id)).all():
+                    for a in s.exec(select(IpAllocation).where(IpAllocation.deployment_id == dep.id)).all():
                         s.delete(a)
             if job.image_id:
                 img = s.get(Image, job.image_id)

@@ -42,7 +42,7 @@
     // no change to the SSE stream. Copy/Download still act on the FULL log.
     const shown = filter ? log.filter(l => (l.text || '').toLowerCase().includes(filter.toLowerCase())) : log;
     useEffect(() => { if (ref.current) ref.current.scrollTop = ref.current.scrollHeight; }, [shown.length]);
-    const copy = () => navigator.clipboard && navigator.clipboard.writeText(log.map(l => l.text).join('\n'));
+    const copy = () => window.UI.copyToClipboard(log.map(l => l.text).join('\n'), 'Log copied');
     const download = () => {
       const blob = new Blob([log.map(l => l.text).join('\n')], { type: 'text/plain' });
       const a = document.createElement('a'); a.href = URL.createObjectURL(blob); a.download = 'goblindock-job.log'; a.click();

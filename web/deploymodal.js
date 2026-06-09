@@ -24,17 +24,10 @@
     const [disk, setDisk] = useState(tpl ? tpl.disk : 20);
     const [busy, setBusy] = useState(false);
     const busyRef = React.useRef(false);
-    const [cap, setCap] = React.useState(null);
-    React.useEffect(() => {
-      let live = true;
-      setCap(null);
-      const cid = tpl && tpl.connectionId;
-      if (!cid) return undefined;
-      window.API.connectionCapacity(cid)
-        .then((c) => { if (live) setCap(c && c.online ? c : null); })
-        .catch(() => { if (live) setCap(null); });
-      return () => { live = false; };
-    }, [tpl && tpl.connectionId]);
+    const capData = window.UI.useFetched(
+      () => ((tpl && tpl.connectionId) ? window.API.connectionCapacity(tpl.connectionId) : null),
+      [tpl && tpl.connectionId], null);
+    const cap = capData && capData.online ? capData : null;
 
     // won't-fit: RAM/disk over free → amber warning; CPU over cores → soft note. Never blocks.
     const capWarn = (() => {

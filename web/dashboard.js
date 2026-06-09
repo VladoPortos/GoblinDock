@@ -175,17 +175,10 @@
   function FirstRunChecklist({ go }) {
     const isAdmin = window.GD.me && window.GD.me.isAdmin;
     const hasConn = (window.GD.CONNECTIONS || []).length > 0;
-    const [imgDone, setImgDone] = React.useState(false);
-
-    React.useEffect(() => {
-      let live = true;
-      const first = (window.GD.CONNECTIONS || [])[0];
-      if (!first) return undefined;
-      window.API.cachedImages(first.connId)
-        .then((r) => { if (live) setImgDone(!!(r && r.cached && Object.values(r.cached).some(Boolean))); })
-        .catch(() => { if (live) setImgDone(false); });
-      return () => { live = false; };
-    }, [hasConn]);
+    const first = (window.GD.CONNECTIONS || [])[0];
+    const cached = window.UI.useFetched(
+      () => (first ? window.API.cachedImages(first.connId) : null), [hasConn], null);
+    const imgDone = !!(cached && cached.cached && Object.values(cached.cached).some(Boolean));
 
     // Non-admins can't add connections / sync images — just show the deploy step.
     if (!isAdmin) {
@@ -252,30 +245,24 @@
       }
     };
 
-    // ---- bulk ----
-    const bulk = async (action) => {
+    // ---- bulk ---- (one runner; start/stop/restart and destroy differ only in the
+    // API call, the toast wording, and the tones for success / partial failure)
+    const runBulk = async (call, label, okTone, failTone) => {
       const targets = selectedVms();
       if (!targets.length) return;
       setBulkBusy(true);
-      const results = await Promise.allSettled(targets.map(v => window.API.vmAction(v.depId, action)));
+      const results = await Promise.allSettled(targets.map(call));
       const ok = results.filter(r => r.status === 'fulfilled').length;
       const fail = results.length - ok;
-      window.GDStore.toast(action + ': ' + ok + ' ok' + (fail ? (' · ' + fail + ' failed') : ''), fail ? 'warn' : 'ok');
+      window.GDStore.toast(label(ok) + (fail ? (' · ' + fail + ' failed') : ''), fail ? failTone : okTone);
       setBulkBusy(false);
       clearSel();
       setTimeout(() => window.GDStore.refresh().catch(() => {}), 700);
     };
-    const bulkDelete = async () => {
-      const targets = selectedVms();
-      setBulkBusy(true);
-      const results = await Promise.allSettled(targets.map(v => window.API.vmDestroy(v.depId)));
-      const ok = results.filter(r => r.status === 'fulfilled').length;
-      const fail = results.length - ok;
-      window.GDStore.toast('Destroying ' + ok + ' VM' + (ok === 1 ? '' : 's') + (fail ? (' · ' + fail + ' failed') : ''), fail ? 'err' : 'warn');
-      setBulkBusy(false);
-      clearSel();
-      setTimeout(() => window.GDStore.refresh().catch(() => {}), 700);
-    };
+    const bulk = (action) => runBulk(v => window.API.vmAction(v.depId, action),
+      (ok) => action + ': ' + ok + ' ok', 'ok', 'warn');
+    const bulkDelete = () => runBulk(v => window.API.vmDestroy(v.depId),
+      (ok) => 'Destroying ' + ok + ' VM' + (ok === 1 ? '' : 's'), 'warn', 'err');
 
     // ---- saved views ----
     const applyView = (v) => { setScope(v.scope); setStatus(v.status); setTag(v.tag || 'all'); setQ(v.q || ''); if (v.view) setView(v.view); };

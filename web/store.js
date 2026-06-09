@@ -43,11 +43,20 @@ window.GDStore = (function () {
     }
   }
 
+  // Shared sign-out: best-effort server logout, drop the CSRF token, then route to
+  // the login screen. Used by the topbar menu and the Profile page.
+  async function signOut(go) {
+    try { await window.API.logout(); } catch (e) { /* cookie may already be gone */ }
+    window.GD._csrf = null;
+    if (go) go('login');
+  }
+
   return {
     refresh,
     setOnChange: (fn) => { onChange = fn; },
     toast,
     vmAction,
+    signOut,
     nav: {},
   };
 })();

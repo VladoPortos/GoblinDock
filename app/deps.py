@@ -1,13 +1,11 @@
 """Auth dependencies — session-cookie based."""
 from __future__ import annotations
 
-from datetime import timezone
-
 from fastapi import Depends, HTTPException, Request, status
 from sqlmodel import Session, select
 
 from .db import get_session
-from .models import User, utcnow
+from .models import User, ensure_utc, utcnow
 from .security import WIDGET_KEY_PREFIX, hash_widget_key
 
 
@@ -62,9 +60,7 @@ def widget_key_user(request: Request, session: Session = Depends(get_session)) -
 
 def _touch_widget_key_last_used(session: Session, user: User) -> None:
     now = utcnow()
-    last = user.widget_key_last_used
-    if last is not None and last.tzinfo is None:
-        last = last.replace(tzinfo=timezone.utc)  # SQLite hands back naive UTC
+    last = ensure_utc(user.widget_key_last_used)
     if last is None or (now - last).total_seconds() >= _WIDGET_KEY_LAST_USED_THROTTLE_S:
         user.widget_key_last_used = now
         session.add(user)

@@ -93,7 +93,7 @@
             { label: ((GD.me && GD.me.name) || 'Account') + ' · ' + ((GD.me && GD.me.role) || ''), icon: 'user' },
             { sep: true },
             { label: 'Profile', icon: 'user', onClick: () => go('profile') },
-            { label: 'Sign out', icon: 'logout', onClick: async () => { try { await window.API.logout(); } catch (e) {} window.GD._csrf = null; go('login'); } },
+            { label: 'Sign out', icon: 'logout', onClick: () => window.GDStore.signOut(go) },
           ]
         }, React.createElement('div', { className: 'avatar', title: (GD.me && GD.me.name) || '' }, (GD.me && GD.me.initials) || '··'))
       )

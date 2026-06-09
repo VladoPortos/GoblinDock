@@ -16,6 +16,14 @@ def utcnow() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def ensure_utc(dt: Optional[datetime]) -> Optional[datetime]:
+    """SQLite hands back stored datetimes as naive UTC — re-attach the timezone so
+    they can be compared with utcnow() (one shared helper instead of ad-hoc fixes)."""
+    if dt is not None and dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt
+
+
 class User(SQLModel, table=True):
     __tablename__ = "users"
     id: Optional[int] = Field(default=None, primary_key=True)

@@ -2,36 +2,15 @@
 (function () {
   const { useState, useEffect, useRef } = React;
   const Icon = window.Icon;
-  const { OSGlyph, ConfirmModal } = window.UI;
+  const { OSGlyph, ConfirmModal, StatusBadge, copyToClipboard, readClipboard, fmtBytes } = window.UI;
   const h = React.createElement;
   const toast = (m, t) => window.GDStore.toast(m, t);
-
-  // Clipboard helpers — the API needs a secure context (https or localhost) + a user
-  // gesture; degrade with a hint to Ctrl+V/Ctrl+C rather than failing silently.
-  async function readClipboard() {
-    if (!navigator.clipboard || !navigator.clipboard.readText) {
-      toast('Clipboard blocked by the browser — use Ctrl+V', 'warn'); return null;
-    }
-    try { return await navigator.clipboard.readText(); }
-    catch (e) { toast('Clipboard permission denied — use Ctrl+V', 'warn'); return null; }
-  }
-  async function writeClipboard(text) {
-    if (!text) { toast('Select text in the console first', 'warn'); return; }
-    if (!navigator.clipboard || !navigator.clipboard.writeText) { toast('Clipboard blocked — use Ctrl+C', 'warn'); return; }
-    try { await navigator.clipboard.writeText(text); toast('Copied', 'ok'); }
-    catch (e) { toast('Copy failed', 'err'); }
-  }
 
   // Small toolbar shown above each console.
   function ConsoleBar(children) {
     return h('div', { className: 'row', style: { gap: 6, marginBottom: 8, flexWrap: 'wrap' } }, children);
   }
 
-  const fmtBytes = (n) => {
-    n = Number(n) || 0; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
-    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
-    return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + ' ' + u[i];
-  };
   const fmtUptime = (s) => {
     s = Number(s) || 0; if (!s) return '—';
     const d = Math.floor(s / 86400), hh = Math.floor((s % 86400) / 3600), m = Math.floor((s % 3600) / 60);
@@ -39,10 +18,10 @@
   };
 
   // ---------- xterm serial console ----------
-  // Shared status pill for both consoles — maps connection status to a tone + dot.
+  // Shared status pill for both consoles — maps connection status to a badge tone.
   function ConsoleStatusBadge({ status, label }) {
     const tone = status === 'open' ? 'running' : status === 'connecting' ? 'working' : 'error';
-    return h('span', { className: 'badge ' + tone }, h('span', { className: 'dot ' + tone }), label);
+    return h(StatusBadge, { status: tone, label });
   }
 
   function VmConsole({ depId, tall }) {
@@ -92,7 +71,11 @@
       if (ws && ws.readyState === 1) ws.send('0:' + new TextEncoder().encode(text).length + ':' + text);
       if (termRef.current) termRef.current.focus();
     };
-    const copy = () => writeClipboard(termRef.current ? termRef.current.getSelection() : '');
+    const copy = () => {
+      const text = termRef.current ? termRef.current.getSelection() : '';
+      if (!text) { toast('Select text in the console first', 'warn'); return; }
+      copyToClipboard(text);
+    };
     const label = status === 'open' ? 'Connected' : status === 'connecting' ? 'Connecting…' : status === 'noterm' ? 'unavailable' : 'Disconnected';
     return h('div', null,
       h('div', { className: 'row', style: { marginBottom: 9, gap: 8 } },
@@ -171,7 +154,8 @@
       log.map((l, i) => h('div', { key: i, className: l.cls || '' }, l.text)));
   }
 
-  function Meter({ icon, label, value, pct, tone }) {
+  // Stat card with an optional bar — distinct from UI.Meter (the bare percentage bar).
+  function StatCard({ icon, label, value, pct, tone }) {
     return h('div', { className: 'card card-pad', style: { display: 'flex', flexDirection: 'column', gap: 9 } },
       h('div', { className: 'row', style: { color: 'var(--text-dim)' } },
         h(Icon, { name: icon, size: 15 }),
@@ -260,10 +244,10 @@
 
       // live metrics
       h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14, marginBottom: 16 } },
-        h(Meter, { icon: 'cpu', label: 'CPU', value: running ? (live.cpuPct + ' %') : '—', pct: running ? live.cpuPct : null }),
-        h(Meter, { icon: 'ram', label: 'Memory', value: running ? (fmtBytes(live.memUsed) + ' / ' + fmtBytes(live.memMax)) : '—', pct: memPct, tone: 'var(--info)' }),
-        h(Meter, { icon: 'disk', label: 'Disk', value: live.diskMax ? (fmtBytes(live.diskUsed) + ' / ' + fmtBytes(live.diskMax)) : '—', pct: diskPct, tone: 'var(--ok)' }),
-        h(Meter, { icon: 'clock', label: 'Uptime', value: running ? fmtUptime(live.uptime) : '—' })),
+        h(StatCard, { icon: 'cpu', label: 'CPU', value: running ? (live.cpuPct + ' %') : '—', pct: running ? live.cpuPct : null }),
+        h(StatCard, { icon: 'ram', label: 'Memory', value: running ? (fmtBytes(live.memUsed) + ' / ' + fmtBytes(live.memMax)) : '—', pct: memPct, tone: 'var(--info)' }),
+        h(StatCard, { icon: 'disk', label: 'Disk', value: live.diskMax ? (fmtBytes(live.diskUsed) + ' / ' + fmtBytes(live.diskMax)) : '—', pct: diskPct, tone: 'var(--ok)' }),
+        h(StatCard, { icon: 'clock', label: 'Uptime', value: running ? fmtUptime(live.uptime) : '—' })),
 
       // console (toggle between the Proxmox graphical console and the serial console)
       showConsole && h('div', { className: 'card card-pad', style: { marginBottom: 16 } },

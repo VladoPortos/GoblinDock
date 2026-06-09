@@ -26,22 +26,63 @@
     );
   }
 
+  // ---- shared clipboard helpers ----
+  // The async clipboard API needs a secure context (https or localhost) + a user
+  // gesture; writes fall back to a hidden textarea + execCommand. One implementation
+  // for every copy/paste in the app.
+  async function writeClipboardRaw(text) {
+    const t = String(text == null ? '' : text);
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      try { await navigator.clipboard.writeText(t); return true; } catch (e) { /* fall through */ }
+    }
+    try {
+      const ta = document.createElement('textarea');
+      ta.value = t; ta.style.position = 'fixed'; ta.style.opacity = '0';
+      document.body.appendChild(ta); ta.select(); document.execCommand('copy');
+      document.body.removeChild(ta); return true;
+    } catch (e) { return false; }
+  }
+  function copyToClipboard(text, okMsg) {
+    return writeClipboardRaw(text).then((ok) =>
+      window.GDStore.toast(ok ? (okMsg || 'Copied') : 'Clipboard blocked — use Ctrl+C', ok ? 'ok' : 'warn'));
+  }
+  async function readClipboard() {
+    if (!navigator.clipboard || !navigator.clipboard.readText) {
+      window.GDStore.toast('Clipboard blocked by the browser — use Ctrl+V', 'warn'); return null;
+    }
+    try { return await navigator.clipboard.readText(); }
+    catch (e) { window.GDStore.toast('Clipboard permission denied — use Ctrl+V', 'warn'); return null; }
+  }
+
+  const fmtBytes = (n) => {
+    n = Number(n) || 0; const u = ['B', 'KB', 'MB', 'GB', 'TB']; let i = 0;
+    while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+    return (i === 0 ? n : n.toFixed(n < 10 ? 1 : 0)) + ' ' + u[i];
+  };
+
+  // Fetch-on-mount hook with cancel-on-unmount: runs `fn` whenever `deps` change,
+  // ignores stale results after unmount/re-run, resolves to `errValue` on failure.
+  // Returns null while loading.
+  function useFetched(fn, deps, errValue) {
+    const [data, setData] = React.useState(null);
+    React.useEffect(() => {
+      let live = true;
+      setData(null);
+      Promise.resolve().then(fn)
+        .then((d) => { if (live) setData(d); })
+        .catch(() => { if (live) setData(errValue === undefined ? null : errValue); });
+      return () => { live = false; };
+    }, deps);
+    return data;
+  }
+
   function CopyField({ value, mono = true }) {
     const [copied, setCopied] = useState(false);
     const doCopy = (e) => {
       e.stopPropagation();
-      const text = String(value == null ? '' : value);
-      const ok = () => { setCopied(true); setTimeout(() => setCopied(false), 1100); };
-      if (navigator.clipboard && navigator.clipboard.writeText) {
-        navigator.clipboard.writeText(text).then(ok).catch(() => {});
-      } else {
-        try {
-          const ta = document.createElement('textarea');
-          ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
-          document.body.appendChild(ta); ta.select(); document.execCommand('copy');
-          document.body.removeChild(ta); ok();
-        } catch (x) { /* ignore */ }
-      }
+      writeClipboardRaw(value).then((ok) => {
+        if (ok) { setCopied(true); setTimeout(() => setCopied(false), 1100); }
+      });
     };
     return React.createElement('span', {
       className: 'copy' + (mono ? ' mono' : ''), onClick: doCopy, title: 'Copy',
@@ -277,5 +318,6 @@
     Field, TextArea, SelectField, Toggle, TagInput, FormModal,
     collectAsks, initAskAnswers, asksMissing, AskInputs,
     SizeField,
+    copyToClipboard, readClipboard, fmtBytes, useFetched,
   };
 })();

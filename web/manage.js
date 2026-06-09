@@ -3,11 +3,21 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { Menu, ConfirmModal, FormModal, Field, TextArea, SelectField, Toggle } = window.UI;
+  const { Menu, ConfirmModal, FormModal, Field, TextArea, SelectField, Toggle, fmtBytes, useFetched } = window.UI;
   const h = React.createElement;
 
   const refresh = () => window.GDStore.refresh().catch(() => {});
   const toast = (m, t) => window.GDStore.toast(m, t);
+
+  // Secrets and Variables share the UPPER_SNAKE name rule and the Global/Personal
+  // scope selector — one copy each instead of a clone per modal.
+  const normName = (v) => v.toUpperCase().replace(/[^A-Z0-9_]/g, '_');
+  function ScopeField({ scope, setScope }) {
+    return h('div', null, h('label', { className: 'field-label' }, 'Scope'),
+      h('div', { className: 'seg', style: { width: '100%' } },
+        h('button', { className: scope === 'global' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setScope('global') }, 'Global'),
+        h('button', { className: scope === 'user' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setScope('user') }, 'Personal')));
+  }
 
   /* ============ BLOCKS LIBRARY ============ */
   function BlocksLib() {
@@ -105,12 +115,9 @@
       } catch (e) { toast(e.message || 'failed', 'err'); setBusy(false); }
     };
     return h(FormModal, { title: editing ? 'Edit secret' : 'Add secret', icon: 'lock', onClose, onSubmit: submit, busy, submitLabel: editing ? 'Save' : 'Add secret' },
-      h(Field, { label: 'Name', value: name, onChange: (v) => setName(v.toUpperCase().replace(/[^A-Z0-9_]/g, '_')), mono: true, placeholder: 'TEAM_SSH_PUBKEY' }),
+      h(Field, { label: 'Name', value: name, onChange: (v) => setName(normName(v)), mono: true, placeholder: 'TEAM_SSH_PUBKEY' }),
       h(TextArea, { label: editing ? 'New value' : 'Value', value, onChange: setValue, rows: 4, mono: true }),
-      !editing && isAdmin && h('div', null, h('label', { className: 'field-label' }, 'Scope'),
-        h('div', { className: 'seg', style: { width: '100%' } },
-          h('button', { className: scope === 'global' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setScope('global') }, 'Global'),
-          h('button', { className: scope === 'user' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setScope('user') }, 'Personal'))),
+      !editing && isAdmin && h(ScopeField, { scope, setScope }),
       h('p', { className: 'hint', style: { fontSize: 11.5 } }, 'Reference in blocks as ', h('code', { className: 'kbd' }, '{{ secrets.' + (name || 'NAME') + ' }}'), '.'));
   }
 
@@ -161,12 +168,9 @@
       } catch (e) { toast(e.message || 'failed', 'err'); setBusy(false); }
     };
     return h(FormModal, { title: editing ? 'Edit variable' : 'Add variable', icon: 'tag', onClose, onSubmit: submit, busy, submitLabel: editing ? 'Save' : 'Add variable' },
-      h(Field, { label: 'Name', value: name, onChange: (v) => setName(v.toUpperCase().replace(/[^A-Z0-9_]/g, '_')), mono: true, placeholder: 'APP_PORT' }),
+      h(Field, { label: 'Name', value: name, onChange: (v) => setName(normName(v)), mono: true, placeholder: 'APP_PORT' }),
       h(TextArea, { label: 'Value', value, onChange: setValue, rows: 3, mono: true }),
-      !editing && isAdmin && h('div', null, h('label', { className: 'field-label' }, 'Scope'),
-        h('div', { className: 'seg', style: { width: '100%' } },
-          h('button', { className: scope === 'global' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setScope('global') }, 'Global'),
-          h('button', { className: scope === 'user' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setScope('user') }, 'Personal'))),
+      !editing && isAdmin && h(ScopeField, { scope, setScope }),
       h('p', { className: 'hint', style: { fontSize: 11.5 } }, 'Reference in blocks as ', h('code', { className: 'kbd' }, '{{ variable.' + (name || 'NAME') + ' }}'), '.'));
   }
 
@@ -285,14 +289,7 @@
   }
 
   function NodeGauge({ connId }) {
-    const [cap, setCap] = React.useState(null);
-    React.useEffect(() => {
-      let live = true;
-      window.API.connectionCapacity(connId)
-        .then((c) => { if (live) setCap(c); })
-        .catch(() => { if (live) setCap({ online: false }); });
-      return () => { live = false; };
-    }, [connId]);
+    const cap = useFetched(() => window.API.connectionCapacity(connId), [connId], { online: false });
     if (!cap) return h('div', { className: 'hint mono', style: { fontSize: 11 } }, 'checking capacity…');
     if (!cap.online) return h('div', { className: 'hint mono', style: { fontSize: 11, opacity: 0.6 } }, 'node offline');
     const bar = (label, used, total) => h('div', { style: { marginTop: 4 } },
@@ -556,7 +553,6 @@
       catch (e) { toast(e.message || 'backup failed', 'err'); }
       setBusy(false);
     };
-    const fmtBytes = (n) => (n >= 1048576 ? (n / 1048576).toFixed(1) + ' MB' : Math.max(1, Math.round(n / 1024)) + ' KB');
     const fmtTs = (iso) => { try { return new Date(iso).toLocaleString(); } catch (e) { return iso; } };
     if (data === null) return h('div', { className: 'card', style: { padding: 30, textAlign: 'center', color: 'var(--text-faint)' } }, 'Loading…');
     const list = data.backups || [];

@@ -10,7 +10,7 @@ import re
 import socket
 import threading
 import time
-from datetime import timedelta, timezone
+from datetime import timedelta
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -38,6 +38,7 @@ from .models import (
     Secret,
     Variable,
     User,
+    ensure_utc,
     utcnow,
 )
 from .proxmox import Proxmox, base_disk_filename
@@ -223,6 +224,17 @@ def _network_ctx(session: Session, net: Network, dep_id: int) -> dict:
     return ctx
 
 
+def _build_job_ctx(session: Session, base: Image, cpu: int, ram: int, disk: int,
+                   net: Optional[Network], dep_id: int) -> str:
+    """The full worker job context shared by deploy and rebuild: image source,
+    sizing, and network (no network => plain DHCP)."""
+    ctx = {"src_url": base.source_url, "checksum": base.checksum or "",
+           "checksum_algorithm": _checksum_algo(base.checksum or ""),
+           "cpu": cpu, "ram": ram, "disk": disk}
+    ctx.update(_network_ctx(session, net, dep_id) if net else {"network_mode": "dhcp"})
+    return json.dumps(ctx)
+
+
 # --------------------------------------------------------------------------- #
 # helpers                                                                      #
 # --------------------------------------------------------------------------- #
@@ -252,6 +264,16 @@ def _scoped_owned(obj, user: User) -> bool:
     if obj.scope == "global":
         return user.role == "admin"
     return obj.owner_id == user.id or user.role == "admin"
+
+
+def _owned_deployment(session: Session, dep_id: int, user: User) -> Deployment:
+    """Fetch a deployment and enforce the owner-or-admin rule (404 / 403)."""
+    dep = session.get(Deployment, dep_id)
+    if not dep:
+        raise HTTPException(404, "not found")
+    if dep.owner_id != user.id and user.role != "admin":
+        raise HTTPException(403, "not your VM")
+    return dep
 
 
 # --------------------------------------------------------------------------- #
@@ -337,9 +359,7 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     # blunting password-spray and proxy-IP-collapsed brute force. SQLite returns the
     # stored datetime as naive, so normalise to UTC before comparing with utcnow().
     if user and user.locked_until:
-        lu = user.locked_until
-        if lu.tzinfo is None:
-            lu = lu.replace(tzinfo=timezone.utc)
+        lu = ensure_utc(user.locked_until)
         if lu > utcnow():
             raise HTTPException(429, "account temporarily locked — try again later")
     if not user or user.disabled or not verify_password(body.password, user.password_hash):
@@ -623,14 +643,9 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
     session.commit()
     session.refresh(dep)
 
-    ctx = {"src_url": base.source_url, "checksum": base.checksum or "",
-           "checksum_algorithm": _checksum_algo(base.checksum or ""),
-           "cpu": cpu, "ram": ram, "disk": disk}
-    ctx.update(_network_ctx(session, net, dep.id))
-
     job = Job(type="deploy", title=f"Deploying {name}", deployment_id=dep.id,
               connection_id=conn.id, created_by=user.id, status="queued",
-              context_json=json.dumps(ctx))
+              context_json=_build_job_ctx(session, base, cpu, ram, disk, net, dep.id))
     session.add(job)
     record_audit(session, user, "deploy", "deployment", dep.id, name)
     session.commit()
@@ -646,11 +661,7 @@ class ActionBody(BaseModel):
 @router.post("/deployments/{dep_id}/action")
 def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
               session: Session = Depends(get_session)):
-    dep = session.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "not found")
-    if dep.owner_id != user.id and user.role != "admin":
-        raise HTTPException(403, "not your VM")
+    dep = _owned_deployment(session, dep_id, user)
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
@@ -675,11 +686,7 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
 
 @router.post("/deployments/{dep_id}/rebuild")
 def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    dep = session.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "not found")
-    if dep.owner_id != user.id and user.role != "admin":
-        raise HTTPException(403, "not your VM")
+    dep = _owned_deployment(session, dep_id, user)
     if not dep.template_id:
         raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
     tpl = session.get(Template, dep.template_id)
@@ -693,13 +700,9 @@ def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session
     # it looks up the deployment_id and returns the same IP, so no new address is
     # allocated and the VM keeps its reserved static IP after the rebuild.
     net = session.get(Network, dep.network_id) if dep.network_id else None
-    ctx = {"src_url": base.source_url, "checksum": base.checksum or "",
-           "checksum_algorithm": _checksum_algo(base.checksum or ""),
-           "cpu": dep.cpu, "ram": dep.ram, "disk": dep.disk}
-    ctx.update(_network_ctx(session, net, dep.id) if net else {"network_mode": "dhcp"})
     job = Job(type="rebuild", title=f"Rebuilding {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
-              context_json=json.dumps(ctx))
+              context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id))
     session.add(job)
     session.commit()
     session.refresh(job)
@@ -709,11 +712,7 @@ def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session
 
 @router.delete("/deployments/{dep_id}")
 def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    dep = session.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "not found")
-    if dep.owner_id != user.id and user.role != "admin":
-        raise HTTPException(403, "not your VM")
+    dep = _owned_deployment(session, dep_id, user)
     dep.status = "working"
     session.add(dep)
     job = Job(type="destroy", title=f"Destroying {dep.name}", deployment_id=dep.id,
@@ -740,11 +739,7 @@ def _iface_summary(ifaces) -> list:
 
 @router.get("/vms/{dep_id}/detail")
 def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    dep = session.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "not found")
-    if dep.owner_id != user.id and user.role != "admin":
-        raise HTTPException(403, "not your VM")
+    dep = _owned_deployment(session, dep_id, user)
     conn = session.get(Connection, dep.connection_id)
     img = session.get(Image, dep.image_id) if dep.image_id else None
     tpl = session.get(Template, dep.template_id) if dep.template_id else None
@@ -850,35 +845,61 @@ async def _pump_ws(websocket: WebSocket, pve, prefer_bytes: bool) -> None:
     await asyncio.gather(browser_to_pve(), pve_to_browser())
 
 
-@router.websocket("/vms/{dep_id}/console")
-async def vm_console(websocket: WebSocket, dep_id: int):
-    """Bridge the browser's xterm to the VM's serial console. We open a Proxmox
-    termproxy (authenticated with our API token, kept server-side) and pipe bytes;
-    the browser only ever talks to GoblinDock."""
-    # Check origin + authn/authz BEFORE accepting the handshake — an unauthorized or
-    # cross-site peer is rejected at the HTTP layer and never completes the upgrade.
+async def _ws_authorized_dep(websocket: WebSocket, dep_id: int):
+    """Shared console-WS handshake guard: origin check + session auth + deployment
+    ownership, all BEFORE accepting the upgrade — an unauthorized or cross-site peer
+    is rejected at the HTTP layer and never completes the upgrade. Returns a detached
+    (conn, dep) pair, or (None, None) after closing the socket."""
     if not _ws_origin_ok(websocket):
         await websocket.close(code=4403)
-        return
+        return None, None
     uid = websocket.session.get("uid")
     with Session(engine) as s:
         user = s.get(User, uid) if uid else None
         dep = s.get(Deployment, dep_id)
         if (not user or user.disabled or websocket.session.get("sv", 0) != user.session_epoch
-                or not dep or not dep.connection_id or not dep.vmid
-                or (dep.owner_id != user.id and user.role != "admin")):
+                or not dep or (dep.owner_id != user.id and user.role != "admin")):
             await websocket.close(code=4403)
-            return
+            return None, None
         c = s.get(Connection, dep.connection_id)
         conn = Connection(**c.model_dump()) if c else None
-        vmid, node = dep.vmid, dep.node or (c.node if c else "")
+        dep = Deployment(**dep.model_dump())
     if not conn:
         await websocket.close(code=4404)
-        return
-    _subs = websocket.scope.get("subprotocols") or []
-    await websocket.accept(subprotocol="binary" if "binary" in _subs else None)
+        return None, None
+    return conn, dep
 
+
+async def _accept_binary(websocket: WebSocket) -> None:
+    subs = websocket.scope.get("subprotocols") or []
+    await websocket.accept(subprotocol="binary" if "binary" in subs else None)
+
+
+def _pve_ws_kwargs(px: Proxmox, conn: Connection) -> dict:
+    """Common kwargs for the server-side websocket to Proxmox (token auth + TLS)."""
     import ssl as _ssl
+    ctx = _ssl.create_default_context()
+    if not conn.verify_tls:
+        ctx.check_hostname = False
+        ctx.verify_mode = _ssl.CERT_NONE
+    return {"additional_headers": {"Authorization": px.token_auth_header()},
+            "ssl": ctx, "subprotocols": ["binary"], "max_size": None, "open_timeout": 15}
+
+
+@router.websocket("/vms/{dep_id}/console")
+async def vm_console(websocket: WebSocket, dep_id: int):
+    """Bridge the browser's xterm to the VM's serial console. We open a Proxmox
+    termproxy (authenticated with our API token, kept server-side) and pipe bytes;
+    the browser only ever talks to GoblinDock."""
+    conn, dep = await _ws_authorized_dep(websocket, dep_id)
+    if not conn:
+        return
+    if not dep.vmid:
+        await websocket.close(code=4403)
+        return
+    vmid, node = dep.vmid, dep.node or conn.node
+    await _accept_binary(websocket)
+
     import websockets as _ws
 
     try:
@@ -887,14 +908,8 @@ async def vm_console(websocket: WebSocket, dep_id: int):
         px.ensure_serial(vmid, node)
         tp = px.termproxy(vmid, node)
         ticket, port, puser = tp.get("ticket"), tp.get("port"), tp.get("user")
-        ctx = _ssl.create_default_context()
-        if not conn.verify_tls:
-            ctx.check_hostname = False
-            ctx.verify_mode = _ssl.CERT_NONE
         async with _ws.connect(
-            px.console_ws_url(vmid, node, port, ticket),
-            additional_headers={"Authorization": px.token_auth_header()},
-            ssl=ctx, subprotocols=["binary"], max_size=None, open_timeout=15,
+            px.console_ws_url(vmid, node, port, ticket), **_pve_ws_kwargs(px, conn),
         ) as pve:
             await pve.send(f"{puser}:{ticket}\n")
             await _pump_ws(websocket, pve, prefer_bytes=False)
@@ -914,17 +929,12 @@ async def vm_console(websocket: WebSocket, dep_id: int):
 # then consumed by the websocket. noVNC needs the VNC ticket (as password) up front,
 # so we hand it to the browser via the HTTP call and keep the same proxy session for
 # the websocket (keyed by a one-time token).
-import time as _time
 _VNC_SESS: dict = {}
 
 
 @router.post("/vms/{dep_id}/vncproxy")
 def vm_vncproxy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    dep = session.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "not found")
-    if dep.owner_id != user.id and user.role != "admin":
-        raise HTTPException(403, "not your VM")
+    dep = _owned_deployment(session, dep_id, user)
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
@@ -935,7 +945,7 @@ def vm_vncproxy(dep_id: int, user: User = Depends(current_user), session: Sessio
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"proxmox: {e}")
     import secrets as _secrets
-    now = _time.time()
+    now = time.time()
     for k in [k for k, v in list(_VNC_SESS.items()) if v["exp"] < now]:
         _VNC_SESS.pop(k, None)
     tok = _secrets.token_urlsafe(24)
@@ -946,42 +956,23 @@ def vm_vncproxy(dep_id: int, user: User = Depends(current_user), session: Sessio
 
 @router.websocket("/vms/{dep_id}/vnc")
 async def vm_vnc(websocket: WebSocket, dep_id: int):
-    if not _ws_origin_ok(websocket):
-        await websocket.close(code=4403)
-        return
-    uid = websocket.session.get("uid")
     tok = websocket.query_params.get("t")
     sess = _VNC_SESS.pop(tok, None) if tok else None
-    with Session(engine) as s:
-        user = s.get(User, uid) if uid else None
-        dep = s.get(Deployment, dep_id)
-        if (not user or user.disabled or websocket.session.get("sv", 0) != user.session_epoch
-                or not dep or not sess or sess.get("dep_id") != dep_id
-                or sess.get("exp", 0) < _time.time()
-                or (dep.owner_id != user.id and user.role != "admin")):
-            await websocket.close(code=4403)
-            return
-        c = s.get(Connection, dep.connection_id)
-        conn = Connection(**c.model_dump()) if c else None
+    conn, _dep = await _ws_authorized_dep(websocket, dep_id)
     if not conn:
-        await websocket.close(code=4404)
         return
-    _subs = websocket.scope.get("subprotocols") or []
-    await websocket.accept(subprotocol="binary" if "binary" in _subs else None)
+    if not sess or sess.get("dep_id") != dep_id or sess.get("exp", 0) < time.time():
+        await websocket.close(code=4403)
+        return
+    await _accept_binary(websocket)
 
-    import ssl as _ssl
     import websockets as _ws
 
     try:
         px = Proxmox(conn)
-        ctx = _ssl.create_default_context()
-        if not conn.verify_tls:
-            ctx.check_hostname = False
-            ctx.verify_mode = _ssl.CERT_NONE
         async with _ws.connect(
             px.console_ws_url(sess["vmid"], sess["node"], sess["port"], sess["ticket"]),
-            additional_headers={"Authorization": px.token_auth_header()},
-            ssl=ctx, subprotocols=["binary"], max_size=None, open_timeout=15,
+            **_pve_ws_kwargs(px, conn),
         ) as pve:
             await _pump_ws(websocket, pve, prefer_bytes=True)
     except Exception:  # noqa: BLE001
@@ -1235,9 +1226,7 @@ def del_secret(sec_id: int, user: User = Depends(current_user), session: Session
     sec = session.get(Secret, sec_id)
     if not sec:
         raise HTTPException(404, "not found")
-    if sec.scope == "global" and user.role != "admin":
-        raise HTTPException(403, "admin only")
-    if sec.scope == "user" and sec.owner_id != user.id and user.role != "admin":
+    if not _scoped_owned(sec, user):
         raise HTTPException(403, "not yours")
     session.delete(sec)
     session.commit()
@@ -1252,14 +1241,12 @@ def reveal_secret(sec_id: int, response: Response, user: User = Depends(current_
     sec = session.get(Secret, sec_id)
     if not sec:
         raise HTTPException(404, "not found")
-    if sec.scope == "global" and user.role != "admin":
-        raise HTTPException(403, "admin only")
-    if sec.scope == "user" and sec.owner_id != user.id and user.role != "admin":
+    if not _scoped_owned(sec, user):
         raise HTTPException(403, "not yours")
     response.headers["Cache-Control"] = "no-store"
     record_audit(session, user, "secret.reveal", "secret", sec.id, sec.name)
     session.commit()
-    users, _ = _maps(session)
+    users = {u.id: u for u in session.exec(select(User)).all()}
     return S.secret_dict(sec, users, reveal=True)
 
 
@@ -2270,11 +2257,7 @@ class DeploymentPatchBody(BaseModel):
 @router.patch("/deployments/{dep_id}")
 def patch_deployment(dep_id: int, body: DeploymentPatchBody, user: User = Depends(current_user),
                      session: Session = Depends(get_session)):
-    dep = session.get(Deployment, dep_id)
-    if not dep:
-        raise HTTPException(404, "not found")
-    if dep.owner_id != user.id and user.role != "admin":
-        raise HTTPException(403, "not your VM")
+    dep = _owned_deployment(session, dep_id, user)
     if body.name is not None and body.name.strip():
         dep.name = _clean_name(body.name)
     if body.tags is not None:
