@@ -375,8 +375,8 @@ BUILTIN_BLOCKS = [
         cloudinit="docker run -d --name {name} --restart {restart} {image}",
     ),
     dict(
-        key="b-pgdb", name="PostgreSQL DB + User", category="Services", icon="sliders",
-        section="Install", description="create a database + user (community.postgresql)",
+        key="b-pgdb", name="PostgreSQL DB + User", category="Databases", icon="sliders",
+        section="Install", description="create a database + user (needs PostgreSQL Server; community.postgresql)",
         input_schema=[
             {"name": "db", "type": "text", "default": "appdb", "label": "Database"},
             {"name": "user", "type": "text", "default": "appuser", "label": "User"},
@@ -533,11 +533,443 @@ BUILTIN_BLOCKS = [
         ),
         cloudinit="echo {user}:{password} | chpasswd\npasswd -u {user} 2>/dev/null || true",
     ),
+
+    # ---- networking ----
+    dict(
+        key="b-tailscale", name="Tailscale", category="Networking", icon="globe",
+        section="Install", description="join your tailnet at deploy (auth key)",
+        input_schema=[
+            {"name": "authkey", "type": "secret", "default": "{{ secrets.TAILSCALE_AUTHKEY }}", "label": "Auth key"},
+            {"name": "tailscale_ssh", "type": "bool", "default": False, "label": "Enable Tailscale SSH"},
+            # extra `tailscale up` flags (e.g. --advertise-tags) — intentionally raw, like Run Script
+            {"name": "args", "type": "code", "default": "", "label": "Extra `tailscale up` flags · optional"},
+        ],
+        ansible=(
+            "- name: Install Tailscale\n"
+            "  ansible.builtin.shell: curl -fsSL https://tailscale.com/install.sh | sh\n"
+            "- name: Join tailnet\n"
+            "  ansible.builtin.shell: |\n"
+            "    if {tailscale_ssh}; then tailscale up --auth-key={authkey_q} --ssh {args}; else tailscale up --auth-key={authkey_q} {args}; fi\n"
+            "  when: {authkey_set}"
+        ),
+        cloudinit=(
+            "curl -fsSL https://tailscale.com/install.sh | sh\n"
+            "if {tailscale_ssh}; then tailscale up --auth-key={authkey} --ssh; else tailscale up --auth-key={authkey}; fi"
+        ),
+    ),
+    dict(
+        key="b-k3s", name="K3s Node", category="Networking", icon="network",
+        section="Install", description="single-node k3s server, or an agent joining a cluster",
+        input_schema=[
+            {"name": "role", "type": "select", "options": ["server", "agent"], "default": "server", "label": "Role"},
+            {"name": "server_url", "type": "text", "default": "", "label": "Server URL (agent) · https://host:6443", "optional": True},
+            {"name": "token", "type": "secret", "default": "", "label": "Join token (agent / extra servers)", "optional": True},
+        ],
+        ansible=(
+            "- name: Install K3s\n"
+            "  ansible.builtin.shell: |\n"
+            "    if [ {role_q} = agent ]; then\n"
+            "      curl -sfL https://get.k3s.io | K3S_URL={server_url_q} K3S_TOKEN={token_q} sh -s - agent\n"
+            "    elif [ -n {token_q} ]; then\n"
+            "      curl -sfL https://get.k3s.io | K3S_TOKEN={token_q} sh -s - server\n"
+            "    else\n"
+            "      curl -sfL https://get.k3s.io | sh -s - server\n"
+            "    fi"
+        ),
+        cloudinit="curl -sfL https://get.k3s.io | sh -s - server",
+    ),
+
+    # ---- security ----
+    dict(
+        key="b-sshharden", name="SSH Hardening", category="Security", icon="shield",
+        section="Configure", description="root login / password auth / port / allowed users",
+        input_schema=[
+            {"name": "permit_root", "type": "bool", "default": False, "label": "Permit root login"},
+            {"name": "password_auth", "type": "bool", "default": False, "label": "Allow password auth"},
+            {"name": "port", "type": "text", "default": "22", "label": "SSH port"},
+            {"name": "allow_users", "type": "text", "default": "", "label": "AllowUsers (space-separated, empty = all)", "optional": True},
+        ],
+        # 00-goblindock-hardening sorts before 00-goblindock.conf ('-' < '.'), so on a
+        # conflict with the password-login toggle of b-ssh/b-user the hardening wins.
+        ansible=(
+            "- name: SSH Hardening\n"
+            "  ansible.builtin.shell: |\n"
+            "    conf=/etc/ssh/sshd_config.d/00-goblindock-hardening.conf\n"
+            "    : > \"$conf\"\n"
+            "    if {permit_root}; then echo 'PermitRootLogin yes' >> \"$conf\"; else echo 'PermitRootLogin no' >> \"$conf\"; fi\n"
+            "    if {password_auth}; then echo 'PasswordAuthentication yes' >> \"$conf\"; else echo 'PasswordAuthentication no' >> \"$conf\"; fi\n"
+            "    echo Port {port_q} >> \"$conf\"\n"
+            "    if [ -n {allow_users_q} ]; then echo AllowUsers {allow_users_q} >> \"$conf\"; fi\n"
+            "    sshd -t\n"
+            "    systemctl restart ssh || systemctl restart sshd"
+        ),
+        cloudinit=(
+            "conf=/etc/ssh/sshd_config.d/00-goblindock-hardening.conf\n"
+            "if {permit_root}; then echo 'PermitRootLogin yes' > \"$conf\"; else echo 'PermitRootLogin no' > \"$conf\"; fi\n"
+            "if {password_auth}; then echo 'PasswordAuthentication yes' >> \"$conf\"; else echo 'PasswordAuthentication no' >> \"$conf\"; fi\n"
+            "echo Port {port} >> \"$conf\"\n"
+            "if [ -n {allow_users} ]; then echo AllowUsers {allow_users} >> \"$conf\"; fi\n"
+            "sshd -t && systemctl restart ssh || systemctl restart sshd"
+        ),
+    ),
+    dict(
+        key="b-fail2ban", name="Fail2ban", category="Security", icon="shield",
+        section="Install", description="brute-force protection with an sshd jail",
+        input_schema=[
+            {"name": "bantime", "type": "text", "default": "1h", "label": "Ban time"},
+            {"name": "maxretry", "type": "text", "default": "5", "label": "Max retries"},
+            {"name": "extra", "type": "code", "default": "", "label": "Extra jail.local lines · optional"},
+        ],
+        ansible=(
+            "- name: Install Fail2ban\n"
+            "  ansible.builtin.apt:\n"
+            "    name: fail2ban\n"
+            "    state: present\n"
+            "    update_cache: true\n"
+            "- name: Fail2ban sshd jail\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /etc/fail2ban/jail.d/goblindock.local\n"
+            "    mode: \"0644\"\n"
+            "    content: |\n"
+            "      [sshd]\n"
+            "      enabled = true\n"
+            "      bantime = {bantime}\n"
+            "      maxretry = {maxretry}\n"
+            "      {extra}\n"
+            "- name: Enable Fail2ban\n"
+            "  ansible.builtin.service:\n"
+            "    name: fail2ban\n"
+            "    enabled: true\n"
+            "    state: restarted"
+        ),
+        cloudinit=(
+            "apt-get install -y fail2ban\n"
+            "printf '[sshd]\\nenabled = true\\nbantime = %s\\nmaxretry = %s\\n' {bantime} {maxretry} > /etc/fail2ban/jail.d/goblindock.local\n"
+            "systemctl enable --now fail2ban && systemctl restart fail2ban"
+        ),
+    ),
+    dict(
+        key="b-cacert", name="Trust Internal CA", category="Security", icon="lock",
+        section="Configure", description="install a CA certificate into the system trust store",
+        input_schema=[
+            {"name": "name", "type": "text", "default": "internal-ca", "label": "Name (filename)"},
+            {"name": "pem", "type": "code", "default": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----", "label": "CA certificate (PEM)"},
+        ],
+        ansible=(
+            "- name: Install CA certificate\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /usr/local/share/ca-certificates/{name}.crt\n"
+            "    mode: \"0644\"\n"
+            "    content: |\n"
+            "      {pem}\n"
+            "- name: Update trust store\n"
+            "  ansible.builtin.shell: update-ca-certificates"
+        ),
+        cloudinit="cat > /usr/local/share/ca-certificates/{name}.crt <<'GDEOF'\n{pem}\nGDEOF\nupdate-ca-certificates",
+    ),
+    dict(
+        key="b-autoupdates", name="Unattended Upgrades", category="Security", icon="refresh",
+        section="Configure", description="automatic security updates (optional auto-reboot)",
+        input_schema=[
+            {"name": "auto_reboot", "type": "bool", "default": False, "label": "Auto-reboot when required"},
+            {"name": "reboot_time", "type": "text", "default": "03:00", "label": "Reboot time"},
+        ],
+        ansible=(
+            "- name: Install unattended-upgrades\n"
+            "  ansible.builtin.apt:\n"
+            "    name: unattended-upgrades\n"
+            "    state: present\n"
+            "    update_cache: true\n"
+            "- name: Enable periodic upgrades\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /etc/apt/apt.conf.d/20auto-upgrades\n"
+            "    mode: \"0644\"\n"
+            "    content: |\n"
+            "      APT::Periodic::Update-Package-Lists \"1\";\n"
+            "      APT::Periodic::Unattended-Upgrade \"1\";\n"
+            "- name: Auto-reboot policy\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /etc/apt/apt.conf.d/51goblindock-reboot\n"
+            "    mode: \"0644\"\n"
+            "    content: |\n"
+            "      Unattended-Upgrade::Automatic-Reboot \"true\";\n"
+            "      Unattended-Upgrade::Automatic-Reboot-Time \"{reboot_time}\";\n"
+            "  when: {auto_reboot}"
+        ),
+        cloudinit=(
+            "apt-get install -y unattended-upgrades\n"
+            "printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades\n"
+            "if {auto_reboot}; then printf 'Unattended-Upgrade::Automatic-Reboot \"true\";\\nUnattended-Upgrade::Automatic-Reboot-Time \"%s\";\\n' {reboot_time} > /etc/apt/apt.conf.d/51goblindock-reboot; fi"
+        ),
+    ),
+
+    # ---- docker extras (pair with the Docker CE block) ----
+    dict(
+        key="b-compose", name="Docker Compose Stack", category="Docker", icon="docker",
+        section="Install", description="deploy a compose stack to /opt/<name> (needs Docker CE)",
+        input_schema=[
+            {"name": "name", "type": "text", "default": "app", "label": "Stack name"},
+            {"name": "compose", "type": "code",
+             "default": "services:\n  web:\n    image: nginx:latest\n    ports:\n      - \"8080:80\"\n    restart: unless-stopped\n",
+             "label": "compose.yml"},
+            {"name": "env", "type": "code", "default": "", "label": ".env · optional"},
+        ],
+        ansible=(
+            "- name: Stack directory\n"
+            "  ansible.builtin.file:\n"
+            "    path: /opt/{name}\n"
+            "    state: directory\n"
+            "    mode: \"0755\"\n"
+            "- name: Write compose.yml\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /opt/{name}/compose.yml\n"
+            "    mode: \"0644\"\n"
+            "    content: |\n"
+            "      {compose}\n"
+            "- name: Write .env\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /opt/{name}/.env\n"
+            "    mode: \"0600\"\n"
+            "    content: |\n"
+            "      {env}\n"
+            "  when: {env_set}\n"
+            "- name: Compose up\n"
+            "  ansible.builtin.shell: docker compose up -d\n"
+            "  args:\n"
+            "    chdir: /opt/{name}"
+        ),
+        cloudinit=(
+            "install -d /opt/{name}\n"
+            "cat > /opt/{name}/compose.yml <<'GDEOF'\n{compose}\nGDEOF\n"
+            "cd /opt/{name} && docker compose up -d"
+        ),
+    ),
+    dict(
+        key="b-watchtower", name="Watchtower", category="Docker", icon="refresh",
+        section="Install", description="auto-update running containers (needs Docker CE)",
+        input_schema=[
+            {"name": "interval", "type": "text", "default": "86400", "label": "Poll interval (seconds)"},
+            {"name": "cleanup", "type": "bool", "default": True, "label": "Remove old images"},
+        ],
+        ansible=(
+            "- name: Run Watchtower\n"
+            "  ansible.builtin.shell: |\n"
+            "    docker rm -f watchtower 2>/dev/null || true\n"
+            "    extra=''\n"
+            "    if {cleanup}; then extra=--cleanup; fi\n"
+            "    docker run -d --name watchtower --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower --interval {interval_q} $extra"
+        ),
+        cloudinit=(
+            "docker rm -f watchtower 2>/dev/null || true\n"
+            "docker run -d --name watchtower --restart unless-stopped -v /var/run/docker.sock:/var/run/docker.sock containrrr/watchtower --interval {interval}"
+        ),
+    ),
+    dict(
+        key="b-portaineragent", name="Portainer Agent", category="Docker", icon="docker",
+        section="Install", description="let an existing Portainer manage this VM (needs Docker CE)",
+        input_schema=[
+            {"name": "port", "type": "text", "default": "9001", "label": "Agent port"},
+        ],
+        ansible=(
+            "- name: Run Portainer Agent\n"
+            "  ansible.builtin.shell: |\n"
+            "    docker rm -f portainer_agent 2>/dev/null || true\n"
+            "    docker run -d --name portainer_agent --restart always -p {port_q}:9001 -v /var/run/docker.sock:/var/run/docker.sock -v /var/lib/docker/volumes:/var/lib/docker/volumes portainer/agent:latest"
+        ),
+        cloudinit="docker run -d --name portainer_agent --restart always -p {port}:9001 -v /var/run/docker.sock:/var/run/docker.sock -v /var/lib/docker/volumes:/var/lib/docker/volumes portainer/agent:latest",
+    ),
+
+    # ---- storage / databases ----
+    dict(
+        key="b-mountshare", name="Mount Network Share", category="Files", icon="disk",
+        section="Configure", description="mount an NFS or CIFS share via fstab (ansible.posix)",
+        input_schema=[
+            {"name": "fstype", "type": "select", "options": ["nfs", "cifs"], "default": "nfs", "label": "Type"},
+            {"name": "src", "type": "text", "default": "192.168.1.10:/export/media", "label": "Share (server:/path or //server/share)"},
+            {"name": "mountpoint", "type": "text", "default": "/mnt/share", "label": "Mountpoint"},
+            {"name": "opts", "type": "text", "default": "defaults", "label": "Options (cifs: username=…,password=…)"},
+        ],
+        ansible=(
+            "- name: Install mount tools\n"
+            "  ansible.builtin.apt:\n"
+            "    name: [nfs-common, cifs-utils]\n"
+            "    state: present\n"
+            "    update_cache: true\n"
+            "- name: Mount Network Share\n"
+            "  ansible.posix.mount:\n"
+            "    path: {mountpoint}\n"
+            "    src: \"{src}\"\n"
+            "    fstype: {fstype}\n"
+            "    opts: \"{opts}\"\n"
+            "    state: mounted"
+        ),
+        cloudinit=(
+            "apt-get install -y nfs-common cifs-utils\n"
+            "mkdir -p {mountpoint}\n"
+            "grep -qF {src} /etc/fstab || printf '%s %s %s %s 0 0\\n' {src} {mountpoint} {fstype} {opts} >> /etc/fstab\n"
+            "mount -a || true"
+        ),
+    ),
+    dict(
+        key="b-swap", name="Swap File", category="OS Setup", icon="ram",
+        section="OS Setup", description="swap file at first boot — helps small VMs survive heavy installs",
+        input_schema=[
+            {"name": "size_gb", "type": "text", "default": "2", "label": "Size (GB)"},
+            {"name": "swappiness", "type": "text", "default": "10", "label": "Swappiness"},
+        ],
+        ansible=(
+            "- name: Swap File\n"
+            "  ansible.builtin.shell: |\n"
+            "    [ -f /swapfile ] || fallocate -l {size_gb_q}G /swapfile\n"
+            "    chmod 600 /swapfile\n"
+            "    mkswap /swapfile 2>/dev/null || true\n"
+            "    swapon /swapfile 2>/dev/null || true\n"
+            "    grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab\n"
+            "    sysctl -w vm.swappiness={swappiness_q} || true\n"
+            "    echo vm.swappiness={swappiness_q} > /etc/sysctl.d/99-goblindock-swap.conf"
+        ),
+        cloudinit=(
+            "[ -f /swapfile ] || fallocate -l {size_gb}G /swapfile\n"
+            "chmod 600 /swapfile\n"
+            "mkswap /swapfile 2>/dev/null || true\n"
+            "swapon /swapfile 2>/dev/null || true\n"
+            "grep -q '^/swapfile' /etc/fstab || echo '/swapfile none swap sw 0 0' >> /etc/fstab\n"
+            "sysctl -w vm.swappiness={swappiness} || true\n"
+            "echo vm.swappiness={swappiness} > /etc/sysctl.d/99-goblindock-swap.conf"
+        ),
+    ),
+    dict(
+        key="b-mariadb", name="MariaDB Server", category="Databases", icon="box",
+        section="Install", description="install MariaDB + optional database & user",
+        input_schema=[
+            {"name": "database", "type": "text", "default": "appdb", "label": "Database · optional", "optional": True},
+            {"name": "user", "type": "text", "default": "appuser", "label": "User · optional", "optional": True},
+            {"name": "password", "type": "password", "default": "", "label": "User password", "optional": True},
+            {"name": "lan", "type": "bool", "default": False, "label": "Listen on LAN (default localhost)"},
+        ],
+        # no community.mysql collection in the image — root works over the unix socket
+        # on Debian/Ubuntu, so plain `mysql -e` does the provisioning.
+        ansible=(
+            "- name: Install MariaDB\n"
+            "  ansible.builtin.apt:\n"
+            "    name: mariadb-server\n"
+            "    state: present\n"
+            "    update_cache: true\n"
+            "- name: Enable MariaDB\n"
+            "  ansible.builtin.service:\n"
+            "    name: mariadb\n"
+            "    enabled: true\n"
+            "    state: started\n"
+            "- name: Listen on LAN\n"
+            "  ansible.builtin.shell: |\n"
+            "    sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf\n"
+            "    systemctl restart mariadb\n"
+            "  when: {lan}\n"
+            "- name: Create database\n"
+            "  ansible.builtin.shell: mysql -e 'CREATE DATABASE IF NOT EXISTS {database}'\n"
+            "  when: {database_set}\n"
+            "- name: Create user + grant\n"
+            "  ansible.builtin.shell: |\n"
+            "    mysql -e \"CREATE USER IF NOT EXISTS '{user}'@'%' IDENTIFIED BY {password_q}\"\n"
+            "    mysql -e \"GRANT ALL PRIVILEGES ON {database}.* TO '{user}'@'%'\"\n"
+            "    mysql -e \"FLUSH PRIVILEGES\"\n"
+            "  when: {password_set}"
+        ),
+        cloudinit="apt-get install -y mariadb-server\nsystemctl enable --now mariadb",
+    ),
+    dict(
+        key="b-pgserver", name="PostgreSQL Server", category="Databases", icon="box",
+        section="Install", description="install PostgreSQL (pair with PostgreSQL DB + User)",
+        input_schema=[
+            {"name": "lan", "type": "bool", "default": False, "label": "Listen on LAN + allow remote auth"},
+            {"name": "allow_cidr", "type": "text", "default": "192.168.0.0/16", "label": "Allowed CIDR (LAN mode)"},
+        ],
+        ansible=(
+            "- name: Install PostgreSQL\n"
+            "  ansible.builtin.apt:\n"
+            "    name: [postgresql, postgresql-contrib]\n"
+            "    state: present\n"
+            "    update_cache: true\n"
+            "- name: Enable PostgreSQL\n"
+            "  ansible.builtin.service:\n"
+            "    name: postgresql\n"
+            "    enabled: true\n"
+            "    state: started\n"
+            "- name: Listen on LAN\n"
+            "  ansible.builtin.shell: |\n"
+            "    sudo -u postgres psql -c \"ALTER SYSTEM SET listen_addresses = '*'\"\n"
+            "    hba=$(sudo -u postgres psql -tAc 'show hba_file')\n"
+            "    grep -q goblindock \"$hba\" || echo 'host all all {allow_cidr} scram-sha-256 # goblindock' >> \"$hba\"\n"
+            "    systemctl restart postgresql\n"
+            "  when: {lan}"
+        ),
+        cloudinit="apt-get install -y postgresql postgresql-contrib\nsystemctl enable --now postgresql",
+    ),
+    dict(
+        key="b-redis", name="Redis Server", category="Databases", icon="box",
+        section="Install", description="install Redis (optional password / LAN / memory cap)",
+        input_schema=[
+            {"name": "password", "type": "password", "default": "", "label": "Password · optional", "optional": True},
+            {"name": "lan", "type": "bool", "default": False, "label": "Listen on LAN (default localhost)"},
+            {"name": "maxmemory", "type": "text", "default": "", "label": "Max memory (e.g. 256mb) · optional", "optional": True},
+        ],
+        ansible=(
+            "- name: Install Redis\n"
+            "  ansible.builtin.apt:\n"
+            "    name: redis-server\n"
+            "    state: present\n"
+            "    update_cache: true\n"
+            "- name: Configure Redis\n"
+            "  ansible.builtin.shell: |\n"
+            "    if {lan}; then sed -i 's/^bind .*/bind 0.0.0.0 ::1/' /etc/redis/redis.conf; sed -i 's/^protected-mode yes/protected-mode no/' /etc/redis/redis.conf; fi\n"
+            "    if [ -n {password_q} ]; then printf 'requirepass %s\\n' {password_q} >> /etc/redis/redis.conf; fi\n"
+            "    if [ -n {maxmemory_q} ]; then printf 'maxmemory %s\\nmaxmemory-policy allkeys-lru\\n' {maxmemory_q} >> /etc/redis/redis.conf; fi\n"
+            "    systemctl enable redis-server\n"
+            "    systemctl restart redis-server"
+        ),
+        cloudinit="apt-get install -y redis-server\nsystemctl enable --now redis-server",
+    ),
+
+    # ---- polish ----
+    dict(
+        key="b-motd", name="MOTD / Login Banner", category="OS Setup", icon="terminal",
+        section="Configure", description="custom SSH login banner (hides the distro's default noise)",
+        input_schema=[
+            {"name": "banner", "type": "code",
+             "default": "==========================================\n   deployed by GoblinDock\n==========================================\n",
+             "label": "Banner text"},
+            {"name": "disable_default", "type": "bool", "default": True, "label": "Hide distro MOTD noise"},
+        ],
+        ansible=(
+            "- name: Write MOTD banner\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /etc/update-motd.d/01-goblindock\n"
+            "    mode: \"0755\"\n"
+            "    content: |\n"
+            "      #!/bin/sh\n"
+            "      cat <<'BANNER'\n"
+            "      {banner}\n"
+            "      BANNER\n"
+            "- name: Hide distro MOTD noise\n"
+            "  ansible.builtin.shell: chmod -x /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news /etc/update-motd.d/91-contract-ua-esm-status 2>/dev/null || true\n"
+            "  when: {disable_default}"
+        ),
+        cloudinit=(
+            "cat > /etc/update-motd.d/01-goblindock <<'GDEOF'\n"
+            "#!/bin/sh\n"
+            "cat <<'BANNER'\n{banner}\nBANNER\n"
+            "GDEOF\n"
+            "chmod +x /etc/update-motd.d/01-goblindock\n"
+            "if {disable_default}; then chmod -x /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news 2>/dev/null || true; fi"
+        ),
+    ),
 ]
 
 
-# cloud-init = first-boot identity (must run at boot); everything else is post-boot ansible.
-_CLOUDINIT_BLOCKS = {"b-os", "b-ssh", "b-clean", "b-conpw"}
+# cloud-init = first-boot blocks (identity, or things that must exist BEFORE the
+# post-boot ansible leg — swap, so small VMs survive heavy installs); everything
+# else is post-boot ansible.
+_CLOUDINIT_BLOCKS = {"b-os", "b-ssh", "b-clean", "b-conpw", "b-swap"}
 
 
 def seed_blocks() -> None:

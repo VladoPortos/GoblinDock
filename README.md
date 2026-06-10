@@ -98,7 +98,7 @@ throttle see the real client address.
 | **Connection (target)** | A Proxmox node/cluster + token. Each target sets its own **per-VM ceilings** (max vCPU / RAM / disk). |
 | **ISO / base image** | A public cloud image (e.g. Ubuntu 24.04) — the raw material every deploy builds from. The ISOs page shows whether it's already cached on a node and can **pre-sync** it there ahead of the first deploy. |
 | **Template** | A named deployment preset: a base cloud image + location + blocks + default resources (e.g. *AI Dev Box*, *MySQL node*). Block inputs can be flagged **ask on deployment** — every deploy then prompts for fresh values (hostname, password…). Deploy in one click. |
-| **Block** | One customization step (install a package, write a file, run a script, install Claude Code…). 29 built-ins + your own. |
+| **Block** | One customization step (install a package, join your tailnet, deploy a compose stack, install Claude Code…). 44 built-ins + your own. |
 | **Secret / Variable** | Reusable values referenced as `{{ secrets.NAME }}` (encrypted) or `{{ variable.NAME }}` (plaintext, visible). |
 
 The flow: **add a base image (or use the seeded ones) → build a template (blocks + location + size) → deploy.**
@@ -114,8 +114,10 @@ This is the part people are curious about. When you stack several blocks, Goblin
 
 ![The block builder — palette, canvas with phase-tagged blocks, and the typed-input inspector](docs/screenshots/builder.png)
 
-There are 29 built-in blocks (plus your own forks and custom ones), each tagged with the
-phase it runs in:
+There are 44 built-in blocks (plus your own forks and custom ones) — networking
+(Tailscale, K3s), security (SSH hardening, Fail2ban, internal CA, unattended upgrades),
+Docker (Compose stacks, Watchtower, Portainer agent), databases (MariaDB, PostgreSQL,
+Redis), storage, AI tooling and more — each tagged with the phase it runs in:
 
 ![Block library — built-in + custom blocks, each tagged cloud-init or ansible](docs/screenshots/blocks.png)
 
