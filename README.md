@@ -81,7 +81,7 @@ open http://localhost:8080
 
 > The image is published at **`ghcr.io/vladoportos/goblindock`** — multi-arch
 > (amd64 · arm64). Tags: `latest` (newest release), `main` (rolling, from the default
-> branch), and semver (`2.3.3`, `2.3`). The compose files pull `:latest` by default.
+> branch), and semver (`2.3.4`, `2.3`). The compose files pull `:latest` by default.
 
 The first load shows **"Create the first admin account"**. With the dev override the
 Proxmox connection is auto-seeded from `PROXMOX_*` (`GOBLINDOCK_SEED_PROXMOX=true`); in
