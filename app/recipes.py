@@ -197,6 +197,13 @@ def _merged_inputs(block: Block, placed: dict) -> dict:
     for k, v in user_inputs.items():
         if v not in (None, ""):
             merged[k] = v
+    # Defense-in-depth at the SINK: a 'user' value becomes a Linux/PostgreSQL username
+    # that lands raw in ansible YAML across several blocks (become_user, owner/group,
+    # /home/<user> paths, module name args). Restrict it to a safe username charset so it
+    # can never inject sibling YAML keys, traverse paths, or break a scalar — a no-op for
+    # real usernames. Cloud-init already shell-quotes every value; this covers ansible too.
+    if isinstance(merged.get("user"), str):
+        merged["user"] = re.sub(r"[^A-Za-z0-9_-]", "", merged["user"])[:32]
     return merged
 
 
