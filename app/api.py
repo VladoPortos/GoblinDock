@@ -1492,6 +1492,87 @@ def test_connection(conn_id: int, user: User = Depends(require_admin), session: 
                 "error": "could not reach the Proxmox API — check the host, port, token and TLS settings"}
 
 
+class ConnProbeBody(BaseModel):
+    host: str
+    port: int = 8006
+    token_id: str = ""
+    token_secret: Optional[str] = None
+    verify_tls: bool = False
+    conn_id: Optional[int] = None
+
+
+@router.post("/connections/probe")
+def probe_connection(body: ConnProbeBody, user: User = Depends(require_admin),
+                     session: Session = Depends(get_session)):
+    """Discover a Proxmox host's nodes / storages / bridges from the add/edit form
+    BEFORE the connection is saved — so the admin picks values instead of typing them.
+
+    Builds a TRANSIENT Connection (never added to the session). On an existing
+    connection (conn_id given) a blank token_secret/token_id/verify_tls reuses what's
+    already stored, so 'Load' works when editing without re-entering the secret.
+    Errors are redacted: logged server-side, generic message returned."""
+    import logging
+
+    stored: Optional[Connection] = None
+    if body.conn_id is not None:
+        stored = session.get(Connection, body.conn_id)
+        if not stored:
+            raise HTTPException(404, "not found")
+
+    token_id = body.token_id or (stored.token_id if stored else "")
+    verify_tls = body.verify_tls
+    port = body.port or 8006
+    if stored:
+        if not body.token_id:
+            token_id = stored.token_id
+        # reuse stored verify_tls/port when the form didn't send a meaningful value
+        if not body.verify_tls:
+            verify_tls = stored.verify_tls
+        if not body.port:
+            port = stored.port or 8006
+
+    # Fresh secret supplied → encrypt it; otherwise reuse the stored encrypted blob.
+    if body.token_secret:
+        token_secret_enc = encrypt(body.token_secret)
+    elif stored:
+        token_secret_enc = stored.token_secret_enc
+    else:
+        token_secret_enc = encrypt("")
+
+    transient = Connection(
+        name="(probe)", host=body.host, port=port, token_id=token_id,
+        token_secret_enc=token_secret_enc, verify_tls=verify_tls,
+    )
+
+    try:
+        px = Proxmox(transient)
+        version = px.version().get("version")
+        all_nodes = px.nodes()
+        nodes = [n["node"] for n in all_nodes if n.get("status") == "online"]
+        if not nodes:
+            nodes = [n["node"] for n in all_nodes if n.get("node")]
+        if not nodes:
+            raise RuntimeError("no nodes returned")
+        node = nodes[0]
+        storages = []
+        for s in px.storage_status(node):
+            content = s.get("content", "")
+            storages.append({
+                "name": s.get("storage"),
+                "content": content.split(",") if content else [],
+                "type": s.get("type"),
+                "freeGb": int(s.get("avail", 0)) // (1024 ** 3),
+            })
+        bridges = px.bridges(node)
+        return {"ok": True, "version": version, "nodes": nodes,
+                "storages": storages, "bridges": bridges}
+    except Exception as e:  # noqa: BLE001
+        logging.getLogger("goblindock").warning(
+            "connection probe failed for host %s: %s", body.host, e)
+        return {"ok": False,
+                "error": "could not reach the Proxmox API — check the host, port, token and TLS settings"}
+
+
 # --------------------------------------------------------------------------- #
 # node capacity (deploy-modal headroom + connection gauge)                     #
 # --------------------------------------------------------------------------- #

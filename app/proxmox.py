@@ -122,6 +122,15 @@ class Proxmox:
         """Per-store {storage, type, total, used, avail} on the node."""
         return self.api.nodes(node or self.pick_node()).storage.get()
 
+    def bridges(self, node: Optional[str] = None) -> list[str]:
+        """Bridge interface names configured on the node (for the network device).
+        Best-effort: returns [] if the listing can't be read."""
+        try:
+            ifaces = self.api.nodes(node or self.pick_node()).network.get(type="any_bridge")
+            return [it["iface"] for it in (ifaces or []) if (it or {}).get("iface")]
+        except Exception:  # noqa: BLE001
+            return []
+
     # ---- inventory -----------------------------------------------------
     def list_qemu(self, node: Optional[str] = None) -> list[dict]:
         return self.api.nodes(node or self.pick_node()).qemu.get()

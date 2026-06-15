@@ -252,7 +252,38 @@
       max_disk_gb: conn ? (conn.maxDiskGb || 0) : 0,
     }));
     const [busy, setBusy] = useState(false);
+    const [probe, setProbe] = useState(null);      // null until a successful "Load from Proxmox"
+    const [probing, setProbing] = useState(false);
     const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
+    const canProbe = !!(f.host && f.token_id && (editing || f.token_secret));
+    const loadFromProxmox = async () => {
+      setProbing(true);
+      try {
+        const r = await window.API.probeConnection({
+          host: f.host, port: Number(f.port), token_id: f.token_id,
+          token_secret: f.token_secret, verify_tls: false,
+          conn_id: editing ? conn.connId : null,
+        });
+        if (r && r.ok) { setProbe(r); toast('Loaded from Proxmox', 'ok'); }
+        else { toast((r && r.error) || 'Could not reach Proxmox', 'err'); }
+      } catch (e) { toast(e.message, 'err'); }
+      setProbing(false);
+    };
+    // Build <select> options for a discovered field, ALWAYS including the current
+    // value (so editing never silently drops a stored value not on the host).
+    const optsWith = (names, current) => {
+      const list = (names || []).slice();
+      if (current && !list.includes(current)) list.unshift(current);
+      return list;
+    };
+    const storeNames = probe ? probe.storages.map((s) => s.name) : [];
+    const vmStores = probe ? probe.storages.filter((s) => (s.content || []).includes('images')).map((s) => s.name) : [];
+    const isoStores = probe ? probe.storages.filter((s) => (s.content || []).includes('import') || (s.content || []).includes('iso')).map((s) => s.name) : [];
+    // Empty filter → fall back to ALL storages so the field is never un-pickable.
+    const vmStoreOpts = optsWith(vmStores.length ? vmStores : storeNames, f.storage);
+    const isoStoreOpts = optsWith(isoStores.length ? isoStores : storeNames, f.iso_storage);
+    const nodeOpts = optsWith(probe ? probe.nodes : [], f.node);
+    const bridgeOpts = optsWith(probe ? probe.bridges : [], f.bridge);
     const submit = async () => {
       if (!f.name || !f.host || (!editing && (!f.token_id || !f.token_secret))) { toast('Name, host and token are required', 'err'); return; }
       setBusy(true);
@@ -275,10 +306,25 @@
         h(Field, { label: 'Host / IP', value: f.host, onChange: (v) => set('host', v), mono: true }),
         h(Field, { label: 'Token ID', value: f.token_id, onChange: (v) => set('token_id', v), mono: true, placeholder: 'goblindock@pve!app' }),
         h(Field, { label: 'Token secret' + (editing ? ' (leave blank to keep)' : ''), value: f.token_secret, onChange: (v) => set('token_secret', v), mono: true, type: 'password', placeholder: editing ? '••••••••' : '' }),
-        h(Field, { label: 'Default node', value: f.node, onChange: (v) => set('node', v), mono: true }),
-        h(Field, { label: 'VM storage', value: f.storage, onChange: (v) => set('storage', v), mono: true }),
-        h(Field, { label: 'ISO storage', value: f.iso_storage, onChange: (v) => set('iso_storage', v), mono: true }),
-        h(Field, { label: 'Bridge', value: f.bridge, onChange: (v) => set('bridge', v), mono: true }),
+        h('div', { style: { gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 10 } },
+          h('button', { type: 'button', className: 'btn sm', onClick: loadFromProxmox, disabled: !canProbe || probing },
+            h(Icon, { name: 'download', size: 14 }), probing ? 'Loading…' : 'Load from Proxmox'),
+          probe && h('span', { className: 'hint mono', style: { fontSize: 11, color: 'var(--ok)' } },
+            '✓ PVE ' + (probe.version || '—') + ' · ' + (probe.nodes || []).length + ' node' + ((probe.nodes || []).length === 1 ? '' : 's')),
+          !probe && !canProbe && h('span', { className: 'hint', style: { fontSize: 11 } },
+            'Enter host, token id' + (editing ? '' : ' and secret') + ' to load')),
+        probe
+          ? h(SelectField, { label: 'Default node', value: f.node, onChange: (v) => set('node', v), options: nodeOpts })
+          : h(Field, { label: 'Default node', value: f.node, onChange: (v) => set('node', v), mono: true }),
+        probe
+          ? h(SelectField, { label: 'VM storage', value: f.storage, onChange: (v) => set('storage', v), options: vmStoreOpts })
+          : h(Field, { label: 'VM storage', value: f.storage, onChange: (v) => set('storage', v), mono: true }),
+        probe
+          ? h(SelectField, { label: 'ISO storage', value: f.iso_storage, onChange: (v) => set('iso_storage', v), options: isoStoreOpts })
+          : h(Field, { label: 'ISO storage', value: f.iso_storage, onChange: (v) => set('iso_storage', v), mono: true }),
+        probe
+          ? h(SelectField, { label: 'Bridge', value: f.bridge, onChange: (v) => set('bridge', v), options: bridgeOpts })
+          : h(Field, { label: 'Bridge', value: f.bridge, onChange: (v) => set('bridge', v), mono: true }),
         h('div', { style: { gridColumn: '1 / -1' } },
           h('label', { className: 'field-label' }, 'Per-VM limits for this target ',
             h('span', { className: 'hint', style: { fontWeight: 400, fontSize: 11 } }, '· 0 = inherit global')),
