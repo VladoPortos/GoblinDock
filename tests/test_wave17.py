@@ -142,10 +142,14 @@ def test_mariadb_user_password_shell_quoted():
 def test_cacert_pem_lands_in_trust_store_task():
     pem = "-----BEGIN CERTIFICATE-----\nMIIB\n-----END CERTIFICATE-----"
     recipe = [{"blocks": [{"ref": "b-cacert", "inputs": {"name": "homelab-ca", "pem": pem}}]}]
-    doc = yaml.safe_load(_compile(recipe))
+    pb = _compile(recipe)
+    doc = yaml.safe_load(pb)
     copy = doc[0]["tasks"][0]["ansible.builtin.copy"]
-    assert copy["dest"] == "/usr/local/share/ca-certificates/homelab-ca.crt"
+    assert copy["dest"] == "/tmp/gd-homelab-ca.crt"
     assert "BEGIN CERTIFICATE" in copy["content"]
+    # cross-distro: installs into whichever trust store exists
+    assert "update-ca-trust" in pb and "update-ca-certificates" in pb
+    assert "/etc/pki/ca-trust/source/anchors/homelab-ca.crt" in pb
 
 
 def test_motd_banner_multiline_stays_valid_yaml():

@@ -113,10 +113,22 @@ BUILTIN_BLOCKS = [
     ),
     dict(
         key="b-clean", name="Cleanup & Trim", category="OS Setup", icon="trash",
-        section="Cleanup", description="apt clean + fstrim",
+        section="Cleanup", description="package-cache clean + fstrim (apt/dnf/yum)",
         input_schema=[],
-        ansible="- name: Cleanup & Trim\n  ansible.builtin.shell: apt-get clean && fstrim -av || true",
-        cloudinit="apt-get clean || true\nfstrim -av || true",
+        ansible=(
+            "- name: Cleanup & Trim\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null 2>&1; then apt-get clean || true\n"
+            "    elif command -v dnf >/dev/null 2>&1; then dnf clean all || true\n"
+            "    elif command -v yum >/dev/null 2>&1; then yum clean all || true; fi\n"
+            "    fstrim -av 2>/dev/null || true"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null 2>&1; then apt-get clean || true\n"
+            "elif command -v dnf >/dev/null 2>&1; then dnf clean all || true\n"
+            "elif command -v yum >/dev/null 2>&1; then yum clean all || true; fi\n"
+            "fstrim -av 2>/dev/null || true"
+        ),
     ),
 
     # ---- extended pre-built blocks (Ansible-module backed, simple inputs) ----
@@ -264,21 +276,35 @@ BUILTIN_BLOCKS = [
         cloudinit="( crontab -l 2>/dev/null; echo '{minute} {hour} * * * {job}' ) | crontab -",
     ),
     dict(
-        key="b-ufw", name="Firewall Rule (UFW)", category="Services", icon="shield",
-        section="Configure", description="allow/deny a port (community.general)",
+        key="b-ufw", name="Firewall Rule", category="Services", icon="shield",
+        section="Configure", description="open/close a port — UFW (Debian) or firewalld (RHEL)",
         input_schema=[
             {"name": "port", "type": "text", "default": "22", "label": "Port"},
             {"name": "proto", "type": "select", "options": ["tcp", "udp"], "default": "tcp", "label": "Protocol"},
             {"name": "rule", "type": "select", "options": ["allow", "deny", "limit", "reject"], "default": "allow", "label": "Rule"},
         ],
+        # UFW on Debian/Ubuntu, firewalld on RHEL/Oracle. allow/limit -> open the port;
+        # deny/reject -> close it (firewalld has no per-port rate-limit, so 'limit' opens).
         ansible=(
-            "- name: Firewall Rule (UFW)\n"
-            "  community.general.ufw:\n"
-            "    rule: {rule}\n"
-            "    port: \"{port}\"\n"
-            "    proto: {proto}"
+            "- name: Firewall Rule\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v ufw >/dev/null 2>&1; then\n"
+            "      ufw {rule} {port_q}/{proto} || true\n"
+            "    elif command -v firewall-cmd >/dev/null 2>&1; then\n"
+            "      case {rule} in\n"
+            "        allow|limit) firewall-cmd --permanent --add-port={port_q}/{proto} ;;\n"
+            "        deny|reject) firewall-cmd --permanent --remove-port={port_q}/{proto} ;;\n"
+            "      esac\n"
+            "      firewall-cmd --reload\n"
+            "    fi || true"
         ),
-        cloudinit="ufw {rule} {port}/{proto} || true",
+        cloudinit=(
+            "if command -v ufw >/dev/null 2>&1; then ufw {rule} {port}/{proto} || true\n"
+            "elif command -v firewall-cmd >/dev/null 2>&1; then\n"
+            "  case {rule} in allow|limit) firewall-cmd --permanent --add-port={port}/{proto};; deny|reject) firewall-cmd --permanent --remove-port={port}/{proto};; esac\n"
+            "  firewall-cmd --reload || true\n"
+            "fi || true"
+        ),
     ),
     dict(
         key="b-hostname", name="Set Hostname", category="OS Setup", icon="server",
@@ -325,16 +351,22 @@ BUILTIN_BLOCKS = [
         ],
         ansible=(
             "- name: Ensure pip\n"
-            "  ansible.builtin.apt:\n"
-            "    name: python3-pip\n"
-            "    state: present\n"
-            "    update_cache: true\n"
+            "  ansible.builtin.shell: |\n"
+            "    command -v pip3 >/dev/null 2>&1 && exit 0\n"
+            "    if command -v apt-get >/dev/null 2>&1; then apt-get install -y python3-pip\n"
+            "    elif command -v dnf >/dev/null 2>&1; then dnf install -y python3-pip\n"
+            "    else yum install -y python3-pip; fi\n"
             "- name: Pip Packages\n"
             "  ansible.builtin.pip:\n"
             "    name: {packages_yamlq}\n"
             "    state: present"
         ),
-        cloudinit="apt-get install -y python3-pip\npip3 install {packages}",
+        cloudinit=(
+            "if command -v apt-get >/dev/null 2>&1; then apt-get install -y python3-pip\n"
+            "elif command -v dnf >/dev/null 2>&1; then dnf install -y python3-pip\n"
+            "else yum install -y python3-pip; fi\n"
+            "pip3 install {packages}"
+        ),
     ),
     dict(
         key="b-sysctl", name="Sysctl Setting", category="OS Setup", icon="sliders",
@@ -687,10 +719,10 @@ BUILTIN_BLOCKS = [
         ],
         ansible=(
             "- name: Install Fail2ban\n"
-            "  ansible.builtin.apt:\n"
-            "    name: fail2ban\n"
-            "    state: present\n"
-            "    update_cache: true\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null 2>&1; then apt-get install -y fail2ban\n"
+            "    elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release || true; dnf install -y fail2ban\n"
+            "    else yum install -y epel-release || true; yum install -y fail2ban; fi\n"
             "- name: Fail2ban sshd jail\n"
             "  ansible.builtin.copy:\n"
             "    dest: /etc/fail2ban/jail.d/goblindock.local\n"
@@ -698,6 +730,7 @@ BUILTIN_BLOCKS = [
             "    content: |\n"
             "      [sshd]\n"
             "      enabled = true\n"
+            "      backend = systemd\n"
             "      bantime = {bantime}\n"
             "      maxretry = {maxretry}\n"
             "      {extra}\n"
@@ -708,8 +741,10 @@ BUILTIN_BLOCKS = [
             "    state: restarted"
         ),
         cloudinit=(
-            "apt-get install -y fail2ban\n"
-            "printf '[sshd]\\nenabled = true\\nbantime = %s\\nmaxretry = %s\\n' {bantime} {maxretry} > /etc/fail2ban/jail.d/goblindock.local\n"
+            "if command -v apt-get >/dev/null 2>&1; then apt-get install -y fail2ban\n"
+            "elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release || true; dnf install -y fail2ban\n"
+            "else yum install -y epel-release || true; yum install -y fail2ban; fi\n"
+            "printf '[sshd]\\nenabled = true\\nbackend = systemd\\nbantime = %s\\nmaxretry = %s\\n' {bantime} {maxretry} > /etc/fail2ban/jail.d/goblindock.local\n"
             "systemctl enable --now fail2ban && systemctl restart fail2ban"
         ),
     ),
@@ -720,17 +755,30 @@ BUILTIN_BLOCKS = [
             {"name": "name", "type": "text", "default": "internal-ca", "label": "Name (filename)"},
             {"name": "pem", "type": "code", "default": "-----BEGIN CERTIFICATE-----\n...\n-----END CERTIFICATE-----", "label": "CA certificate (PEM)"},
         ],
+        # Debian trusts /usr/local/share/ca-certificates + update-ca-certificates; RHEL/Oracle
+        # trusts /etc/pki/ca-trust/source/anchors + update-ca-trust. Stage via the copy module
+        # (clean multi-line PEM), then a shell task installs it into whichever exists.
         ansible=(
-            "- name: Install CA certificate\n"
+            "- name: Stage CA certificate\n"
             "  ansible.builtin.copy:\n"
-            "    dest: /usr/local/share/ca-certificates/{name}.crt\n"
+            "    dest: /tmp/gd-{name}.crt\n"
             "    mode: \"0644\"\n"
             "    content: |\n"
             "      {pem}\n"
-            "- name: Update trust store\n"
-            "  ansible.builtin.shell: update-ca-certificates"
+            "- name: Install CA into the trust store\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v update-ca-trust >/dev/null 2>&1; then\n"
+            "      install -m 0644 /tmp/gd-{name_q}.crt /etc/pki/ca-trust/source/anchors/{name_q}.crt && update-ca-trust extract\n"
+            "    else\n"
+            "      install -m 0644 /tmp/gd-{name_q}.crt /usr/local/share/ca-certificates/{name_q}.crt && update-ca-certificates\n"
+            "    fi\n"
+            "    rm -f /tmp/gd-{name_q}.crt"
         ),
-        cloudinit="cat > /usr/local/share/ca-certificates/{name}.crt <<'GDEOF'\n{pem}\nGDEOF\nupdate-ca-certificates",
+        cloudinit=(
+            "if command -v update-ca-trust >/dev/null 2>&1; then dest=/etc/pki/ca-trust/source/anchors/{name}.crt; else dest=/usr/local/share/ca-certificates/{name}.crt; fi\n"
+            "cat > \"$dest\" <<'GDEOF'\n{pem}\nGDEOF\n"
+            "if command -v update-ca-trust >/dev/null 2>&1; then update-ca-trust extract; else update-ca-certificates; fi"
+        ),
     ),
     dict(
         key="b-autoupdates", name="Unattended Upgrades", category="Security", icon="refresh",
@@ -740,31 +788,30 @@ BUILTIN_BLOCKS = [
             {"name": "reboot_time", "type": "text", "default": "03:00", "label": "Reboot time"},
         ],
         ansible=(
-            "- name: Install unattended-upgrades\n"
-            "  ansible.builtin.apt:\n"
-            "    name: unattended-upgrades\n"
-            "    state: present\n"
-            "    update_cache: true\n"
-            "- name: Enable periodic upgrades\n"
-            "  ansible.builtin.copy:\n"
-            "    dest: /etc/apt/apt.conf.d/20auto-upgrades\n"
-            "    mode: \"0644\"\n"
-            "    content: |\n"
-            "      APT::Periodic::Update-Package-Lists \"1\";\n"
-            "      APT::Periodic::Unattended-Upgrade \"1\";\n"
-            "- name: Auto-reboot policy\n"
-            "  ansible.builtin.copy:\n"
-            "    dest: /etc/apt/apt.conf.d/51goblindock-reboot\n"
-            "    mode: \"0644\"\n"
-            "    content: |\n"
-            "      Unattended-Upgrade::Automatic-Reboot \"true\";\n"
-            "      Unattended-Upgrade::Automatic-Reboot-Time \"{reboot_time}\";\n"
-            "  when: {auto_reboot}"
+            "- name: Automatic security updates\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null 2>&1; then\n"
+            "      apt-get install -y unattended-upgrades\n"
+            "      printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades\n"
+            "      if {auto_reboot}; then printf 'Unattended-Upgrade::Automatic-Reboot \"true\";\\nUnattended-Upgrade::Automatic-Reboot-Time \"{reboot_time}\";\\n' > /etc/apt/apt.conf.d/51goblindock-reboot; fi\n"
+            "    else\n"
+            "      (command -v dnf >/dev/null 2>&1 && dnf install -y dnf-automatic) || yum install -y dnf-automatic\n"
+            "      sed -i 's/^apply_updates = .*/apply_updates = yes/' /etc/dnf/automatic.conf 2>/dev/null || true\n"
+            "      if {auto_reboot}; then sed -i 's/^reboot = .*/reboot = when-needed/' /etc/dnf/automatic.conf 2>/dev/null || true; fi\n"
+            "      systemctl enable --now dnf-automatic.timer\n"
+            "    fi"
         ),
         cloudinit=(
-            "apt-get install -y unattended-upgrades\n"
-            "printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades\n"
-            "if {auto_reboot}; then printf 'Unattended-Upgrade::Automatic-Reboot \"true\";\\nUnattended-Upgrade::Automatic-Reboot-Time \"%s\";\\n' {reboot_time} > /etc/apt/apt.conf.d/51goblindock-reboot; fi"
+            "if command -v apt-get >/dev/null 2>&1; then\n"
+            "  apt-get install -y unattended-upgrades\n"
+            "  printf 'APT::Periodic::Update-Package-Lists \"1\";\\nAPT::Periodic::Unattended-Upgrade \"1\";\\n' > /etc/apt/apt.conf.d/20auto-upgrades\n"
+            "  if {auto_reboot}; then printf 'Unattended-Upgrade::Automatic-Reboot \"true\";\\nUnattended-Upgrade::Automatic-Reboot-Time \"%s\";\\n' {reboot_time} > /etc/apt/apt.conf.d/51goblindock-reboot; fi\n"
+            "else\n"
+            "  (command -v dnf >/dev/null 2>&1 && dnf install -y dnf-automatic) || yum install -y dnf-automatic\n"
+            "  sed -i 's/^apply_updates = .*/apply_updates = yes/' /etc/dnf/automatic.conf 2>/dev/null || true\n"
+            "  if {auto_reboot}; then sed -i 's/^reboot = .*/reboot = when-needed/' /etc/dnf/automatic.conf 2>/dev/null || true; fi\n"
+            "  systemctl enable --now dnf-automatic.timer\n"
+            "fi"
         ),
     ),
 
@@ -856,10 +903,10 @@ BUILTIN_BLOCKS = [
         ],
         ansible=(
             "- name: Install mount tools\n"
-            "  ansible.builtin.apt:\n"
-            "    name: [nfs-common, cifs-utils]\n"
-            "    state: present\n"
-            "    update_cache: true\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null 2>&1; then apt-get install -y nfs-common cifs-utils\n"
+            "    elif command -v dnf >/dev/null 2>&1; then dnf install -y nfs-utils cifs-utils\n"
+            "    else yum install -y nfs-utils cifs-utils; fi\n"
             "- name: Mount Network Share\n"
             "  ansible.posix.mount:\n"
             "    path: {mountpoint}\n"
@@ -869,7 +916,9 @@ BUILTIN_BLOCKS = [
             "    state: mounted"
         ),
         cloudinit=(
-            "apt-get install -y nfs-common cifs-utils\n"
+            "if command -v apt-get >/dev/null 2>&1; then apt-get install -y nfs-common cifs-utils\n"
+            "elif command -v dnf >/dev/null 2>&1; then dnf install -y nfs-utils cifs-utils\n"
+            "else yum install -y nfs-utils cifs-utils; fi\n"
             "mkdir -p {mountpoint}\n"
             "grep -qF {src} /etc/fstab || printf '%s %s %s %s 0 0\\n' {src} {mountpoint} {fstype} {opts} >> /etc/fstab\n"
             "mount -a || true"
@@ -916,10 +965,10 @@ BUILTIN_BLOCKS = [
         # on Debian/Ubuntu, so plain `mysql -e` does the provisioning.
         ansible=(
             "- name: Install MariaDB\n"
-            "  ansible.builtin.apt:\n"
-            "    name: mariadb-server\n"
-            "    state: present\n"
-            "    update_cache: true\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null 2>&1; then apt-get install -y mariadb-server\n"
+            "    elif command -v dnf >/dev/null 2>&1; then dnf install -y mariadb-server\n"
+            "    else yum install -y mariadb-server; fi\n"
             "- name: Enable MariaDB\n"
             "  ansible.builtin.service:\n"
             "    name: mariadb\n"
@@ -927,7 +976,8 @@ BUILTIN_BLOCKS = [
             "    state: started\n"
             "- name: Listen on LAN\n"
             "  ansible.builtin.shell: |\n"
-            "    sed -i 's/^bind-address.*/bind-address = 0.0.0.0/' /etc/mysql/mariadb.conf.d/50-server.cnf\n"
+            "    if [ -d /etc/mysql/mariadb.conf.d ]; then d=/etc/mysql/mariadb.conf.d; else d=/etc/my.cnf.d; fi\n"
+            "    printf '[mysqld]\\nbind-address = 0.0.0.0\\n' > \"$d/99-goblindock.cnf\"\n"
             "    systemctl restart mariadb\n"
             "  when: {lan}\n"
             "- name: Create database\n"
@@ -940,7 +990,12 @@ BUILTIN_BLOCKS = [
             "    mysql -e \"FLUSH PRIVILEGES\"\n"
             "  when: {password_set}"
         ),
-        cloudinit="apt-get install -y mariadb-server\nsystemctl enable --now mariadb",
+        cloudinit=(
+            "if command -v apt-get >/dev/null 2>&1; then apt-get install -y mariadb-server\n"
+            "elif command -v dnf >/dev/null 2>&1; then dnf install -y mariadb-server\n"
+            "else yum install -y mariadb-server; fi\n"
+            "systemctl enable --now mariadb"
+        ),
     ),
     dict(
         key="b-pgserver", name="PostgreSQL Server", category="Databases", icon="box",
@@ -951,15 +1006,14 @@ BUILTIN_BLOCKS = [
         ],
         ansible=(
             "- name: Install PostgreSQL\n"
-            "  ansible.builtin.apt:\n"
-            "    name: [postgresql, postgresql-contrib]\n"
-            "    state: present\n"
-            "    update_cache: true\n"
-            "- name: Enable PostgreSQL\n"
-            "  ansible.builtin.service:\n"
-            "    name: postgresql\n"
-            "    enabled: true\n"
-            "    state: started\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null 2>&1; then\n"
+            "      apt-get install -y postgresql postgresql-contrib\n"
+            "    else\n"
+            "      (command -v dnf >/dev/null 2>&1 && dnf install -y postgresql-server postgresql-contrib) || yum install -y postgresql-server postgresql-contrib\n"
+            "      [ -f /var/lib/pgsql/data/PG_VERSION ] || postgresql-setup --initdb || /usr/bin/postgresql-setup initdb || true\n"
+            "    fi\n"
+            "    systemctl enable --now postgresql\n"
             "- name: Listen on LAN\n"
             "  ansible.builtin.shell: |\n"
             "    sudo -u postgres psql -c \"ALTER SYSTEM SET listen_addresses = '*'\"\n"
@@ -968,7 +1022,14 @@ BUILTIN_BLOCKS = [
             "    systemctl restart postgresql\n"
             "  when: {lan}"
         ),
-        cloudinit="apt-get install -y postgresql postgresql-contrib\nsystemctl enable --now postgresql",
+        cloudinit=(
+            "if command -v apt-get >/dev/null 2>&1; then apt-get install -y postgresql postgresql-contrib\n"
+            "else\n"
+            "  (command -v dnf >/dev/null 2>&1 && dnf install -y postgresql-server postgresql-contrib) || yum install -y postgresql-server postgresql-contrib\n"
+            "  [ -f /var/lib/pgsql/data/PG_VERSION ] || postgresql-setup --initdb || /usr/bin/postgresql-setup initdb || true\n"
+            "fi\n"
+            "systemctl enable --now postgresql"
+        ),
     ),
     dict(
         key="b-redis", name="Redis Server", category="Databases", icon="box",
@@ -980,19 +1041,26 @@ BUILTIN_BLOCKS = [
         ],
         ansible=(
             "- name: Install Redis\n"
-            "  ansible.builtin.apt:\n"
-            "    name: redis-server\n"
-            "    state: present\n"
-            "    update_cache: true\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null 2>&1; then apt-get install -y redis-server\n"
+            "    elif command -v dnf >/dev/null 2>&1; then dnf install -y redis\n"
+            "    else yum install -y redis; fi\n"
             "- name: Configure Redis\n"
             "  ansible.builtin.shell: |\n"
-            "    if {lan}; then sed -i 's/^bind .*/bind 0.0.0.0 ::1/' /etc/redis/redis.conf; sed -i 's/^protected-mode yes/protected-mode no/' /etc/redis/redis.conf; fi\n"
-            "    if [ -n {password_q} ]; then printf 'requirepass %s\\n' {password_q} >> /etc/redis/redis.conf; fi\n"
-            "    if [ -n {maxmemory_q} ]; then printf 'maxmemory %s\\nmaxmemory-policy allkeys-lru\\n' {maxmemory_q} >> /etc/redis/redis.conf; fi\n"
-            "    systemctl enable redis-server\n"
-            "    systemctl restart redis-server"
+            "    conf=/etc/redis/redis.conf; [ -f \"$conf\" ] || conf=/etc/redis.conf\n"
+            "    systemctl list-unit-files 2>/dev/null | grep -q '^redis-server' && svc=redis-server || svc=redis\n"
+            "    if {lan}; then sed -i 's/^bind .*/bind 0.0.0.0 ::1/' \"$conf\"; sed -i 's/^protected-mode yes/protected-mode no/' \"$conf\"; fi\n"
+            "    if [ -n {password_q} ]; then printf 'requirepass %s\\n' {password_q} >> \"$conf\"; fi\n"
+            "    if [ -n {maxmemory_q} ]; then printf 'maxmemory %s\\nmaxmemory-policy allkeys-lru\\n' {maxmemory_q} >> \"$conf\"; fi\n"
+            "    systemctl enable \"$svc\"\n"
+            "    systemctl restart \"$svc\""
         ),
-        cloudinit="apt-get install -y redis-server\nsystemctl enable --now redis-server",
+        cloudinit=(
+            "if command -v apt-get >/dev/null 2>&1; then apt-get install -y redis-server; svc=redis-server\n"
+            "elif command -v dnf >/dev/null 2>&1; then dnf install -y redis; svc=redis\n"
+            "else yum install -y redis; svc=redis; fi\n"
+            "systemctl enable --now \"$svc\""
+        ),
     ),
 
     # ---- polish ----
