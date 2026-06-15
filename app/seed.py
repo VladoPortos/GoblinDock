@@ -1008,23 +1008,16 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Write MOTD banner\n"
             "  ansible.builtin.copy:\n"
-            "    dest: /etc/update-motd.d/01-goblindock\n"
-            "    mode: \"0755\"\n"
+            "    dest: /etc/motd\n"
+            "    mode: \"0644\"\n"
             "    content: |\n"
-            "      #!/bin/sh\n"
-            "      cat <<'BANNER'\n"
             "      {banner}\n"
-            "      BANNER\n"
             "- name: Hide distro MOTD noise\n"
             "  ansible.builtin.shell: chmod -x /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news /etc/update-motd.d/91-contract-ua-esm-status 2>/dev/null || true\n"
             "  when: {disable_default}"
         ),
         cloudinit=(
-            "cat > /etc/update-motd.d/01-goblindock <<'GDEOF'\n"
-            "#!/bin/sh\n"
-            "cat <<'BANNER'\n{banner}\nBANNER\n"
-            "GDEOF\n"
-            "chmod +x /etc/update-motd.d/01-goblindock\n"
+            "cat > /etc/motd <<'GDEOF'\n{banner}\nGDEOF\n"
             "if {disable_default}; then chmod -x /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news 2>/dev/null || true; fi"
         ),
     ),

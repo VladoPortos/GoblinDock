@@ -152,9 +152,10 @@ def test_motd_banner_multiline_stays_valid_yaml():
     recipe = [{"blocks": [{"ref": "b-motd", "inputs": {
         "banner": "line one\nline two\nline three", "disable_default": True}}]}]
     doc = yaml.safe_load(_compile(recipe))
-    content = doc[0]["tasks"][0]["ansible.builtin.copy"]["content"]
-    assert "line two" in content and content.startswith("#!/bin/sh")
-    assert content.rstrip().endswith("BANNER")
+    copy = doc[0]["tasks"][0]["ansible.builtin.copy"]
+    assert copy["dest"] == "/etc/motd", copy
+    content = copy["content"]
+    assert "line one" in content and "line two" in content and "line three" in content
 
 
 def test_all_new_ansible_blocks_compile_together():
