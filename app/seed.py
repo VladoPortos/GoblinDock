@@ -29,13 +29,36 @@ BUILTIN_BLOCKS = [
         cloudinit="timedatectl set-timezone {timezone} || true\nlocalectl set-locale LANG={locale} || true",
     ),
     dict(
-        key="b-apt", name="Install Packages", category="Packages", icon="package",
-        section="Install", description="apt package list",
+        key="b-apt", name="Install Packages (apt)", category="Packages", icon="package",
+        section="Install", description="apt package list — Debian / Ubuntu",
         input_schema=[
             {"name": "packages", "type": "tags", "default": ["build-essential", "git", "curl", "htop", "jq"], "label": "Packages"},
         ],
-        ansible="- name: Install Packages\n  ansible.builtin.apt:\n    name: {packages_yaml}\n    state: present\n    update_cache: true",
+        ansible="- name: Install Packages (apt)\n  ansible.builtin.apt:\n    name: {packages_yaml}\n    state: present\n    update_cache: true",
         cloudinit="export DEBIAN_FRONTEND=noninteractive\napt-get update -y\napt-get install -y {packages}",
+    ),
+    dict(
+        # RHEL 8+ / Fedora / Rocky / Alma. dnf refreshes stale metadata on install,
+        # but update_cache keeps it explicit. Package NAMES are the user's call —
+        # e.g. apt's build-essential has no direct dnf equivalent (use @development-tools),
+        # and htop/jq may need EPEL on minimal RHEL.
+        key="b-dnf", name="Install Packages (dnf)", category="Packages", icon="package",
+        section="Install", description="dnf package list — RHEL 8+ / Fedora / Rocky / Alma",
+        input_schema=[
+            {"name": "packages", "type": "tags", "default": ["git", "curl", "wget", "tar"], "label": "Packages"},
+        ],
+        ansible="- name: Install Packages (dnf)\n  ansible.builtin.dnf:\n    name: {packages_yaml}\n    state: present\n    update_cache: true",
+        cloudinit="dnf install -y {packages}",
+    ),
+    dict(
+        # Legacy RHEL / CentOS 7 (and Amazon Linux 2) where dnf is absent.
+        key="b-yum", name="Install Packages (yum)", category="Packages", icon="package",
+        section="Install", description="yum package list — RHEL / CentOS 7",
+        input_schema=[
+            {"name": "packages", "type": "tags", "default": ["git", "curl", "wget", "tar"], "label": "Packages"},
+        ],
+        ansible="- name: Install Packages (yum)\n  ansible.builtin.yum:\n    name: {packages_yaml}\n    state: present\n    update_cache: true",
+        cloudinit="yum install -y {packages}",
     ),
     dict(
         key="b-ssh", name="User & SSH Key", category="Users / SSH", icon="key",

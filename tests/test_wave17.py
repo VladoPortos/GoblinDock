@@ -53,8 +53,8 @@ def test_new_blocks_seeded():
     for key in NEW_KEYS:
         assert key in blocks, f"{key} not seeded"
         assert blocks[key].builtin, f"{key} not marked builtin"
-    assert len([b for b in blocks.values() if b.builtin]) == 44, \
-        "expected 44 built-in blocks (29 + 15 new)"
+    assert len([b for b in blocks.values() if b.builtin]) == 46, \
+        "expected 46 built-in blocks (29 + 15 new + dnf/yum)"
 
 
 def test_phase_assignment():
