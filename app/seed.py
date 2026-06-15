@@ -62,7 +62,7 @@ BUILTIN_BLOCKS = [
     ),
     dict(
         key="b-ssh", name="User & SSH Key", category="Users / SSH", icon="key",
-        section="Configure", description="create user, push key, sudo, optional password",
+        section="Accounts", description="create user, push key, sudo, optional password",
         input_schema=[
             {"name": "user", "type": "text", "default": "goblin", "label": "Username"},
             {"name": "public_key", "type": "secret", "default": "{{ secrets.TEAM_SSH_PUBKEY }}", "label": "Public key"},
@@ -122,7 +122,7 @@ BUILTIN_BLOCKS = [
     # ---- extended pre-built blocks (Ansible-module backed, simple inputs) ----
     dict(
         key="b-user", name="Create User", category="Users / SSH", icon="key",
-        section="Configure", description="create a Linux user + groups + password",
+        section="Accounts", description="create a Linux user + groups + password",
         input_schema=[
             {"name": "user", "type": "text", "default": "deploy", "label": "Username"},
             {"name": "groups", "type": "tags", "default": ["sudo"], "label": "Groups"},
@@ -585,7 +585,7 @@ BUILTIN_BLOCKS = [
 
     dict(
         key="b-conpw", name="Console Password", category="Users / SSH", icon="key",
-        section="Configure", description="set a password so a user can log in at the console (serial/VNC)",
+        section="Accounts", description="set a password so a user can log in at the console (serial/VNC)",
         input_schema=[
             {"name": "user", "type": "text", "default": "goblin", "label": "User"},
             {"name": "password", "type": "secret", "default": "{{ secrets.CONSOLE_PASSWORD }}", "label": "Password"},

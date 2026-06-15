@@ -7,9 +7,10 @@
   const h = React.createElement;
 
   let UID = 100;
-  const SECTION_BY_NAME = { 'OS Setup': 's-os', 'Install': 's-inst', 'Configure': 's-conf', 'Scripts': 's-scr', 'Cleanup': 's-clean' };
+  const SECTION_BY_NAME = { 'OS Setup': 's-os', 'Accounts': 's-acc', 'Install': 's-inst', 'Configure': 's-conf', 'Scripts': 's-scr', 'Cleanup': 's-clean' };
   const blankSections = () => ([
     { id: 's-os', name: 'OS Setup', blocks: [] },
+    { id: 's-acc', name: 'Accounts', blocks: [] },
     { id: 's-inst', name: 'Install', blocks: [] },
     { id: 's-conf', name: 'Configure', blocks: [] },
     { id: 's-scr', name: 'Scripts', blocks: [] },
@@ -291,7 +292,7 @@
     return h(FormModal, { title: editing ? 'Edit block' : 'New custom block', icon: 'blocks', onClose, onSubmit: submit, busy, submitLabel: editing ? 'Save block' : 'Create block', width: 'min(600px, 95vw)' },
       h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
         h(Field, { label: 'Name', value: f.name, onChange: (v) => set('name', v) }),
-        h(SelectField, { label: 'Section', value: f.section, onChange: (v) => set('section', v), options: ['OS Setup', 'Install', 'Configure', 'Scripts', 'Cleanup'] }),
+        h(SelectField, { label: 'Section', value: f.section, onChange: (v) => set('section', v), options: ['OS Setup', 'Accounts', 'Install', 'Configure', 'Scripts', 'Cleanup'] }),
         h(SelectField, { label: 'Phase', value: f.phase, onChange: (v) => set('phase', v), options: [{ value: 'cloudinit', label: 'cloud-init (first boot)' }, { value: 'ansible', label: 'ansible (post-boot)' }] }),
         h(SelectField, { label: 'Icon', value: f.icon, onChange: (v) => set('icon', v), options: ['spark', 'code', 'package', 'settings', 'sliders', 'docker', 'key', 'file', 'trash'] })),
       h(Field, { label: 'Description', value: f.description, onChange: (v) => set('description', v) }),
@@ -322,7 +323,7 @@
       const out = blankSections();
       const byId = Object.fromEntries(out.map((s) => [s.id, s]));
       src.forEach((sec) => {
-        const target = byId[sec.id] || byId[SECTION_BY_NAME[sec.name]] || out[1];
+        const target = byId[sec.id] || byId[SECTION_BY_NAME[sec.name]] || byId['s-inst'];
         (sec.blocks || []).forEach((b) => target.blocks.push({ uid: 'u' + (UID++), ref: b.ref, name: b.name || paletteByKey(b.ref).name || b.ref, inputs: b.inputs || {}, ask: Array.isArray(b.ask) ? b.ask.slice() : [] }));
       });
       return out;
