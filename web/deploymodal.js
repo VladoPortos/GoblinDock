@@ -43,11 +43,12 @@
     })();
 
     const conn = tpl ? (GD.CONNECTIONS || []).find((c) => c.connId === tpl.connectionId) || {} : {};
-    const gl = GD.limits || {};
-    const maxCpu = conn.maxCores || gl.maxCores || 1;
-    const maxMem = conn.maxRamGb || gl.maxRam || 2;
-    // connection cap → global cap → 500 GB slider default when neither is set
-    const maxDisk = conn.maxDiskGb || gl.maxDisk || 500;
+    // The connection's per-VM limit is authoritative; 0 = unlimited → fall back to the
+    // node's real capacity (or a generous default) so the slider isn't capped at the old
+    // global 1-core/2-GB default.
+    const maxCpu = conn.maxCores || (cap && cap.cpu && cap.cpu.cores) || 128;
+    const maxMem = conn.maxRamGb || (cap && cap.mem && cap.mem.totalGb) || 256;
+    const maxDisk = conn.maxDiskGb || (cap && cap.storage && cap.storage.freeGb) || 500;
 
     const pick = (id) => {
       setTplId(id);

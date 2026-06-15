@@ -32,6 +32,8 @@ services:
       # Guard rails / per-VM sizing caps (GoblinDock only ever acts inside this VMID window).
       GOBLINDOCK_VMID_MIN: "8000"
       GOBLINDOCK_VMID_MAX: "8099"
+      # Fallback per-VM cap (applies only if a deploy target has no connection). The
+      # authoritative per-VM ceiling is set per-connection in the UI; 0 there = unlimited.
       GOBLINDOCK_MAX_CORES: "1"
       GOBLINDOCK_MAX_RAM_MB: "2048"
     volumes:

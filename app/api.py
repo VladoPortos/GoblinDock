@@ -620,13 +620,18 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
 
     deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs)
 
-    eff_cores = conn.max_cores or settings.max_cores
-    eff_ram_mb = conn.max_ram_mb or settings.max_ram_mb
-    eff_disk_gb = conn.max_disk_gb or settings.max_disk_gb
-    cpu = max(1, min(body.cpu if body.cpu is not None else tpl.default_cpu, eff_cores))
-    ram = max(1, min(body.ram if body.ram is not None else tpl.default_ram, eff_ram_mb // 1024))
-    disk = body.disk if body.disk is not None else tpl.default_disk
-    disk = max(1, min(disk, eff_disk_gb) if eff_disk_gb else disk)
+    # The connection's per-VM ceiling is authoritative; 0 = unlimited for that
+    # dimension (CPU, RAM and disk all behave identically). A connection is required
+    # above, so settings.max_* only act as a no-connection fallback.
+    cap_cores = conn.max_cores if conn else settings.max_cores
+    cap_ram_mb = conn.max_ram_mb if conn else settings.max_ram_mb
+    cap_disk_gb = conn.max_disk_gb if conn else settings.max_disk_gb
+    cpu_req = body.cpu if body.cpu is not None else tpl.default_cpu
+    ram_req = body.ram if body.ram is not None else tpl.default_ram
+    disk_req = body.disk if body.disk is not None else tpl.default_disk
+    cpu = max(1, min(cpu_req, cap_cores) if cap_cores else cpu_req)
+    ram = max(1, min(ram_req, cap_ram_mb // 1024) if cap_ram_mb else ram_req)
+    disk = max(1, min(disk_req, cap_disk_gb) if cap_disk_gb else disk_req)
     name = _clean_name(body.name) if (body.name or "").strip() else _auto_name(session)
 
     net = session.get(Network, tpl.network_id) if tpl.network_id else None
@@ -1212,25 +1217,16 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
     return bid, cid, nid
 
 
-def _template_ceilings(session: Session, cid: Optional[int]) -> tuple[int, int]:
-    """Template defaults clamp like deploys do: the target connection's own ceilings
-    (when set) beat the global caps, so a high-limit target can carry matching
-    template defaults. Returns (max_cores, max_ram_gb)."""
-    conn = session.get(Connection, cid) if cid else None
-    cores = conn.max_cores if conn and conn.max_cores else settings.max_cores
-    ram_mb = conn.max_ram_mb if conn and conn.max_ram_mb else settings.max_ram_mb
-    return cores, ram_mb // 1024
-
-
 @router.post("/templates")
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     bid, cid, nid = _validate_template_refs(session, body)
-    max_cpu, max_ram = _template_ceilings(session, cid)
+    # Store the authored sizes verbatim. The per-VM ceiling is enforced at deploy
+    # time from the connection (0 = unlimited), so a template default is never
+    # silently shrunk to a cap here.
     rc = Template(name=body.name.strip() or "template", description=body.description,
                 os_family=body.os_family, recipe_json=json.dumps(body.recipe or []),
-                default_cpu=min(body.cpu, max_cpu),
-                default_ram=min(body.ram, max_ram),
-                default_disk=body.disk, public=body.public, owner_id=user.id,
+                default_cpu=body.cpu, default_ram=body.ram, default_disk=body.disk,
+                public=body.public, owner_id=user.id,
                 base_image_id=bid, connection_id=cid, network_id=nid)
     session.add(rc)
     record_audit(session, user, "template.create", "template", "-", rc.name)
@@ -1254,9 +1250,8 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
     rc.os_family = body.os_family
     rc.recipe_json = json.dumps(body.recipe or [])
     rc.base_image_id, rc.connection_id, rc.network_id = _validate_template_refs(session, body)
-    max_cpu, max_ram = _template_ceilings(session, rc.connection_id)
-    rc.default_cpu = min(body.cpu, max_cpu)
-    rc.default_ram = min(body.ram, max_ram)
+    rc.default_cpu = body.cpu
+    rc.default_ram = body.ram
     rc.default_disk = body.disk
     rc.public = body.public
     session.add(rc)

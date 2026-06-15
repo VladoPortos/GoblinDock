@@ -341,7 +341,7 @@ def connection_dict(session: Session, c: Connection, status: Optional[dict] = No
         "tokenId": c.token_id,
         "isoStorage": c.iso_storage,
         "snippetStorage": c.snippet_storage,
-        # per-target VM ceilings (0 = inherit the global default; UI falls back to it)
+        # per-target VM ceilings — authoritative; 0 = unlimited (no per-VM cap)
         "maxCores": c.max_cores,
         "maxRamGb": c.max_ram_mb // 1024,
         "maxDiskGb": c.max_disk_gb,
@@ -362,7 +362,7 @@ def connection_public_dict(session: Session, c: Connection, status: Optional[dic
         "version": (status or {}).get("version", "—"),
         "node": c.node,
         "vms": len(vms),
-        # per-target VM ceilings (used to size the deploy/build sliders; 0 = inherit global)
+        # per-target VM ceilings (used to size the deploy/build sliders); 0 = unlimited
         "maxCores": c.max_cores,
         "maxRamGb": c.max_ram_mb // 1024,
         "maxDiskGb": c.max_disk_gb,

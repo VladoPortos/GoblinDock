@@ -86,12 +86,12 @@ class Settings:
         self.vmid_min = int(os.environ.get("GOBLINDOCK_VMID_MIN", "8000"))
         self.vmid_max = int(os.environ.get("GOBLINDOCK_VMID_MAX", "8099"))
 
-        # Hard cap on test VM size (the Proxmox node isn't powerful). Deploys are
-        # clamped to these regardless of what the UI requests.
+        # Fallback per-VM cap, applied ONLY when a deploy target has no connection
+        # record (in practice never — deploys require a connection). The authoritative
+        # per-VM ceiling is set per-connection in the UI (Settings → Proxmox), where
+        # 0 = unlimited for that dimension.
         self.max_cores = int(os.environ.get("GOBLINDOCK_MAX_CORES", "1"))
         self.max_ram_mb = int(os.environ.get("GOBLINDOCK_MAX_RAM_MB", "2048"))
-        # Global disk ceiling (GB); 0 = no global cap. A connection can set its own
-        # per-target limits which override these defaults.
         self.max_disk_gb = int(os.environ.get("GOBLINDOCK_MAX_DISK_GB", "0"))
 
         # Per-user quotas (0 = unlimited). Stop one tenant exhausting the shared VMID

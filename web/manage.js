@@ -331,9 +331,9 @@
           h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
             h(Stat, { k: 'Node', v: c.node || '—' }), h(Stat, { k: 'Storage', v: c.storage }), h(Stat, { k: 'VMs', v: c.vms })),
           (function () {
-            const g = GD.limits || {};
-            const cpu = c.maxCores || g.maxCores || '∞';
-            const ram = c.maxRamGb || g.maxRam || '∞';
+            // 0 = unlimited for that dimension (the connection limit is authoritative).
+            const cpu = c.maxCores || '∞';
+            const ram = c.maxRamGb || '∞';
             const disk = c.maxDiskGb || '∞';
             return h('div', { className: 'row', style: { gap: 7, color: 'var(--text-faint)' } },
               h(Icon, { name: 'sliders', size: 12 }),
