@@ -432,41 +432,83 @@ BUILTIN_BLOCKS = [
         input_schema=[
             {"name": "version", "type": "text", "default": "22", "label": "Major version"},
         ],
+        # Cross-distro: NodeSource ships separate apt (deb.nodesource.com) and rpm
+        # (rpm.nodesource.com) setup scripts — pick by the package manager present so this
+        # works on Debian/Ubuntu AND RHEL/Oracle/Fedora. {version} is shell-quoted.
         ansible=(
             "- name: Install Node.js\n"
             "  ansible.builtin.shell: |\n"
-            "    curl -fsSL https://deb.nodesource.com/setup_{version_q}.x | bash -\n"
-            "    apt-get install -y nodejs"
+            "    if command -v apt-get >/dev/null 2>&1; then\n"
+            "      curl -fsSL https://deb.nodesource.com/setup_{version_q}.x | bash - && apt-get install -y nodejs\n"
+            "    elif command -v dnf >/dev/null 2>&1; then\n"
+            "      curl -fsSL https://rpm.nodesource.com/setup_{version_q}.x | bash - && dnf install -y nodejs\n"
+            "    else\n"
+            "      curl -fsSL https://rpm.nodesource.com/setup_{version_q}.x | bash - && yum install -y nodejs\n"
+            "    fi"
         ),
-        cloudinit="curl -fsSL https://deb.nodesource.com/setup_{version}.x | bash -\napt-get install -y nodejs",
+        cloudinit=(
+            "if command -v apt-get >/dev/null 2>&1; then\n"
+            "  curl -fsSL https://deb.nodesource.com/setup_{version}.x | bash - && apt-get install -y nodejs\n"
+            "elif command -v dnf >/dev/null 2>&1; then\n"
+            "  curl -fsSL https://rpm.nodesource.com/setup_{version}.x | bash - && dnf install -y nodejs\n"
+            "else\n"
+            "  curl -fsSL https://rpm.nodesource.com/setup_{version}.x | bash - && yum install -y nodejs\n"
+            "fi"
+        ),
     ),
     dict(
         key="b-claudecode", name="Claude Code", category="AI Tools", icon="spark",
-        section="Install", description="Anthropic Claude Code CLI (npm global)",
+        section="Install", description="Anthropic Claude Code CLI (native installer — any Linux, no Node)",
         input_schema=[
-            {"name": "node_version", "type": "text", "default": "22", "label": "Node version (installed if absent)"},
+            {"name": "user", "type": "text", "default": "goblin", "label": "Install for user"},
         ],
+        # Native installer drops a self-contained binary into the user's ~/.local/bin —
+        # no Node/npm and distro-agnostic (Debian/Ubuntu, RHEL/Oracle/Fedora, …). The
+        # username is the ONLY interpolation and is shell-quoted — {user_q} (shlex) for
+        # ansible, and render_shell auto-quotes {user} for cloud-init — so it is treated
+        # as data and can't break out of the command. `sudo -u … -H` runs as that user
+        # with their real $HOME; the `test -x` guard makes it a no-op once installed.
         ansible=(
             "- name: Install Claude Code\n"
             "  ansible.builtin.shell: |\n"
-            "    command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_{node_version_q}.x | bash - && apt-get install -y nodejs; }\n"
-            "    npm install -g @anthropic-ai/claude-code"
+            "    sudo -u {user_q} -H bash -c 'test -x \"$HOME/.local/bin/claude\" || curl -fsSL https://claude.ai/install.sh | bash'"
         ),
-        cloudinit="command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_{node_version}.x | bash - && apt-get install -y nodejs; }\nnpm install -g @anthropic-ai/claude-code",
+        cloudinit="sudo -u {user} -H bash -c 'test -x \"$HOME/.local/bin/claude\" || curl -fsSL https://claude.ai/install.sh | bash'",
     ),
     dict(
         key="b-codex", name="OpenAI Codex", category="AI Tools", icon="spark",
-        section="Install", description="OpenAI Codex CLI (npm global)",
+        section="Install", description="OpenAI Codex CLI (npm global — installs Node if absent)",
         input_schema=[
             {"name": "node_version", "type": "text", "default": "22", "label": "Node version (installed if absent)"},
         ],
+        # Codex needs Node/npm. Install it cross-distro (NodeSource apt vs rpm, by package
+        # manager) only when npm is missing, then install Codex globally. Version quoted.
         ansible=(
             "- name: Install OpenAI Codex\n"
             "  ansible.builtin.shell: |\n"
-            "    command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_{node_version_q}.x | bash - && apt-get install -y nodejs; }\n"
+            "    if ! command -v npm >/dev/null 2>&1; then\n"
+            "      if command -v apt-get >/dev/null 2>&1; then\n"
+            "        curl -fsSL https://deb.nodesource.com/setup_{node_version_q}.x | bash - && apt-get install -y nodejs\n"
+            "      elif command -v dnf >/dev/null 2>&1; then\n"
+            "        curl -fsSL https://rpm.nodesource.com/setup_{node_version_q}.x | bash - && dnf install -y nodejs\n"
+            "      else\n"
+            "        curl -fsSL https://rpm.nodesource.com/setup_{node_version_q}.x | bash - && yum install -y nodejs\n"
+            "      fi\n"
+            "    fi\n"
             "    npm install -g @openai/codex"
         ),
-        cloudinit="command -v npm >/dev/null 2>&1 || { curl -fsSL https://deb.nodesource.com/setup_{node_version}.x | bash - && apt-get install -y nodejs; }\nnpm install -g @openai/codex",
+        cloudinit=(
+            "if ! command -v npm >/dev/null 2>&1; then\n"
+            "  if command -v apt-get >/dev/null 2>&1; then\n"
+            "    curl -fsSL https://deb.nodesource.com/setup_{node_version}.x | bash - && apt-get install -y nodejs\n"
+            "  elif command -v dnf >/dev/null 2>&1; then\n"
+            "    curl -fsSL https://rpm.nodesource.com/setup_{node_version}.x | bash - && dnf install -y nodejs\n"
+            "  else\n"
+            "    curl -fsSL https://rpm.nodesource.com/setup_{node_version}.x | bash - && yum install -y nodejs\n"
+            "  fi\n"
+            "fi\n"
+            "npm install -g @openai/codex"
+        ),
     ),
     dict(
         key="b-claudemd", name="Global CLAUDE.md", category="AI Tools", icon="file",
