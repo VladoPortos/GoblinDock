@@ -628,7 +628,7 @@
 
   function Preferences() {
     const [on, setOn] = useState(null);
-    useEffect(() => { window.API.autoRootPwGet().then((r) => setOn(!!r.enabled)).catch((e) => { setOn(true); toast(e.message || 'Could not load setting', 'err'); }); }, []);
+    React.useEffect(() => { window.API.autoRootPwGet().then((r) => setOn(!!r.enabled)).catch((e) => { setOn(true); toast(e.message || 'Could not load setting', 'err'); }); }, []);
     const toggle = async () => {
       const next = !on;
       try { await window.API.autoRootPwSet(next); setOn(next); toast('Saved', 'ok'); }
