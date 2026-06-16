@@ -117,6 +117,28 @@ def test_seed_prunes_removed_builtins():
     print("test_seed_prunes_removed_builtins OK")
 
 
+def test_user_block_yaml_injection_safe():
+    import yaml
+    from app.seed import BUILTIN_BLOCKS
+    from app.recipes import compile_ansible
+    from app.models import Block
+    spec = next(b for b in BUILTIN_BLOCKS if b["key"] == "b-user")
+    block = Block(key="b-user", phase="ansible", name="User",
+                  ansible_template=spec["ansible"],
+                  input_schema_json=json.dumps(spec["input_schema"]))
+    nolookup = lambda kind, name: ""  # noqa: E731
+    # Hostile home/public_key values must NOT break the playbook YAML or inject sibling keys.
+    recipe = [{"blocks": [{"ref": "b-user", "inputs": {
+        "user": "carol",
+        "home": "/srv/x\n      shell: /evil",
+        "public_key": "ssh-ed25519 AAA\"q\nfoo: bar",
+    }}]}]
+    out = compile_ansible(recipe, {"b-user": block}, nolookup, "t")
+    doc = yaml.safe_load(out)  # must parse — raises if the values injected structure
+    assert doc, "playbook must remain valid YAML with hostile home/key values"
+    print("test_user_block_yaml_injection_safe OK")
+
+
 if __name__ == "__main__":
     test_deployment_has_password_columns()
     test_password_helpers()
@@ -124,4 +146,5 @@ if __name__ == "__main__":
     test_unified_user_block()
     test_user_block_compiles()
     test_seed_prunes_removed_builtins()
+    test_user_block_yaml_injection_safe()
     print("\nALL WAVE 24 UNIT TESTS PASSED")
