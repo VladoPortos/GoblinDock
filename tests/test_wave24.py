@@ -10,7 +10,14 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 os.environ.setdefault("GOBLINDOCK_DEV", "1")
 # Point the DB at a throwaway file BEFORE importing app.config/app.db (config reads env at import).
-os.environ["GOBLINDOCK_DB"] = tempfile.mktemp(suffix=".sqlite3")
+_DB = os.path.join(tempfile.gettempdir(), "gd-wave24-test.sqlite3")
+for _ext in ("", "-wal", "-shm"):
+    try:
+        os.remove(_DB + _ext)
+    except OSError:
+        pass
+os.environ["GOBLINDOCK_DB"] = _DB
+os.environ.setdefault("GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(), "gd-data-test"))
 
 
 def test_deployment_has_password_columns():
