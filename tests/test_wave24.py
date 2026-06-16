@@ -45,6 +45,11 @@ def test_auto_root_password_setting():
     assert appsettings.auto_root_password_enabled() is False
     appsettings.set_setting(appsettings.AUTO_ROOT_PASSWORD, "1")
     assert appsettings.auto_root_password_enabled() is True
+    # Junk / empty stored values must fail OPEN (feature stays on).
+    appsettings.set_setting(appsettings.AUTO_ROOT_PASSWORD, "garbage")
+    assert appsettings.auto_root_password_enabled() is True
+    appsettings.set_setting(appsettings.AUTO_ROOT_PASSWORD, "")
+    assert appsettings.auto_root_password_enabled() is True
     print("test_auto_root_password_setting OK")
 
 

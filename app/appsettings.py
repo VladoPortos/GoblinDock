@@ -40,4 +40,5 @@ def get_job_retention_days() -> int:
 
 def auto_root_password_enabled() -> bool:
     """Whether to auto-generate + store a root password on each deploy. Default ON."""
+    # Any non-"0" value (including unset/empty/corrupt) keeps the feature ON — safe default.
     return get_setting(AUTO_ROOT_PASSWORD, "1") != "0"
