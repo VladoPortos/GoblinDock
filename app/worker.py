@@ -48,7 +48,8 @@ from .recipes import (
     load_recipe,
     merge_deploy_inputs,
 )
-from .security import decrypt, encrypt
+from .security import crypt_sha512, decrypt, encrypt, gen_vm_password
+from .appsettings import auto_root_password_enabled
 from . import statebus
 
 _worker_thread: Optional[threading.Thread] = None
@@ -296,7 +297,8 @@ def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_p
         raise RuntimeError(f"ansible {label} failed (status={status}, rc={rc})")
 
 
-def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str]) -> str:
+def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str],
+                         root_pw_hash: str = "") -> str:
     """Full #cloud-config: a goblin user, qemu-guest-agent (so the IP is reported),
     python3 (for ansible), and the cloud-init phase blocks run at first boot."""
     # Sink-level hostname hardening: coerce to a valid RFC1123-ish hostname so a
@@ -315,6 +317,13 @@ def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str]) 
     keys = [k.strip() for k in (pubkeys or []) if k and k.strip()]
     if keys:
         lines += ["    ssh_authorized_keys:"] + [f"      - {k}" for k in keys]
+    if root_pw_hash:
+        lines += [
+            "chpasswd:",
+            "  expire: false",
+            "  users:",
+            f'    - {{name: root, password: "{root_pw_hash}", type: hash}}',
+        ]
     lines += ["package_update: true", "packages:", "  - qemu-guest-agent", "  - python3"]
 
     script = [c for c in recipe_cmds if c.strip() and c.strip() != "set -e"]
@@ -468,6 +477,8 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     user_pubkey = _ssh_pubkey(job.created_by)
     managed_priv, managed_pub = _managed_keypair()
     pubkeys = [k for k in (user_pubkey, managed_pub) if k]
+    root_pw = gen_vm_password() if auto_root_password_enabled() else ""
+    cred_user = ""
     import urllib.parse
     params = {
         "name": dep.name,
@@ -507,15 +518,22 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     used_snippet = False
     if conn.ssh_key_path:
         try:
-            cc = _deploy_cloud_config(dep.name, pubkeys, recipe_cmds)
+            cc = _deploy_cloud_config(dep.name, pubkeys, recipe_cmds,
+                                      root_pw_hash=crypt_sha512(root_pw) if root_pw else "")
             volid = write_snippet_over_ssh(conn, f"gd-deploy-{new_vmid}.yml", cc)
             params["cicustom"] = f"user={volid}"
             used_snippet = True
+            if root_pw:
+                cred_user = "root"
             ctx.log(f"[{_ts()}] cloud-init: guest-agent + first-boot blocks via snippet {volid}", "l-acc")
         except Exception as e:  # noqa: BLE001
             ctx.log(f"[{_ts()}] snippet unavailable ({e}); using native cloud-init", "l-warn")
     if not used_snippet:
         params["ciuser"] = "goblin"
+        if root_pw:
+            # Native cloud-init applies cipassword to the ciuser (goblin), not root.
+            params["cipassword"] = root_pw
+            cred_user = "goblin"
         if pubkeys:
             params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
     px.set_config(new_vmid, node=node, **params)
@@ -558,6 +576,9 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         d.disk = disk_gb
         d.status = "running"
         d.error = ""
+        # Always overwrite so a rebuild (or a disabled setting) reflects the CURRENT VM.
+        d.root_password_enc = encrypt(root_pw) if root_pw else ""
+        d.cred_user = cred_user
         s.add(d)
 
     ctx.progress(100, "Complete")

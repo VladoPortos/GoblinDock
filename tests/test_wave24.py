@@ -139,6 +139,17 @@ def test_user_block_yaml_injection_safe():
     print("test_user_block_yaml_injection_safe OK")
 
 
+def test_cloud_config_root_password():
+    from app.worker import _deploy_cloud_config
+    cc = _deploy_cloud_config("vm1", ["ssh-ed25519 AAAA goblindock"], [], root_pw_hash="$6$abc$DEFhash")
+    assert "chpasswd:" in cc, cc
+    assert "name: root" in cc and "type: hash" in cc, cc
+    assert "$6$abc$DEFhash" in cc, "the hash must be embedded"
+    cc2 = _deploy_cloud_config("vm1", [], [], root_pw_hash="")
+    assert "chpasswd:" not in cc2, cc2
+    print("test_cloud_config_root_password OK")
+
+
 if __name__ == "__main__":
     test_deployment_has_password_columns()
     test_password_helpers()
@@ -147,4 +158,5 @@ if __name__ == "__main__":
     test_user_block_compiles()
     test_seed_prunes_removed_builtins()
     test_user_block_yaml_injection_safe()
+    test_cloud_config_root_password()
     print("\nALL WAVE 24 UNIT TESTS PASSED")
