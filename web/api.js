@@ -160,6 +160,8 @@ window.API = (function () {
     purgeAllJobs: () => req('POST', '/api/jobs/purge-all'),
     jobRetentionGet: () => req('GET', '/api/settings/job-retention'),
     jobRetentionSet: (days) => req('PUT', '/api/settings/job-retention', { days }),
+    autoRootPwGet: () => req('GET', '/api/settings/auto-root-password'),
+    autoRootPwSet: (enabled) => req('PUT', '/api/settings/auto-root-password', { enabled }),
     audit: (params) => req('GET', '/api/audit' + qs(params)),
 
     // admin: scheduled DB backups

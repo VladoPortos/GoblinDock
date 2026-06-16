@@ -1851,6 +1851,23 @@ def set_job_retention(body: JobRetentionBody, user: User = Depends(require_admin
     return {"ok": True, "days": body.days}
 
 
+class AutoRootPwBody(BaseModel):
+    enabled: bool = True
+
+
+@router.get("/settings/auto-root-password")
+def get_auto_root_password(user: User = Depends(current_user)):
+    from . import appsettings
+    return {"enabled": appsettings.auto_root_password_enabled()}
+
+
+@router.put("/settings/auto-root-password")
+def set_auto_root_password(body: AutoRootPwBody, user: User = Depends(require_admin)):
+    from . import appsettings
+    appsettings.set_setting(appsettings.AUTO_ROOT_PASSWORD, "1" if body.enabled else "0")
+    return {"ok": True, "enabled": body.enabled}
+
+
 @router.get("/jobs/{job_id}/stream")
 async def stream_job(job_id: int, request: Request, user: User = Depends(current_user)):
     """SSE: emit a job snapshot whenever steps/logs/progress change."""

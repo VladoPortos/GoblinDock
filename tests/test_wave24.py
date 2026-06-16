@@ -193,6 +193,23 @@ def test_vm_detail_and_reveal():
     print("test_vm_detail_and_reveal OK")
 
 
+def test_auto_root_password_endpoints():
+    from sqlmodel import Session
+    from app.db import init_db, engine
+    from app.models import User
+    from app.security import hash_password
+    from app.api import get_auto_root_password, set_auto_root_password, AutoRootPwBody
+    init_db()
+    with Session(engine) as s:
+        admin = User(email="admin24@x.io", name="Admin", password_hash=hash_password("xxxxxxxxxxxx"), role="admin")
+        s.add(admin); s.commit(); s.refresh(admin)
+        set_auto_root_password(AutoRootPwBody(enabled=False), user=admin)
+        assert get_auto_root_password(user=admin) == {"enabled": False}
+        set_auto_root_password(AutoRootPwBody(enabled=True), user=admin)
+        assert get_auto_root_password(user=admin) == {"enabled": True}
+    print("test_auto_root_password_endpoints OK")
+
+
 if __name__ == "__main__":
     test_deployment_has_password_columns()
     test_password_helpers()
@@ -203,4 +220,5 @@ if __name__ == "__main__":
     test_user_block_yaml_injection_safe()
     test_cloud_config_root_password()
     test_vm_detail_and_reveal()
+    test_auto_root_password_endpoints()
     print("\nALL WAVE 24 UNIT TESTS PASSED")
