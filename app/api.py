@@ -1080,9 +1080,14 @@ def reveal_vm_credentials(dep_id: int, response: Response,
     if not dep.root_password_enc:
         raise HTTPException(404, "no stored password for this VM")
     response.headers["Cache-Control"] = "no-store"
-    record_audit(session, user, "vm.password.reveal", "vm", dep.id, dep.name)
+    record_audit(session, user, "vm.password.reveal", "deployment", dep.id, dep.name)
     session.commit()
-    return {"user": dep.cred_user or "root", "password": decrypt(dep.root_password_enc)}
+    password = decrypt(dep.root_password_enc)
+    if not password:
+        # Stored token failed to decrypt (key rotation / corruption) — surface it rather
+        # than returning a misleading empty password.
+        raise HTTPException(500, "credential decryption failed")
+    return {"user": dep.cred_user or "root", "password": password}
 
 
 @router.websocket("/vms/{dep_id}/vnc")

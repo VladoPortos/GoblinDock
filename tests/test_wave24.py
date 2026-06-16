@@ -181,6 +181,15 @@ def test_vm_detail_and_reveal():
             assert False, "expected 403"
         except HTTPException as e:
             assert e.status_code == 403, e.status_code
+    # a VM with no stored password → 404 on reveal
+    with Session(engine) as s:
+        nopw = Deployment(name="vm24b", owner_id=oid, status="stopped")
+        s.add(nopw); s.commit(); s.refresh(nopw)
+        try:
+            reveal_vm_credentials(nopw.id, Response(), user=s.get(User, oid), session=s)
+            assert False, "expected 404"
+        except HTTPException as e:
+            assert e.status_code == 404, e.status_code
     print("test_vm_detail_and_reveal OK")
 
 
