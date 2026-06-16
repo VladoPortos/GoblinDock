@@ -179,6 +179,10 @@ class Deployment(SQLModel, table=True):
     tags: str = ""
     notes: str = ""
     error: str = ""
+    # Fernet-encrypted VM credential password ('' = none generated). See app/security.encrypt.
+    root_password_enc: str = ""
+    # OS user the password is for: 'root' (snippet path) | 'goblin' (native cloud-init fallback).
+    cred_user: str = ""
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -269,7 +273,7 @@ class Audit(SQLModel, table=True):
 
 class Setting(SQLModel, table=True):
     """Tiny key/value store for runtime-editable app settings (unlike env config,
-    these can be changed from the UI). Currently holds the job-history retention."""
+    these can be changed from the UI)."""
     __tablename__ = "app_settings"
     key: str = Field(primary_key=True)
     value: str = ""

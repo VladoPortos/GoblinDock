@@ -229,9 +229,11 @@
         h('button', { className: tab === 'networks' ? 'active' : '', onClick: () => setTab('networks') }, h(Icon, { name: 'network', size: 14 }), 'Networks'),
         h('button', { className: tab === 'users' ? 'active' : '', onClick: () => setTab('users') }, h(Icon, { name: 'users', size: 14 }), 'Users'),
         h('button', { className: tab === 'backups' ? 'active' : '', onClick: () => setTab('backups') }, h(Icon, { name: 'download', size: 14 }), 'Backups'),
-        h('button', { className: tab === 'audit' ? 'active' : '', onClick: () => setTab('audit') }, h(Icon, { name: 'history', size: 14 }), 'Audit')),
+        h('button', { className: tab === 'audit' ? 'active' : '', onClick: () => setTab('audit') }, h(Icon, { name: 'history', size: 14 }), 'Audit'),
+        h('button', { className: tab === 'prefs' ? 'active' : '', onClick: () => setTab('prefs') }, h(Icon, { name: 'sliders', size: 14 }), 'Preferences')),
       tab === 'connections' ? h(Connections) : tab === 'networks' ? h(Networks)
-        : tab === 'users' ? h(Users) : tab === 'backups' ? h(Backups) : h(AuditLog));
+        : tab === 'users' ? h(Users) : tab === 'backups' ? h(Backups)
+        : tab === 'prefs' ? h(Preferences) : h(AuditLog));
   }
 
   /* ---- Connections ---- */
@@ -622,6 +624,24 @@
                 h('td', { className: 'mono', style: { fontSize: 12 } }, b.name),
                 h('td', { className: 'mono hint', style: { fontSize: 12 } }, fmtBytes(b.bytes)),
                 h('td', { className: 'hint', style: { fontSize: 12 } }, fmtTs(b.modified))))))));
+  }
+
+  function Preferences() {
+    const [on, setOn] = useState(null);
+    React.useEffect(() => { window.API.autoRootPwGet().then((r) => setOn(!!r.enabled)).catch((e) => { setOn(true); toast(e.message || 'Could not load setting', 'err'); }); }, []);
+    const toggle = async () => {
+      const next = !on;
+      try { await window.API.autoRootPwSet(next); setOn(next); toast('Saved', 'ok'); }
+      catch (e) { toast(e.message || 'failed', 'err'); }
+    };
+    return h('div', { className: 'card card-pad' },
+      h('div', { className: 'row', style: { justifyContent: 'space-between', gap: 16 } },
+        h('div', null,
+          h('div', { className: 'panel-title' }, 'Auto-generate VM root password'),
+          h('p', { className: 'hint', style: { fontSize: 12, marginTop: 4, maxWidth: 520 } },
+            'On every deploy, set a random root password and store it encrypted so you can read it on the VM page (usable at the Proxmox console). Turn off to leave root locked.')),
+        h('button', { className: 'btn ' + (on ? 'primary' : ''), onClick: toggle, disabled: on === null },
+          h(Icon, { name: on ? 'check' : 'x', size: 14 }), on === null ? '…' : on ? 'On' : 'Off')));
   }
 
   window.BlocksLib = BlocksLib;

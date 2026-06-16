@@ -93,6 +93,7 @@ window.API = (function () {
     patchVm: (id, p) => req('PATCH', `/api/deployments/${id}`, p),
     vmDetail: (id) => req('GET', `/api/vms/${id}/detail`),
     vncProxy: (id) => req('POST', `/api/vms/${id}/vncproxy`),
+    revealVmCredentials: (id) => req('POST', `/api/vms/${id}/credentials/reveal`),
 
     // snapshots
     vmSnapshots: (id) => req('GET', `/api/vms/${id}/snapshots`),
@@ -159,6 +160,8 @@ window.API = (function () {
     purgeAllJobs: () => req('POST', '/api/jobs/purge-all'),
     jobRetentionGet: () => req('GET', '/api/settings/job-retention'),
     jobRetentionSet: (days) => req('PUT', '/api/settings/job-retention', { days }),
+    autoRootPwGet: () => req('GET', '/api/settings/auto-root-password'),
+    autoRootPwSet: (enabled) => req('PUT', '/api/settings/auto-root-password', { enabled }),
     audit: (params) => req('GET', '/api/audit' + qs(params)),
 
     // admin: scheduled DB backups

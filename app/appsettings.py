@@ -10,6 +10,7 @@ from .models import Setting
 
 # Keys
 JOB_RETENTION_DAYS = "job_retention_days"   # "0" = keep forever (no auto-prune)
+AUTO_ROOT_PASSWORD = "auto_root_password"   # "1" = generate a root password per deploy (default on)
 
 
 def get_setting(key: str, default: str = "") -> str:
@@ -35,3 +36,9 @@ def get_job_retention_days() -> int:
         return max(0, int(get_setting(JOB_RETENTION_DAYS, "0") or 0))
     except (TypeError, ValueError):
         return 0
+
+
+def auto_root_password_enabled() -> bool:
+    """Whether to auto-generate + store a root password on each deploy. Default ON."""
+    # Any non-"0" value (including unset/empty/corrupt) keeps the feature ON — safe default.
+    return get_setting(AUTO_ROOT_PASSWORD, "1") != "0"
