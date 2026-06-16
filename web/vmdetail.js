@@ -279,6 +279,7 @@
     const load = () => window.API.vmDetail(depId).then((x) => { setD(x); setErr(null); }).catch((e) => setErr(e.message || 'failed'));
     useEffect(() => {
       if (!depId) { go('dashboard'); return undefined; }
+      setCred(null);
       load();
       const id = setInterval(load, 5000);
       return () => clearInterval(id);
@@ -375,7 +376,7 @@
               h('span', { className: 'hint', style: { fontSize: 12.5 } }, 'Password'),
               h('span', { className: 'row', style: { gap: 8, alignItems: 'center' } },
                 cred
-                  ? h('span', { className: 'mono copy', style: { fontSize: 12.5, fontWeight: 600 } }, cred.password)
+                  ? h('span', { className: 'mono copy', style: { fontSize: 12.5, fontWeight: 600 }, onClick: () => copyToClipboard(cred.password, 'Password copied') }, cred.password)
                   : h('span', { className: 'mono', style: { fontSize: 13, letterSpacing: 2 } }, '••••••••'),
                 h('button', { className: 'btn ghost sm', onClick: cred ? () => setCred(null) : revealCred },
                   h(Icon, { name: cred ? 'eyeOff' : 'eye', size: 14 }), cred ? 'Hide' : 'Show'))),
