@@ -150,6 +150,40 @@ def test_cloud_config_root_password():
     print("test_cloud_config_root_password OK")
 
 
+def test_vm_detail_and_reveal():
+    from sqlmodel import Session
+    from fastapi import Response, HTTPException
+    from app.db import init_db, engine
+    from app.models import User, Deployment
+    from app.security import encrypt, hash_password
+    from app.api import vm_detail, reveal_vm_credentials
+    init_db()
+    with Session(engine) as s:
+        owner = User(email="owner24@x.io", name="Owner", password_hash=hash_password("xxxxxxxxxxxx"), role="user")
+        s.add(owner); s.commit(); s.refresh(owner)
+        dep = Deployment(name="vm24", owner_id=owner.id, status="stopped",
+                         root_password_enc=encrypt("SuperSecretPw24"), cred_user="root")
+        s.add(dep); s.commit(); s.refresh(dep)
+        oid, did = owner.id, dep.id
+    with Session(engine) as s:
+        out = vm_detail(did, user=s.get(User, oid), session=s)
+        assert out["hasRootPassword"] is True
+        assert out["credUser"] == "root"
+        assert "SuperSecretPw24" not in json.dumps(out), "plaintext must not be serialized"
+    with Session(engine) as s:
+        r = reveal_vm_credentials(did, Response(), user=s.get(User, oid), session=s)
+        assert r == {"user": "root", "password": "SuperSecretPw24"}, r
+    with Session(engine) as s:
+        other = User(email="other24@x.io", name="Other", password_hash=hash_password("xxxxxxxxxxxx"), role="user")
+        s.add(other); s.commit(); s.refresh(other)
+        try:
+            reveal_vm_credentials(did, Response(), user=other, session=s)
+            assert False, "expected 403"
+        except HTTPException as e:
+            assert e.status_code == 403, e.status_code
+    print("test_vm_detail_and_reveal OK")
+
+
 if __name__ == "__main__":
     test_deployment_has_password_columns()
     test_password_helpers()
@@ -159,4 +193,5 @@ if __name__ == "__main__":
     test_seed_prunes_removed_builtins()
     test_user_block_yaml_injection_safe()
     test_cloud_config_root_password()
+    test_vm_detail_and_reveal()
     print("\nALL WAVE 24 UNIT TESTS PASSED")

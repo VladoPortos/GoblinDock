@@ -46,6 +46,7 @@ from .recipes import ask_map, compile_playbook, lint_block, load_recipe
 from . import backup
 from . import statebus
 from .security import (
+    decrypt,
     encrypt,
     hash_password,
     hash_widget_key,
@@ -767,6 +768,8 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         "reqCpu": dep.cpu, "reqRam": dep.ram, "reqDisk": dep.disk,
         "jobId": job.id if job else None,
         "live": None, "config": None, "agent": None, "consoleReady": False,
+        "hasRootPassword": bool(dep.root_password_enc),
+        "credUser": dep.cred_user or "root",
     }
     if conn and dep.vmid and dep.status not in ("working", "error"):
         try:
@@ -1066,6 +1069,20 @@ def vm_vncproxy(dep_id: int, user: User = Depends(current_user), session: Sessio
     _VNC_SESS[tok] = {"vmid": dep.vmid, "node": node, "port": r["port"],
                       "ticket": r["ticket"], "dep_id": dep_id, "exp": now + 30}
     return {"ticket": r["ticket"], "wsToken": tok}
+
+
+@router.post("/vms/{dep_id}/credentials/reveal")
+def reveal_vm_credentials(dep_id: int, response: Response,
+                          user: User = Depends(current_user),
+                          session: Session = Depends(get_session)):
+    # POST (CSRF-protected) + audited + never cached — mirrors POST /secrets/{id}/reveal.
+    dep = _owned_deployment(session, dep_id, user)
+    if not dep.root_password_enc:
+        raise HTTPException(404, "no stored password for this VM")
+    response.headers["Cache-Control"] = "no-store"
+    record_audit(session, user, "vm.password.reveal", "vm", dep.id, dep.name)
+    session.commit()
+    return {"user": dep.cred_user or "root", "password": decrypt(dep.root_password_enc)}
 
 
 @router.websocket("/vms/{dep_id}/vnc")
