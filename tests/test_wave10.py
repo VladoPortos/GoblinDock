@@ -392,55 +392,38 @@ def test_user_block_passwords():
     import yaml
     from app.seed import seed_blocks
     from app.models import Block
-    from app.recipes import compile_cloudinit, compile_playbook, load_recipe
+    from app.recipes import compile_playbook, load_recipe
     from sqlmodel import select
     seed_blocks()
     with session_scope() as s:
         blocks = {b.key: b for b in s.exec(select(Block)).all()}
         bu = blocks["b-user"]
-        bs = blocks["b-ssh"]
         bu_schema = json.loads(bu.input_schema_json)
         assert any(f["name"] == "password" and f["type"] == "password" for f in bu_schema), \
             "b-user must have a 'password' password field"
         assert any(f["name"] == "ssh_password_login" and f["type"] == "bool" for f in bu_schema), \
             "b-user must have ssh_password_login bool field"
-        bs_schema = json.loads(bs.input_schema_json)
-        pw = next(f for f in bs_schema if f["name"] == "password")
-        assert pw.get("optional") is True, "b-ssh password field must be optional"
+        pw = next(f for f in bu_schema if f["name"] == "password")
+        assert pw.get("optional") is True, "b-user password field must be optional"
 
-        # --- b-ssh cloudinit rendering with password + ssh_password_login ---
-        recipe = [{"id": "s-conf", "name": "Configure", "blocks": [
-            {"ref": "b-ssh", "name": "User & SSH Key",
-             "inputs": {"user": "goblin", "public_key": "ssh-ed25519 AAA", "sudo": True,
-                        "password": "s3cr:et's", "ssh_password_login": True}},
-        ]}]
-        cmds = compile_cloudinit(recipe, blocks, lambda ns, n: "")
-        joined = "\n".join(cmds)
-        assert "chpasswd" in joined, "chpasswd must appear when password given"
-        assert "00-goblindock.conf" in joined, "SSH password login conf must appear when flag is True"
-
-        # empty password + ssh_password_login False → guard renders inert
-        recipe[0]["blocks"][0]["inputs"]["password"] = ""
-        recipe[0]["blocks"][0]["inputs"]["ssh_password_login"] = False
-        joined2 = "\n".join(compile_cloudinit(recipe, blocks, lambda ns, n: ""))
-        # render_shell shlex-quotes empty string to '' so [ -n '' ] is in output
-        assert "[ -n '' ]" in joined2 or '[ -n "" ]' in joined2, \
-            f"empty password guard must render inert; got: {joined2!r}"
-        assert "if false" in joined2, \
-            f"ssh_password_login=False must render as 'if false'; got: {joined2!r}"
-
-        # --- b-user ansible playbook with a nasty password ---
+        # --- b-user ansible playbook with a nasty password + ssh_password_login ---
         recipe_u = [{"id": "s-conf", "name": "Configure", "blocks": [
-            {"ref": "b-user", "name": "Create User",
+            {"ref": "b-user", "name": "User",
              "inputs": {"user": "deploy", "groups": ["sudo"], "shell": "/bin/bash",
                         "password": "o'br\"ien:x", "ssh_password_login": True}},
         ]}]
         play = compile_playbook(load_recipe(json.dumps(recipe_u)), blocks, "t")
-        parsed = yaml.safe_load(play)
-        assert parsed, "playbook must parse as valid YAML"
-        text = play
-        assert "chpasswd" in text, "chpasswd must appear in ansible playbook"
-        assert "00-goblindock.conf" in text, "SSH login conf must appear in ansible playbook"
+        assert yaml.safe_load(play), "playbook must parse as valid YAML"
+        assert "chpasswd" in play, "chpasswd must appear in ansible playbook"
+        assert "00-goblindock.conf" in play, "SSH login conf must appear in ansible playbook"
+
+        # empty password + ssh_password_login False → those tasks render inert (when: false)
+        recipe_u[0]["blocks"][0]["inputs"]["password"] = ""
+        recipe_u[0]["blocks"][0]["inputs"]["ssh_password_login"] = False
+        play2 = compile_playbook(load_recipe(json.dumps(recipe_u)), blocks, "t")
+        assert yaml.safe_load(play2), "playbook must parse as valid YAML"
+        assert "when: false" in play2, \
+            f"empty password / ssh_password_login False must render 'when: false'; got: {play2!r}"
     print("test_user_block_passwords OK")
 
 
@@ -470,9 +453,7 @@ def test_password_input_type():
     with session_scope() as s:
         blocks = {b.key: b for b in s.exec(select(Block)).all()}
         bu_schema = json.loads(blocks["b-user"].input_schema_json)
-        assert next(f for f in bu_schema if f["name"] == "password")["type"] == "password"
-        bs_schema = json.loads(blocks["b-ssh"].input_schema_json)
-        pw = next(f for f in bs_schema if f["name"] == "password")
+        pw = next(f for f in bu_schema if f["name"] == "password")
         assert pw["type"] == "password" and pw.get("optional") is True
 
     recipe = [{"id": "s-conf", "name": "Configure", "blocks": [

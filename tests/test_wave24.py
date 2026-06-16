@@ -53,8 +53,75 @@ def test_auto_root_password_setting():
     print("test_auto_root_password_setting OK")
 
 
+def test_unified_user_block():
+    from app.seed import BUILTIN_BLOCKS
+    byk = {b["key"]: b for b in BUILTIN_BLOCKS}
+    assert "b-ssh" not in byk, "b-ssh must be removed (merged into b-user)"
+    b = byk["b-user"]
+    assert b["name"] == "User", b["name"]
+    names = {f["name"] for f in b["input_schema"]}
+    for need in ("user", "password", "public_key", "groups", "home", "shell",
+                 "sudoers", "nopasswd", "ssh_password_login"):
+        assert need in names, f"missing field {need}"
+    a = b["ansible"]
+    assert "ansible.posix.authorized_key" in a, "must push SSH key"
+    assert "visudo -cf %s" in a, "sudoers must be validated"
+    assert "NOPASSWD:ALL" in a and "ALL=(ALL) ALL" in a, "both sudo modes present"
+    print("test_unified_user_block OK")
+
+
+def test_user_block_compiles():
+    from app.seed import BUILTIN_BLOCKS
+    from app.recipes import compile_ansible
+    from app.models import Block
+    spec = next(b for b in BUILTIN_BLOCKS if b["key"] == "b-user")
+    block = Block(key="b-user", phase="ansible", name="User",
+                  ansible_template=spec["ansible"],
+                  input_schema_json=json.dumps(spec["input_schema"]))
+    nolookup = lambda kind, name: ""  # noqa: E731
+    # passwordless sudo ON → the NOPASSWD sudoers task is ACTIVE (when: true and true)
+    recipe = [{"blocks": [{"ref": "b-user",
+                           "inputs": {"user": "alice", "sudoers": True, "nopasswd": True}}]}]
+    out = compile_ansible(recipe, {"b-user": block}, nolookup, "t")
+    assert "alice ALL=(ALL) NOPASSWD:ALL" in out, out
+    assert "/etc/sudoers.d/90-alice" in out
+    assert "when: true and true" in out, "passwordless sudoers task must be active"
+    # sudoers OFF → the sudoers tasks still render but are gated off. Ansible always emits
+    # the task body, so assert the GATING (when: false ...), not the absence of the path.
+    recipe2 = [{"blocks": [{"ref": "b-user", "inputs": {"user": "bob", "sudoers": False}}]}]
+    out2 = compile_ansible(recipe2, {"b-user": block}, nolookup, "t")
+    assert "when: false and false" in out2, "sudoers tasks must be gated off when sudoers=False"
+    print("test_user_block_compiles OK")
+
+
+def test_seed_prunes_removed_builtins():
+    from sqlmodel import select
+    from app.db import session_scope
+    from app.models import Block
+    from app.seed import seed_blocks
+    seed_blocks()
+    with session_scope() as s:
+        s.add(Block(key="b-ssh", name="Legacy", kind="builtin", builtin=True,
+                    phase="cloudinit", input_schema_json="[]"))
+    seed_blocks()
+    with session_scope() as s:
+        assert s.exec(select(Block).where(Block.key == "b-ssh")).first() is None, \
+            "removed builtin must be pruned"
+    with session_scope() as s:
+        s.add(Block(key="c-mine", name="Mine", kind="custom", builtin=False,
+                    phase="ansible", input_schema_json="[]"))
+    seed_blocks()
+    with session_scope() as s:
+        assert s.exec(select(Block).where(Block.key == "c-mine")).first() is not None, \
+            "custom block must NOT be pruned"
+    print("test_seed_prunes_removed_builtins OK")
+
+
 if __name__ == "__main__":
     test_deployment_has_password_columns()
     test_password_helpers()
     test_auto_root_password_setting()
+    test_unified_user_block()
+    test_user_block_compiles()
+    test_seed_prunes_removed_builtins()
     print("\nALL WAVE 24 UNIT TESTS PASSED")

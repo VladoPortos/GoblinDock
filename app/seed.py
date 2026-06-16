@@ -61,28 +61,6 @@ BUILTIN_BLOCKS = [
         cloudinit="yum install -y {packages}",
     ),
     dict(
-        key="b-ssh", name="User & SSH Key", category="Users / SSH", icon="key",
-        section="Accounts", description="create user, push key, sudo, optional password",
-        input_schema=[
-            {"name": "user", "type": "text", "default": "goblin", "label": "Username"},
-            {"name": "public_key", "type": "secret", "default": "{{ secrets.TEAM_SSH_PUBKEY }}", "label": "Public key"},
-            {"name": "sudo", "type": "bool", "default": True, "label": "Passwordless sudo"},
-            {"name": "password", "type": "password", "default": "", "label": "Password · optional", "optional": True},
-            {"name": "ssh_password_login", "type": "bool", "default": False, "label": "Allow SSH password login"},
-        ],
-        ansible="- name: User & SSH Key\n  ansible.builtin.user:\n    name: {user}\n    groups: [sudo]\n    shell: /bin/bash",
-        cloudinit=(
-            "id {user} >/dev/null 2>&1 || useradd -m -s /bin/bash {user}\n"
-            "usermod -aG sudo {user} || true\n"
-            "install -d -m700 /home/{user}/.ssh\n"
-            "printf '%s\\n' {public_key} >> /home/{user}/.ssh/authorized_keys\n"
-            "chown -R {user}:{user} /home/{user}/.ssh\n"
-            "chmod 600 /home/{user}/.ssh/authorized_keys\n"
-            "if [ -n {password} ]; then echo {user}:{password} | chpasswd; fi\n"
-            "if {ssh_password_login}; then printf 'PasswordAuthentication yes\\n' > /etc/ssh/sshd_config.d/00-goblindock.conf; systemctl restart ssh || systemctl restart sshd; fi"
-        ),
-    ),
-    dict(
         key="b-script", name="Run Script", category="Scripts", icon="code",
         section="Scripts", description="shell snippet run on the VM",
         input_schema=[
@@ -133,33 +111,79 @@ BUILTIN_BLOCKS = [
 
     # ---- extended pre-built blocks (Ansible-module backed, simple inputs) ----
     dict(
-        key="b-user", name="Create User", category="Users / SSH", icon="key",
-        section="Accounts", description="create a Linux user + groups + password",
+        key="b-user", name="User", category="Users / SSH", icon="user",
+        section="Accounts",
+        description="create a Linux user: groups, SSH key, sudo, password, shell, home",
         input_schema=[
             {"name": "user", "type": "text", "default": "deploy", "label": "Username"},
-            {"name": "groups", "type": "tags", "default": ["sudo"], "label": "Groups"},
+            {"name": "password", "type": "password", "default": "", "label": "Password · optional", "optional": True},
+            {"name": "public_key", "type": "secret", "default": "", "label": "SSH public key · optional", "optional": True},
+            {"name": "groups", "type": "tags", "default": [], "label": "Extra groups"},
+            {"name": "home", "type": "text", "default": "", "label": "Home directory · optional", "optional": True},
             {"name": "shell", "type": "text", "default": "/bin/bash", "label": "Login shell"},
-            {"name": "password", "type": "password", "default": "", "label": "Password"},
+            {"name": "sudoers", "type": "bool", "default": False, "label": "Add to sudoers"},
+            {"name": "nopasswd", "type": "bool", "default": False, "label": "Passwordless sudo (NOPASSWD)"},
             {"name": "ssh_password_login", "type": "bool", "default": False, "label": "Allow SSH password login"},
         ],
         ansible=(
-            "- name: Create User\n"
+            "- name: User\n"
             "  ansible.builtin.user:\n"
             "    name: {user}\n"
             "    groups: {groups_yamlq}\n"
             "    append: true\n"
             "    create_home: true\n"
             "    shell: {shell}\n"
+            "- name: Set home directory\n"
+            "  ansible.builtin.user:\n"
+            "    name: {user}\n"
+            "    home: {home}\n"
+            "    move_home: true\n"
+            "  when: {home_set}\n"
+            "- name: Push SSH key\n"
+            "  ansible.posix.authorized_key:\n"
+            "    user: {user}\n"
+            "    state: present\n"
+            "    key: \"{public_key}\"\n"
+            "  when: {public_key_set}\n"
             "- name: Set login password\n"
             "  ansible.builtin.shell: echo {user_q}:{password_q} | chpasswd\n"
             "  when: {password_set}\n"
+            "- name: Sudoers (passwordless)\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /etc/sudoers.d/90-{user}\n"
+            "    content: \"{user} ALL=(ALL) NOPASSWD:ALL\\n\"\n"
+            "    mode: '0440'\n"
+            "    validate: 'visudo -cf %s'\n"
+            "  when: {sudoers} and {nopasswd}\n"
+            "- name: Sudoers (password required)\n"
+            "  ansible.builtin.copy:\n"
+            "    dest: /etc/sudoers.d/90-{user}\n"
+            "    content: \"{user} ALL=(ALL) ALL\\n\"\n"
+            "    mode: '0440'\n"
+            "    validate: 'visudo -cf %s'\n"
+            "  when: {sudoers} and not {nopasswd}\n"
             "- name: Allow SSH password login\n"
             "  ansible.builtin.shell: |\n"
             "    printf 'PasswordAuthentication yes\\n' > /etc/ssh/sshd_config.d/00-goblindock.conf\n"
             "    systemctl restart ssh || systemctl restart sshd\n"
             "  when: {ssh_password_login}"
         ),
-        cloudinit="id {user} >/dev/null 2>&1 || useradd -m -s {shell} {user}",
+        cloudinit=(
+            "id {user} >/dev/null 2>&1 || useradd -m -s {shell} {user}\n"
+            "if [ -n {home} ]; then usermod -d {home} -m {user} || true; fi\n"
+            "for g in {groups}; do usermod -aG \"$g\" {user} || true; done\n"
+            "install -d -m700 /home/{user}/.ssh\n"
+            "if [ -n {public_key} ]; then printf '%s\\n' {public_key} >> /home/{user}/.ssh/authorized_keys; "
+            "chown -R {user}:{user} /home/{user}/.ssh; chmod 600 /home/{user}/.ssh/authorized_keys; fi\n"
+            "if [ -n {password} ]; then echo {user}:{password} | chpasswd; fi\n"
+            "if {sudoers}; then\n"
+            "  if {nopasswd}; then printf '%s ALL=(ALL) NOPASSWD:ALL\\n' {user} > /etc/sudoers.d/90-{user};\n"
+            "  else printf '%s ALL=(ALL) ALL\\n' {user} > /etc/sudoers.d/90-{user}; fi\n"
+            "  chmod 440 /etc/sudoers.d/90-{user}; visudo -cf /etc/sudoers.d/90-{user} || rm -f /etc/sudoers.d/90-{user}\n"
+            "fi\n"
+            "if {ssh_password_login}; then printf 'PasswordAuthentication yes\\n' > /etc/ssh/sshd_config.d/00-goblindock.conf; "
+            "systemctl restart ssh || systemctl restart sshd; fi"
+        ),
     ),
     dict(
         key="b-authkey", name="SSH Authorized Key", category="Users / SSH", icon="key",
@@ -687,7 +711,7 @@ BUILTIN_BLOCKS = [
             {"name": "allow_users", "type": "text", "default": "", "label": "AllowUsers (space-separated, empty = all)", "optional": True},
         ],
         # 00-goblindock-hardening sorts before 00-goblindock.conf ('-' < '.'), so on a
-        # conflict with the password-login toggle of b-ssh/b-user the hardening wins.
+        # conflict with the password-login toggle of the User block the hardening wins.
         ansible=(
             "- name: SSH Hardening\n"
             "  ansible.builtin.shell: |\n"
@@ -1095,12 +1119,19 @@ BUILTIN_BLOCKS = [
 # cloud-init = first-boot blocks (identity, or things that must exist BEFORE the
 # post-boot ansible leg — swap, so small VMs survive heavy installs); everything
 # else is post-boot ansible.
-_CLOUDINIT_BLOCKS = {"b-os", "b-ssh", "b-clean", "b-conpw", "b-swap"}
+_CLOUDINIT_BLOCKS = {"b-os", "b-clean", "b-conpw", "b-swap"}
 
 
 def seed_blocks() -> None:
     with session_scope() as s:
         existing = {b.key: b for b in s.exec(select(Block)).all()}
+        # Prune built-in blocks that were removed from the catalog (e.g. b-ssh, merged
+        # into b-user). Only ever delete OUR built-ins (kind == "builtin"); a user's
+        # custom/forked block (kind == "custom") is never touched.
+        _builtin_keys = {spec["key"] for spec in BUILTIN_BLOCKS}
+        for _k, _b in list(existing.items()):
+            if _k not in _builtin_keys and _b.kind == "builtin":
+                s.delete(_b)
         for spec in BUILTIN_BLOCKS:
             phase = "cloudinit" if spec["key"] in _CLOUDINIT_BLOCKS else "ansible"
             cur = existing.get(spec["key"])

@@ -42,7 +42,7 @@ def _blocks_by_key() -> dict:
 
 def test_account_blocks_in_accounts_section():
     bbk = _blocks_by_key()
-    for key in ("b-ssh", "b-user", "b-conpw"):
+    for key in ("b-user", "b-conpw"):
         assert bbk[key].section == "Accounts", f"{key} section is {bbk[key].section!r}"
     print("test_account_blocks_in_accounts_section OK")
 
@@ -57,7 +57,7 @@ def test_create_user_compiles_before_claude_code():
             {"ref": "b-claudecode", "name": "Claude Code", "inputs": {"user": "cloudauto"}}]},
     ]
     pb = compile_ansible(recipe, bbk, _NO_SECRETS, name="t")
-    i_user = pb.find("name: Create User")
+    i_user = pb.find("name: User")
     i_claude = pb.find("name: Install Claude Code")
     assert i_user != -1 and i_claude != -1, pb
     assert i_user < i_claude, f"Create User must compile before Claude Code\n{pb}"
