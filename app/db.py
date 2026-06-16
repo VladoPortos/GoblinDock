@@ -109,6 +109,8 @@ def _migrate() -> None:
         ],
         "deployments": [
             ("deploy_inputs_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("root_password_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("cred_user", "TEXT NOT NULL DEFAULT ''"),
         ],
         "jobs": [
             ("dismissed", "INTEGER NOT NULL DEFAULT 0"),
