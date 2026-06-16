@@ -93,6 +93,7 @@ window.API = (function () {
     patchVm: (id, p) => req('PATCH', `/api/deployments/${id}`, p),
     vmDetail: (id) => req('GET', `/api/vms/${id}/detail`),
     vncProxy: (id) => req('POST', `/api/vms/${id}/vncproxy`),
+    revealVmCredentials: (id) => req('POST', `/api/vms/${id}/credentials/reveal`),
 
     // snapshots
     vmSnapshots: (id) => req('GET', `/api/vms/${id}/snapshots`),

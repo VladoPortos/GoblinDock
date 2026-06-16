@@ -270,6 +270,11 @@
     const [tall, setTall] = useState(false);
     const [confirm, setConfirm] = useState(false);
     const [busy, setBusy] = useState('');
+    const [cred, setCred] = useState(null);
+    const revealCred = async () => {
+      try { setCred(await window.API.revealVmCredentials(depId)); }
+      catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
+    };
 
     const load = () => window.API.vmDetail(depId).then((x) => { setD(x); setErr(null); }).catch((e) => setErr(e.message || 'failed'));
     useEffect(() => {
@@ -363,7 +368,19 @@
             h(Row, { k: 'OS type', v: cfg.ostype, mono: true }),
             h(Row, { k: 'Network', v: (cfg.net0 || '—').split(',')[0], mono: true }),
             h(Row, { k: 'Guest agent', v: live.agentRunning ? 'running' : (cfg.agent ? 'enabled' : 'off'), mono: true }),
-            h(Row, { k: 'Serial console', v: cfg.serial0 ? 'enabled' : 'not set', mono: true })))),
+            h(Row, { k: 'Serial console', v: cfg.serial0 ? 'enabled' : 'not set', mono: true }))),
+          d.hasRootPassword && Card('Access', h('div', null,
+            h(Row, { k: 'Console user', v: d.credUser || 'root', mono: true }),
+            h('div', { className: 'row', style: { justifyContent: 'space-between', gap: 12, padding: '5px 0' } },
+              h('span', { className: 'hint', style: { fontSize: 12.5 } }, 'Password'),
+              h('span', { className: 'row', style: { gap: 8, alignItems: 'center' } },
+                cred
+                  ? h('span', { className: 'mono copy', style: { fontSize: 12.5, fontWeight: 600 } }, cred.password)
+                  : h('span', { className: 'mono', style: { fontSize: 13, letterSpacing: 2 } }, '••••••••'),
+                h('button', { className: 'btn ghost sm', onClick: cred ? () => setCred(null) : revealCred },
+                  h(Icon, { name: cred ? 'eyeOff' : 'eye', size: 14 }), cred ? 'Hide' : 'Show'))),
+            cred && h('p', { className: 'hint', style: { fontSize: 11, marginTop: 2 } },
+              'Console login (noVNC / serial). Click the value to copy.')))),
         // right column
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
           d.agent
