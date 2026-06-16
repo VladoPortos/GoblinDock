@@ -1852,7 +1852,7 @@ def set_job_retention(body: JobRetentionBody, user: User = Depends(require_admin
 
 
 class AutoRootPwBody(BaseModel):
-    enabled: bool = True
+    enabled: bool
 
 
 @router.get("/settings/auto-root-password")
