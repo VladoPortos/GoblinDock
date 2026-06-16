@@ -538,6 +538,14 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
             params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
     px.set_config(new_vmid, node=node, **params)
     ctx.log(f"[{_ts()}] cloud-init: hostname={dep.name} cores={cores} mem={ram_mb}MB", "l-dim")
+    # Persist the VM credential as soon as cloud-init config is applied, so a later failure
+    # (especially on a rebuild, whose old VM is already destroyed) can never leave a stale
+    # password on the row — the stored credential always matches what was pushed to this VMID.
+    with session_scope() as s:
+        d = s.get(Deployment, dep.id)
+        d.root_password_enc = encrypt(root_pw) if root_pw else ""
+        d.cred_user = cred_user
+        s.add(d)
     # resize disk (grow only)
     try:
         px.resize_disk(new_vmid, "scsi0", f"{disk_gb}G", node=node)
@@ -576,9 +584,6 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         d.disk = disk_gb
         d.status = "running"
         d.error = ""
-        # Always overwrite so a rebuild (or a disabled setting) reflects the CURRENT VM.
-        d.root_password_enc = encrypt(root_pw) if root_pw else ""
-        d.cred_user = cred_user
         s.add(d)
 
     ctx.progress(100, "Complete")
