@@ -37,7 +37,19 @@ def test_password_helpers():
     print("test_password_helpers OK")
 
 
+def test_auto_root_password_setting():
+    from app import appsettings
+    # default ON when unset
+    assert appsettings.auto_root_password_enabled() is True
+    appsettings.set_setting(appsettings.AUTO_ROOT_PASSWORD, "0")
+    assert appsettings.auto_root_password_enabled() is False
+    appsettings.set_setting(appsettings.AUTO_ROOT_PASSWORD, "1")
+    assert appsettings.auto_root_password_enabled() is True
+    print("test_auto_root_password_setting OK")
+
+
 if __name__ == "__main__":
     test_deployment_has_password_columns()
     test_password_helpers()
+    test_auto_root_password_setting()
     print("\nALL WAVE 24 UNIT TESTS PASSED")
