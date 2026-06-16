@@ -76,6 +76,23 @@ def mask(value: str, keep: int = 4) -> str:
     return value[:keep] + "•" * max(4, len(value) - keep)
 
 
+# VM credential password — console-typeable (no ambiguous O/0/l/I/1), high-entropy.
+_VM_PW_ALPHABET = "abcdefghijkmnpqrstuvwxyzABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+
+
+def gen_vm_password(length: int = 20) -> str:
+    """A random VM password an operator can read off the screen and type at the noVNC
+    console: 20 chars from an unambiguous alphabet (~115 bits)."""
+    return "".join(_secrets.choice(_VM_PW_ALPHABET) for _ in range(length))
+
+
+def crypt_sha512(password: str) -> str:
+    """SHA-512 crypt hash ($6$...) for embedding in a cloud-init `chpasswd` so the
+    plaintext never lands in the snippet written to the Proxmox node."""
+    import crypt  # Linux-only stdlib; present on CPython 3.12 (the runtime image).
+    return crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512))
+
+
 def new_csrf_token() -> str:
     return _secrets.token_urlsafe(32)
 
