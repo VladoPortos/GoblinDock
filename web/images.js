@@ -28,7 +28,7 @@
           h('div', { className: 'copy mono', style: { fontSize: 10.5, wordBreak: 'break-all' } }, img.source_url || img.checksum))),
       h('div', { style: { display: 'flex', borderTop: '1px solid var(--border-soft)' } },
         h('button', { className: 'card-act', onClick: () => go('newtemplate', { baseImageId: img.imgId }) }, h(Icon, { name: 'template', size: 14 }), 'New template'),
-        h('button', { className: 'card-act', disabled: !canSync,
+        isAdmin && h('button', { className: 'card-act', disabled: !canSync,
           title: syncing ? 'Sync in progress…'
             : cacheState === 'cached' ? 'Already cached on the target node'
             : !canSync && cacheState !== 'missing' ? 'Cache state unknown (target offline or no URL)'

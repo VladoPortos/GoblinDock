@@ -377,12 +377,25 @@ def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get
 
 # Tiny in-memory login throttle (per email+ip). Resets on restart — fine for v1.
 _login_attempts: dict[str, list[float]] = {}
+_MAX_THROTTLE_KEYS = 10_000
 
 
 def _throttle(key: str) -> None:
     now = time.time()
     window = [t for t in _login_attempts.get(key, []) if now - t < 300]
-    _login_attempts[key] = window
+    if window:
+        _login_attempts[key] = window
+    else:
+        # Don't keep empty windows around — the key is f"{email}|{ip}" with an
+        # unvalidated email, so a stream of unique emails would otherwise grow the
+        # dict without bound (unauthenticated memory-growth DoS).
+        _login_attempts.pop(key, None)
+    # Opportunistic sweep once the dict is large: drop every key whose window is empty
+    # or fully outside the 5-min horizon. Keeps memory bounded under an attack.
+    if len(_login_attempts) > _MAX_THROTTLE_KEYS:
+        for k, ts in list(_login_attempts.items()):
+            if not ts or now - ts[-1] >= 300:
+                _login_attempts.pop(k, None)
     if len(window) >= 8:
         raise HTTPException(429, "too many attempts — try again in a few minutes")
 
@@ -1224,10 +1237,13 @@ class SyncBody(BaseModel):
 
 
 @router.post("/images/{img_id}/sync")
-def sync_image(img_id: int, body: SyncBody, user: User = Depends(current_user),
+def sync_image(img_id: int, body: SyncBody, user: User = Depends(require_admin),
                session: Session = Depends(get_session)):
     """Pre-pull a base cloud image onto the connection's storage — the same
-    cached download a deploy triggers, just ahead of time."""
+    cached download a deploy triggers, just ahead of time. Admin-only and
+    de-duplicated: image sync is a potentially multi-GB download that monopolises
+    the single serial worker, so it is gated like every other connection/image write
+    and never enqueued twice for the same image+connection."""
     img = session.get(Image, img_id)
     if not img:
         raise HTTPException(404, "image not found")
@@ -1238,6 +1254,13 @@ def sync_image(img_id: int, body: SyncBody, user: User = Depends(current_user),
     conn = session.get(Connection, body.connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
+    # De-dupe: return any already queued/running sync for this image+connection instead
+    # of piling identical heavyweight downloads onto the worker.
+    existing = session.exec(select(Job).where(
+        Job.type == "image_sync", Job.image_id == img.id,
+        Job.connection_id == conn.id, Job.status.in_(("queued", "running")))).first()
+    if existing:
+        return {"ok": True, "jobId": existing.id, "deduped": True}
     job = Job(type="image_sync", title=f"Syncing {img.name} → {conn.name}",
               image_id=img.id, connection_id=conn.id, created_by=user.id, status="queued",
               context_json=json.dumps({"src_url": img.source_url,
