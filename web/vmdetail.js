@@ -6,6 +6,9 @@
           copyToClipboard, readClipboard, fmtBytes, useFetched } = window.UI;
   const h = React.createElement;
   const toast = (m, t) => window.GDStore.toast(m, t);
+  // Transitional uptime-box label while a power action is in flight, until the live
+  // Proxmox status catches up (so the box doesn't sit at '—' and feel dead).
+  const _actLabel = (a) => ({ start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…' }[a] || 'Working…');
 
   // Small toolbar shown above each console.
   function ConsoleBar(children) {
@@ -193,6 +196,7 @@
     const [bump, setBump] = useState(0);
     const [taking, setTaking] = useState(false);
     const [confirm, setConfirm] = useState(null);   // { kind: 'rollback' | 'delete', snap }
+    const [startAfter, setStartAfter] = useState(true);   // "start VM after rollback" toggle
     const data = useFetched(() => window.API.vmSnapshots(depId), [depId, bump], { error: true });
     const reload = () => setBump((b) => b + 1);
 
@@ -200,8 +204,11 @@
       // toast + rethrow: ConfirmModal stays open for retry on failure
       try {
         if (kind === 'rollback') {
-          await window.API.rollbackSnapshot(depId, snap.name);
-          toast('Rolled back to ' + snap.name + (snap.vmstate ? '' : ' — VM is stopped, start it again'), 'ok');
+          const r = await window.API.rollbackSnapshot(depId, snap.name, { start: startAfter });
+          toast('Rolled back to ' + snap.name + (
+            (r && r.started) || snap.vmstate ? ' — VM is running'
+            : startAfter ? ' — VM is stopped (couldn’t auto-start)'
+            : ' — VM is stopped'), 'ok');
         } else {
           await window.API.deleteSnapshot(depId, snap.name);
           toast('Snapshot ' + snap.name + ' deleted', 'ok');
@@ -226,7 +233,7 @@
             s.vmstate && h('span', { className: 'badge', style: { fontSize: 10 } }, 'RAM')),
           h('div', { className: 'hint', style: { fontSize: 11 } }, s.created, s.description ? ' · ' + s.description : '')),
         h(Menu, { items: [
-          { label: 'Roll back', icon: 'history', onClick: () => setConfirm({ kind: 'rollback', snap: s }) },
+          { label: 'Roll back', icon: 'history', onClick: () => { setStartAfter(true); setConfirm({ kind: 'rollback', snap: s }); } },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm({ kind: 'delete', snap: s }) },
         ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 15 }))))));
@@ -242,8 +249,13 @@
         icon: confirm.kind === 'rollback' ? 'history' : 'trash',
         title: (confirm.kind === 'rollback' ? 'Roll back to ' : 'Delete ') + confirm.snap.name + '?',
         body: confirm.kind === 'rollback'
-          ? 'The VM disk reverts to this snapshot — everything written since is lost.'
-            + (confirm.snap.vmstate ? ' The VM resumes from the saved RAM state.' : ' The VM ends up stopped; start it afterwards.')
+          ? h('div', null,
+              h('p', { style: { color: 'var(--text-dim)', lineHeight: 1.6, marginBottom: confirm.snap.vmstate ? 0 : 12 } },
+                'The VM disk reverts to this snapshot — everything written since is lost.'
+                + (confirm.snap.vmstate ? ' The VM resumes from the saved RAM state.' : '')),
+              !confirm.snap.vmstate && h(Toggle, {
+                label: 'Start the VM after rollback',
+                on: startAfter, onChange: setStartAfter }))
           : 'Removes the snapshot from the node. The VM itself is not affected.',
         confirmLabel: confirm.kind === 'rollback' ? 'Roll back' : 'Delete snapshot',
         onConfirm: run(confirm.kind, confirm.snap),
@@ -276,6 +288,7 @@
       catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
     };
 
+    const [pending, setPending] = useState('');   // power action awaiting the live status to catch up
     const load = () => window.API.vmDetail(depId).then((x) => { setD(x); setErr(null); }).catch((e) => setErr(e.message || 'failed'));
     useEffect(() => {
       if (!depId) { go('dashboard'); return undefined; }
@@ -284,13 +297,22 @@
       const id = setInterval(load, 5000);
       return () => clearInterval(id);
     }, [depId]);
+    // Clear the transitional label once the live status reaches the action's target.
+    useEffect(() => {
+      if (!pending) return;
+      const st = (d && d.live && d.live.status) || (d && d.status);
+      if (pending === 'stop' ? st !== 'running' : st === 'running') setPending('');
+    }, [d, pending]);
 
     const act = async (action) => {
       setBusy(action);
+      setPending(action);
+      // safety net: never let the label stick forever if the VM never reaches the target
+      setTimeout(() => setPending((p) => (p === action ? '' : p)), 90000);
       try {
         await window.GDStore.vmAction(depId, action);
         setTimeout(load, 800); // detail view also re-pulls its own richer data
-      } catch (e) { /* store already toasted + reverted */ }
+      } catch (e) { setPending(''); /* store already toasted + reverted */ }
       finally { setBusy(''); }
     };
     const destroy = async () => {
@@ -338,7 +360,11 @@
         h(StatCard, { icon: 'cpu', label: 'CPU', value: running ? (live.cpuPct + ' %') : '—', pct: running ? live.cpuPct : null }),
         h(StatCard, { icon: 'ram', label: 'Memory', value: running ? (fmtBytes(live.memUsed) + ' / ' + fmtBytes(live.memMax)) : '—', pct: memPct, tone: 'var(--info)' }),
         h(StatCard, { icon: 'disk', label: 'Disk', value: live.diskMax ? (fmtBytes(live.diskUsed) + ' / ' + fmtBytes(live.diskMax)) : '—', pct: diskPct, tone: 'var(--ok)' }),
-        h(StatCard, { icon: 'clock', label: 'Uptime', value: running ? fmtUptime(live.uptime) : '—' })),
+        h(StatCard, { icon: 'clock', label: 'Uptime',
+          value: running ? fmtUptime(live.uptime)
+            : pending ? h('span', { style: { color: 'var(--accent)' } },
+                h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(pending))
+            : '—' })),
 
       // console (toggle between the Proxmox graphical console and the serial console)
       showConsole && h('div', { className: 'card card-pad', style: { marginBottom: 16 } },

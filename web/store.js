@@ -53,12 +53,15 @@ window.GDStore = (function () {
     const vms = window.GD.VMS || [];
     const vm = vms.find((v) => v.depId === id || v.id === id);
     const prev = vm ? vm.status : null;
-    if (vm) { vm.status = 'working'; if (onChange) onChange(); }
+    // Flip to "working" AND record which action so the UI can show a live
+    // "Starting…/Stopping…/Restarting…" label in the uptime cell until the real
+    // Proxmox status arrives (the next /state refetch replaces VMS and clears _act).
+    if (vm) { vm.status = 'working'; vm._act = action; if (onChange) onChange(); }
     try {
       await window.API.vmAction(id, action);
       // success: statebus ping → refresh() reconciles to the real status (~1s)
     } catch (e) {
-      if (vm) { vm.status = prev; }
+      if (vm) { vm.status = prev; vm._act = null; }
       toast(e.message || (action + ' failed'), 'err');
       if (onChange) onChange();
       throw e;

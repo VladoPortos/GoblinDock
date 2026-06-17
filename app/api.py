@@ -910,6 +910,10 @@ class SnapshotBody(BaseModel):
     includeRam: bool = False
 
 
+class RollbackBody(BaseModel):
+    start: bool = True   # rolling back a disk-only snapshot leaves the VM stopped; start it back up
+
+
 def _snapshot_px(session: Session, dep: Deployment) -> tuple[Proxmox, str]:
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
@@ -984,22 +988,32 @@ def delete_vm_snapshot(dep_id: int, snapname: str, user: User = Depends(current_
 
 
 @router.post("/vms/{dep_id}/snapshots/{snapname}/rollback")
-def rollback_vm_snapshot(dep_id: int, snapname: str, user: User = Depends(current_user),
+def rollback_vm_snapshot(dep_id: int, snapname: str, body: Optional[RollbackBody] = None,
+                         user: User = Depends(current_user),
                          session: Session = Depends(get_session)):
     dep = _owned_deployment(session, dep_id, user)
     if not _SNAPNAME_RE.fullmatch(snapname or ""):
         raise HTTPException(400, "invalid snapshot name")
+    start_after = body.start if body is not None else True
     px, node = _snapshot_px(session, dep)
+    started = False
     try:
         upid = px.rollback_snapshot(dep.vmid, snapname, node=node)
         px.wait_task(upid, node=node, timeout=300)
+        # A disk-only snapshot rollback leaves the VM stopped (Proxmox stops a running
+        # VM to revert its disk); a RAM snapshot resumes running on its own. When the
+        # caller asked to start, bring it back up if it isn't already running so they
+        # land on a running VM at the rollback point.
+        if start_after and px.vm_current(dep.vmid, node).get("status") != "running":
+            px.wait_task(px.start(dep.vmid, node=node), node=node, timeout=120)
+            started = True
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"proxmox: {e}")
     record_audit(session, user, "vm.snapshot.rollback", "deployment", dep.id,
                  f"{dep.name} · {snapname}")
     session.commit()
     statebus.bump()
-    return {"ok": True}
+    return {"ok": True, "started": started}
 
 
 def _ws_origin_ok(ws: WebSocket) -> bool:

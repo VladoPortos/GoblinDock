@@ -6,6 +6,11 @@
   const { OSGlyph, StatusBadge, CopyField, Meter, Sparkline, Menu, ConfirmModal, FormModal, Field } = window.UI;
   const h = React.createElement;
 
+  // Transitional label for the uptime cell while an optimistic power action is in
+  // flight (store sets vm._act + status='working') — gives immediate visual feedback
+  // instead of the cell sitting at '—'/'offline' until the real Proxmox status lands.
+  const _actLabel = (a) => ({ start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…' }[a] || 'Working…');
+
   const VIEWS_KEY = 'gd.savedViews';
   function parseTags(s) { return (s || '').split(',').map((t) => t.trim()).filter(Boolean); }
   function loadViews() { try { return JSON.parse(localStorage.getItem(VIEWS_KEY)) || []; } catch (e) { return []; } }
@@ -118,7 +123,11 @@
                 h('div', { className: 'row', style: { gap: 7 } },
                   h('div', { style: { width: 50 } }, h(Meter, { value: vm.ram })),
                   h('span', { className: 'mono hint', style: { fontSize: 11, minWidth: 28 } }, vm.ram, '%'))),
-              h('td', { className: 'mono hint', style: { fontSize: 12 } }, vm.uptime),
+              h('td', { className: 'mono hint', style: { fontSize: 12 } },
+                vm.status === 'working'
+                  ? h('span', { style: { color: 'var(--accent)' } },
+                      h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
+                  : vm.uptime),
               h('td', null, h(ActionCluster, { vm, onAct }))
             )))
         )
@@ -153,7 +162,10 @@
             hist: window.GDStore.vmHistory(vm.depId).map((p) => p.ram) })),
         h('div', { className: 'divider' }),
         h('div', { className: 'row' },
-          h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
+          vm.status === 'working'
+            ? h('span', { className: 'hint mono', style: { fontSize: 11, color: 'var(--accent)' } },
+                h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
+            : h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
           h('div', { style: { marginLeft: 'auto' } }, h(ActionCluster, { vm, onAct }))
         )
       ))

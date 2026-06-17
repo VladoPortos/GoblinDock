@@ -99,7 +99,7 @@ window.API = (function () {
     vmSnapshots: (id) => req('GET', `/api/vms/${id}/snapshots`),
     createSnapshot: (id, p) => req('POST', `/api/vms/${id}/snapshots`, p),
     deleteSnapshot: (id, name) => req('DELETE', `/api/vms/${id}/snapshots/${encodeURIComponent(name)}`),
-    rollbackSnapshot: (id, name) => req('POST', `/api/vms/${id}/snapshots/${encodeURIComponent(name)}/rollback`),
+    rollbackSnapshot: (id, name, p) => req('POST', `/api/vms/${id}/snapshots/${encodeURIComponent(name)}/rollback`, p),
 
     // images
     addBaseImage: (p) => req('POST', '/api/images/base', p),

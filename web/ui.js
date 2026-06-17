@@ -206,7 +206,9 @@
         h('div', { className: 'mono', style: { fontWeight: 700, fontSize: 15 } }, title)
       ),
       h('div', { className: 'modal-body' },
-        h('p', { style: { color: 'var(--text-dim)', lineHeight: 1.6 } }, body)),
+        typeof body === 'string'
+          ? h('p', { style: { color: 'var(--text-dim)', lineHeight: 1.6 } }, body)
+          : body),
       h('div', { className: 'modal-foot' },
         h('button', { className: 'btn', onClick: onClose, disabled: busy }, 'Cancel'),
         h('button', { className: 'btn ' + (tone === 'danger' ? 'danger' : 'primary'),

@@ -100,6 +100,14 @@ class FakePx:
     def wait_task(self, upid, node=None, timeout=300, **kw):
         return None
 
+    def vm_current(self, vmid, node=None):
+        # report running so rollback's default auto-start is a no-op for these tests
+        return {"status": "running"}
+
+    def start(self, vmid, node=None):
+        FakePx.calls.append(("start", vmid))
+        return "UPID:fake"
+
 
 def _patch():
     from app import api
