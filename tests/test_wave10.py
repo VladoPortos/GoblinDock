@@ -231,6 +231,9 @@ def test_cached_images_endpoint():
     finally:
         api.Proxmox = orig
     # unreachable node → online False, HTTP 200 (no exception)
+    # (clear the per-connection cache: the online result above is cached for a few
+    # seconds — in production the online→offline transition is far longer than the TTL)
+    api._CACHED_IMAGES_CACHE.clear()
     class _DownPx:
         def __init__(self, conn): pass
         def storage_volumes(self, node=None, content="import"):

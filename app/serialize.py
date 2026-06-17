@@ -100,7 +100,8 @@ def _live_status(px: Proxmox, vmid: int, node: str) -> dict:
     return out
 
 
-def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: dict, conns: dict) -> dict:
+def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: dict,
+            conns: dict, active_jobs: Optional[dict] = None) -> dict:
     conn = conns.get(dep.connection_id)
     os_family = "generic"
     image_name = ""
@@ -128,12 +129,16 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
             ram_pct = round(live["mem"] / max(1, live["maxmem"]) * 100)
             uptime = _fmt_uptime(live["uptime"]) if status == "running" else "—"
 
-    # active job → inline chip
+    # active job → inline chip. Use the prebuilt map from /state when given (avoids an
+    # N+1 SELECT per deployment); fall back to a direct query for other callers.
     job_chip = None
-    active = session.exec(
-        select(Job).where(Job.deployment_id == dep.id,
-                          Job.status.in_(["queued", "running"])).order_by(Job.id.desc())
-    ).first()
+    if active_jobs is not None:
+        active = active_jobs.get(dep.id)
+    else:
+        active = session.exec(
+            select(Job).where(Job.deployment_id == dep.id,
+                              Job.status.in_(["queued", "running"])).order_by(Job.id.desc())
+        ).first()
     if active:
         steps = session.exec(select(JobStep).where(JobStep.job_id == active.id)).all()
         done = sum(1 for s in steps if s.state in ("done", "skipped"))

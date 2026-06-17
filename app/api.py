@@ -290,6 +290,27 @@ def _px_cache(conns: dict) -> dict:
     return cache
 
 
+# Short-TTL cache for the per-connection /version probe on /state. SSE-driven refetches
+# fire several times/sec during a job; without this each one hits Proxmox once per
+# connection. The TTL collapses that burst into ~one probe per connection per window.
+_CONN_STATUS_CACHE: dict[int, tuple[float, dict]] = {}
+_CONN_STATUS_TTL = 5.0
+
+
+def _conn_status(px, conn_id: int) -> dict:
+    now = time.time()
+    cached = _CONN_STATUS_CACHE.get(conn_id)
+    if cached and now - cached[0] < _CONN_STATUS_TTL:
+        return cached[1]
+    try:
+        v = px.version()
+        st = {"status": "online", "version": v.get("version", "—")}
+    except Exception:  # noqa: BLE001
+        st = {"status": "offline"}
+    _CONN_STATUS_CACHE[conn_id] = (now, st)
+    return st
+
+
 def _job_owned(job: Job, user: User) -> bool:
     return user.role == "admin" or job.created_by == user.id
 
@@ -471,7 +492,16 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     if user.role != "admin":
         deps_q = deps_q.where(Deployment.owner_id == user.id)
     deps = session.exec(deps_q).all()
-    vms = [S.vm_dict(session, d, user, px_cache, users, conns) for d in deps]
+    # Batch the active-job lookup once instead of one SELECT per deployment (N+1 on the
+    # /state hot path). Highest id wins per deployment (matches the per-dep query order).
+    active_by_dep: dict[int, Job] = {}
+    if deps:
+        for j in session.exec(
+            select(Job).where(Job.deployment_id.in_([d.id for d in deps]),
+                              Job.status.in_(["queued", "running"])).order_by(Job.id.desc())
+        ).all():
+            active_by_dep.setdefault(j.deployment_id, j)
+    vms = [S.vm_dict(session, d, user, px_cache, users, conns, active_by_dep) for d in deps]
 
     base = [S.base_image_dict(i) for i in session.exec(select(Image).where(Image.kind == "base")).all()]
     tpls = session.exec(select(Template).order_by(Template.id)).all()
@@ -498,14 +528,8 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     is_admin = user.role == "admin"
     connections = []
     for c in conn_list:
-        st = None
         px = px_cache.get(c.id)
-        if px:
-            try:
-                v = px.version()
-                st = {"status": "online", "version": v.get("version", "—")}
-            except Exception:  # noqa: BLE001
-                st = {"status": "offline"}
+        st = _conn_status(px, c.id) if px else None
         # Non-admins get a REDACTED connection (target name + node + sizing only) — never
         # the Proxmox host / token id / SSH paths / storage backends, which are admin-only
         # config. They still need this much to pick a build/deploy target and size a VM.
@@ -1209,27 +1233,40 @@ def add_base_image(body: BaseImageBody, user: User = Depends(require_admin),
     return {"ok": True}
 
 
+_CACHED_IMAGES_CACHE: dict[int, tuple[float, dict]] = {}
+_CACHED_IMAGES_TTL = 10.0  # seconds — bounds Proxmox listing amplification under polling
+
+
 @router.get("/images/cached")
 def cached_images(connectionId: int, user: User = Depends(current_user),
                   session: Session = Depends(get_session)):
     """Which base images are already downloaded on the connection's image storage.
-    One Proxmox listing per call; an unreachable node returns online=False with
-    HTTP 200 (the ISOs page renders 'target offline', never an error toast)."""
+    Result is cached per connection for a few seconds so repeated polling doesn't do
+    one Proxmox listing per call; an unreachable node returns online=False with HTTP
+    200 (the ISOs page renders 'target offline', never an error toast)."""
     conn = session.get(Connection, connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
+    now = time.time()
+    hit = _CACHED_IMAGES_CACHE.get(connectionId)
+    if hit and now - hit[0] < _CACHED_IMAGES_TTL:
+        return hit[1]
     bases = session.exec(select(Image).where(Image.kind == "base")).all()
     px = Proxmox(conn)
     try:
         vols = px.storage_volumes(node=conn.node or None)
     except Exception:  # noqa: BLE001 — unreachable node is an expected state
-        return {"online": False, "cached": {}}
+        result = {"online": False, "cached": {}}
+        _CACHED_IMAGES_CACHE[connectionId] = (now, result)
+        return result
     cached = {}
     for img in bases:
         if not (img.source_url or "").strip():
             continue  # nothing to download — UI shows unknown
         cached[str(img.id)] = px.iso_volume_path(base_disk_filename(img.source_url)) in vols
-    return {"online": True, "cached": cached}
+    result = {"online": True, "cached": cached}
+    _CACHED_IMAGES_CACHE[connectionId] = (now, result)
+    return result
 
 
 class SyncBody(BaseModel):
@@ -1980,8 +2017,9 @@ async def stream_job(job_id: int, request: Request, user: User = Depends(current
         last_event_id = 0
         last_sig = None
         first = True
+        deadline = time.monotonic() + _SSE_MAX_LIFETIME
         while True:
-            if await request.is_disconnected():
+            if await request.is_disconnected() or time.monotonic() > deadline:
                 break
             with Session(engine) as session:
                 job = session.get(Job, job_id)
@@ -2027,6 +2065,10 @@ async def stream_job(job_id: int, request: Request, user: User = Depends(current
 # quiet ticks (~25s) emit a keepalive comment so proxies don't drop an idle stream.
 _SSE_POLL_SECONDS = 1
 _SSE_KEEPALIVE_TICKS = 25
+# Hard wall-clock cap on any SSE stream. request.is_disconnected() can fail to fire
+# behind BaseHTTPMiddleware, leaking a polling coroutine per stale connection; this
+# self-terminates it (EventSource just reconnects).
+_SSE_MAX_LIFETIME = 3600
 
 
 @router.get("/state/stream")
@@ -2037,8 +2079,9 @@ async def state_stream(request: Request, user: User = Depends(current_user)):
     async def gen():
         last = -1
         idle = 0
+        deadline = time.monotonic() + _SSE_MAX_LIFETIME
         while True:
-            if await request.is_disconnected():
+            if await request.is_disconnected() or time.monotonic() > deadline:
                 break
             v = statebus.version()
             if v != last:
