@@ -24,16 +24,6 @@ _REF_RE = re.compile(r"\{\{\s*(secrets|variable)\.([A-Za-z0-9_]+)\s*\}\}")
 _PLACEHOLDER_RE = re.compile(r"(?P<indent>[^\S\n]*)\{(?P<key>[A-Za-z0-9_]+)\}")
 
 
-class _Default(dict):
-    """str.format_map helper: an unknown {placeholder} collapses to '' instead of
-    raising KeyError, so render_shell can reference an optional input safely.
-    (Without this, render_shell's format_map raised NameError on every call and the
-    bare except returned the template UNRENDERED — cloud-init blocks never substituted
-    their inputs. Defining it makes render_shell actually render + shell-quote.)"""
-    def __missing__(self, key):  # noqa: D401
-        return ""
-
-
 def _substitute(template: str, flat: dict) -> str:
     """Indentation-aware placeholder fill: when a placeholder is filled with a
     multi-line value (e.g. a Run Script body under a YAML `|` block scalar),
@@ -86,10 +76,12 @@ def render_shell(template: str, inputs: dict, types: dict,
         else:
             sval = resolve_secrets(str(v), secret_lookup)
             flat[k] = sval if t == "code" else shlex.quote(sval)
-    try:
-        return template.format_map(_Default(flat))
-    except Exception:  # noqa: BLE001
-        return template
+    # Use the regex substitutor (same as the ansible path) rather than str.format_map:
+    # format_map treats every literal `{...}` in the template as a field reference, so
+    # shell idioms like awk '{print $1}', ${HOME}, jq '{x:.y}' and brace-expansion
+    # a.{txt,bak} were silently deleted or aborted rendering. _substitute only touches
+    # {word} placeholders and leaves all other braces intact.
+    return _substitute(template, flat)
 
 
 def _ansible_flat(inputs: dict, types: dict,

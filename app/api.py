@@ -94,6 +94,41 @@ def _clean_name(name: str, what: str = "name") -> str:
     return name
 
 
+# Secret/variable names are referenced as {{ secrets.NAME }} / {{ variable.NAME }},
+# whose resolver only matches [A-Za-z0-9_]+ (recipes._REF_RE). A name with a space,
+# dash or dot would be stored but be permanently unreferenceable, so enforce the
+# resolver's charset at creation/rename — stricter than _NAME_RE on purpose.
+_REF_NAME_RE = re.compile(r"^[A-Za-z0-9_]+$")
+
+
+def _clean_ref_name(name: str, what: str = "name") -> str:
+    name = (name or "").strip()
+    if not _REF_NAME_RE.match(name):
+        raise HTTPException(
+            400, f"invalid {what}: use letters, digits and underscore only "
+                 "(must be referenceable as {{ secrets.NAME }} / {{ variable.NAME }})")
+    return name
+
+
+# Proxmox node and storage ids flow into proxmoxer URL paths; constrain them to a
+# safe allowlist at connection create/edit so they can't traverse or inject the path.
+_STORAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
+
+
+def _clean_storage_id(value: str, what: str = "id") -> str:
+    value = (value or "").strip()
+    if value and not _STORAGE_ID_RE.match(value):
+        raise HTTPException(400, f"invalid {what}: use letters, digits, dot, dash or underscore")
+    return value
+
+
+def _has_control_chars(s: str) -> bool:
+    """True if `s` contains any C0 control char (incl. newline/tab) or DEL — used to
+    reject deploy-input values that could inject sibling YAML keys into a module-arg
+    dict or otherwise break out of a single rendered scalar."""
+    return any(ord(c) < 0x20 or ord(c) == 0x7f for c in s)
+
+
 # Proxmox download-url needs both a checksum AND its algorithm. The base-image form
 # stores only the hex digest, so infer the algorithm from its length (cloud images
 # publish hex digests). Unknown length → no algorithm → no verification attempted
@@ -597,6 +632,11 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                     raise HTTPException(400, f"deployInputs: {name!r} must be a list")
                 if ftype not in ("bool", "boolean", "toggle", "tags", "list") and not isinstance(v, str):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a string")
+                # Reject control chars / newlines in non-code answers: a multi-line scalar
+                # could inject sibling keys into the rendered module-arg dict. 'code' (Run
+                # Script) is intentionally free-form shell on the deployer's own VM.
+                if isinstance(v, str) and ftype != "code" and _has_control_chars(v):
+                    raise HTTPException(400, f"deployInputs: {name!r} must not contain control characters or newlines")
                 if ftype in ("text", "secret", "password") and not v.strip():
                     raise HTTPException(400, f"template requires input {name!r}")
                 out[name] = v
@@ -1359,7 +1399,7 @@ def add_secret(body: SecretBody, user: User = Depends(current_user), session: Se
     scope = body.scope if body.scope in ("global", "user") else "global"
     if scope == "global" and user.role != "admin":
         scope = "user"
-    name = body.name.strip()
+    name = _clean_ref_name(body.name, "secret name")
     if name.startswith(_SYSTEM_SECRET_PREFIX):
         raise HTTPException(400, f"the {_SYSTEM_SECRET_PREFIX!r} name prefix is reserved for app-managed secrets")
     owner = user.id if scope == "user" else None
@@ -1431,7 +1471,7 @@ def add_variable(body: VariableBody, user: User = Depends(current_user), session
     scope = body.scope if body.scope in ("global", "user") else "global"
     if scope == "global" and user.role != "admin":
         scope = "user"
-    name = body.name.strip()
+    name = _clean_ref_name(body.name, "variable name")
     owner = user.id if scope == "user" else None
     if session.exec(select(Variable).where(Variable.name == name, Variable.scope == scope,
                                            Variable.owner_id == owner)).first():
@@ -1452,7 +1492,7 @@ def edit_variable(var_id: int, body: VariableBody, user: User = Depends(current_
     if not _scoped_owned(v, user):
         raise HTTPException(403, "not yours")
     if body.name is not None and body.name.strip():
-        newname = body.name.strip()
+        newname = _clean_ref_name(body.name, "variable name")
         if newname != v.name and session.exec(select(Variable).where(
                 Variable.name == newname, Variable.scope == v.scope,
                 Variable.owner_id == v.owner_id, Variable.id != v.id)).first():
@@ -1505,8 +1545,11 @@ class ConnBody(BaseModel):
 def add_connection(body: ConnBody, user: User = Depends(require_admin), session: Session = Depends(get_session)):
     c = Connection(name=body.name, host=body.host, port=body.port, token_id=body.token_id,
                    token_secret_enc=encrypt(body.token_secret), verify_tls=body.verify_tls,
-                   node=body.node, storage=body.storage, iso_storage=body.iso_storage,
-                   snippet_storage=body.snippet_storage, bridge=body.bridge,
+                   node=_clean_storage_id(body.node, "node"),
+                   storage=_clean_storage_id(body.storage, "storage"),
+                   iso_storage=_clean_storage_id(body.iso_storage, "iso storage"),
+                   snippet_storage=_clean_storage_id(body.snippet_storage, "snippet storage"),
+                   bridge=body.bridge,
                    ssh_host=body.ssh_host, ssh_user=body.ssh_user,
                    ssh_key_path=body.ssh_key_path,
                    max_cores=max(0, body.max_cores), max_ram_mb=max(0, body.max_ram_gb) * 1024,
@@ -2104,6 +2147,9 @@ def edit_connection(conn_id: int, body: ConnEditBody, user: User = Depends(requi
         gb = data.pop("max_ram_gb")
         if gb is not None:
             c.max_ram_mb = max(0, gb) * 1024
+    for fld in ("node", "storage", "iso_storage", "snippet_storage"):
+        if data.get(fld) is not None:
+            data[fld] = _clean_storage_id(data[fld], fld.replace("_", " "))
     for k, v in data.items():
         if v is not None:                      # 0 is allowed (resets to inherit global)
             setattr(c, k, v)

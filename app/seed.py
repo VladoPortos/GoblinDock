@@ -1005,12 +1005,12 @@ BUILTIN_BLOCKS = [
             "    systemctl restart mariadb\n"
             "  when: {lan}\n"
             "- name: Create database\n"
-            "  ansible.builtin.shell: mysql -e 'CREATE DATABASE IF NOT EXISTS {database}'\n"
+            "  ansible.builtin.shell: mysql -e 'CREATE DATABASE IF NOT EXISTS '{database_q}\n"
             "  when: {database_set}\n"
             "- name: Create user + grant\n"
             "  ansible.builtin.shell: |\n"
             "    mysql -e \"CREATE USER IF NOT EXISTS '{user}'@'%' IDENTIFIED BY {password_q}\"\n"
-            "    mysql -e \"GRANT ALL PRIVILEGES ON {database}.* TO '{user}'@'%'\"\n"
+            "    mysql -e \"GRANT ALL PRIVILEGES ON \"{database_q}\".* TO '{user}'@'%'\"\n"
             "    mysql -e \"FLUSH PRIVILEGES\"\n"
             "  when: {password_set}"
         ),
@@ -1042,7 +1042,7 @@ BUILTIN_BLOCKS = [
             "  ansible.builtin.shell: |\n"
             "    sudo -u postgres psql -c \"ALTER SYSTEM SET listen_addresses = '*'\"\n"
             "    hba=$(sudo -u postgres psql -tAc 'show hba_file')\n"
-            "    grep -q goblindock \"$hba\" || echo 'host all all {allow_cidr} scram-sha-256 # goblindock' >> \"$hba\"\n"
+            "    grep -q goblindock \"$hba\" || echo 'host all all '{allow_cidr_q}' scram-sha-256 # goblindock' >> \"$hba\"\n"
             "    systemctl restart postgresql\n"
             "  when: {lan}"
         ),
