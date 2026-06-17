@@ -699,6 +699,13 @@ def _auto_name(session: Session, base: str = "gd") -> str:
 def deploy(body: DeployBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     _enforce_quota(session, user, "vm")
     tpl = session.get(Template, body.templateId)
+    # TRUST BOUNDARY (accepted Run-Script model): a PUBLIC template may be deployed by
+    # any user, and its author's recipe — including free-form Run-Script/cloud-init —
+    # then runs as root on the DEPLOYER's VM, with {{ secrets }} resolved in the
+    # deployer's scope. The blast radius is the deployer's own VM (a single net0), so
+    # this is by design, not a bug. Recommended hardening (product decision, not done):
+    # a deploy-time confirmation when tpl.owner_id != user.id, and/or admin review of
+    # published templates. See review finding "Run-Script cross-owner trust model".
     if not tpl or not (tpl.public or tpl.owner_id == user.id or user.role == "admin"):
         raise HTTPException(404, "template not found")
     base = session.get(Image, tpl.base_image_id) if tpl.base_image_id else None

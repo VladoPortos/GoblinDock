@@ -61,6 +61,11 @@ async def csrf_and_security_headers(request: Request, call_next):
     response.headers.setdefault("X-Frame-Options", "DENY")
     response.headers.setdefault("Referrer-Policy", "no-referrer")
     response.headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+    # Tight CSP: scripts/styles/connect are 'self' only (no unsafe-eval, no remote
+    # origins). The one exception is style-src 'unsafe-inline' — the React SPA renders
+    # via inline `style=` attributes (h(..., {style:{...}})), so dropping it would break
+    # all styling. Removing it would require nonce/hash-ing every inline style (a build
+    # refactor); accepted as-is. script-src deliberately has NO 'unsafe-inline'.
     response.headers.setdefault(
         "Content-Security-Policy",
         "default-src 'self'; img-src 'self' data:; "

@@ -1126,11 +1126,13 @@ def seed_blocks() -> None:
     with session_scope() as s:
         existing = {b.key: b for b in s.exec(select(Block)).all()}
         # Prune built-in blocks that were removed from the catalog (e.g. b-ssh, merged
-        # into b-user). Only ever delete OUR built-ins (kind == "builtin"); a user's
-        # custom/forked block (kind == "custom") is never touched.
+        # into b-user). `.builtin` is the single source of truth for "one of ours" —
+        # the same flag the re-sync below and visibility checks use, so prune and
+        # re-sync can never disagree. A user's custom/forked block (builtin=False) is
+        # never touched. (`kind` is a descriptive label only; not behaviorally load-bearing.)
         _builtin_keys = {spec["key"] for spec in BUILTIN_BLOCKS}
         for _k, _b in list(existing.items()):
-            if _k not in _builtin_keys and _b.kind == "builtin":
+            if _k not in _builtin_keys and _b.builtin:
                 s.delete(_b)
         for spec in BUILTIN_BLOCKS:
             phase = "cloudinit" if spec["key"] in _CLOUDINIT_BLOCKS else "ansible"
