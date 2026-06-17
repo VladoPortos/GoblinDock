@@ -14,6 +14,7 @@ scheduler thread and trivial to unit-test.
 from __future__ import annotations
 
 import logging
+import os
 import sqlite3
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +22,15 @@ from pathlib import Path
 from .config import settings
 
 log = logging.getLogger("goblindock")
+
+
+def _chmod(path, mode: int) -> None:
+    """Best-effort restrictive perms — the DB/backups hold password hashes, encrypted
+    secrets and the plaintext audit log, so keep them off co-mounted readers."""
+    try:
+        os.chmod(path, mode)
+    except OSError:
+        pass
 
 # Backups are named so rotation can glob EXACTLY these and never touch the live DB
 # (goblindock.sqlite3 / -wal / -shm) or anything else that shares the directory.
@@ -84,6 +94,7 @@ def backup_now(reason: str = "scheduled") -> Path:
     """
     d = backup_dir()
     d.mkdir(parents=True, exist_ok=True)
+    _chmod(d, 0o700)
     dest = d / f"{_PREFIX}{_timestamp()}{_SUFFIX}"
 
     # Dedicated short-lived connections — NOT the pooled SQLAlchemy engine. A generous
@@ -99,6 +110,7 @@ def backup_now(reason: str = "scheduled") -> Path:
             dst.close()
     finally:
         src.close()
+    _chmod(dest, 0o600)   # snapshot holds password hashes + encrypted secrets + audit log
 
     deleted = _rotate(settings.backup_keep)
     log.info("DB backup (%s) → %s (%d byte) · rotated %d old",

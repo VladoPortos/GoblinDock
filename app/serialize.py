@@ -376,6 +376,7 @@ def connection_dict(session: Session, c: Connection, status: Optional[dict] = No
         "host": c.host,
         "port": c.port,
         "tokenId": c.token_id,
+        "verifyTls": c.verify_tls,
         "isoStorage": c.iso_storage,
         "snippetStorage": c.snippet_storage,
         # per-target VM ceilings — authoritative; 0 = unlimited (no per-VM cap)

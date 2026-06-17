@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import logging
 import os
 import re
 import time
@@ -20,6 +21,12 @@ from proxmoxer.core import ResourceException
 from .config import settings
 from .models import Connection
 from .security import decrypt
+
+log = logging.getLogger("goblindock")
+
+# Hosts we've already warned about running with TLS verification off — so the warning
+# fires once per host per process instead of on every Proxmox client construction.
+_warned_insecure_tls: set = set()
 
 
 class ProxmoxError(RuntimeError):
@@ -94,6 +101,12 @@ class Proxmox:
         self.iso_storage = conn.iso_storage or "local"
         self.snippet_storage = conn.snippet_storage or "local"
         self.bridge = conn.bridge or "vmbr0"
+        if not conn.verify_tls and conn.host not in _warned_insecure_tls:
+            _warned_insecure_tls.add(conn.host)
+            log.warning(
+                "Proxmox TLS verification DISABLED for %s — the API token is sent over an "
+                "unverified channel and an on-path attacker could capture it. Use a trusted "
+                "certificate or accept this risk for a self-signed homelab node.", conn.host)
         self.api = ProxmoxAPI(
             conn.host,
             user=user,

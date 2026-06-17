@@ -6,6 +6,7 @@ background worker thread read/write concurrently at homelab scale.
 """
 from __future__ import annotations
 
+import os
 from contextlib import contextmanager
 from typing import Iterator
 
@@ -48,6 +49,13 @@ def init_db() -> None:
     _rename_legacy()   # MUST run before create_all — see docstring
     SQLModel.metadata.create_all(engine)
     _migrate()
+    # The DB file holds Argon2 password hashes, Fernet-encrypted secrets and the
+    # plaintext audit log — keep it readable only by the owner.
+    if settings.db_path and os.path.exists(settings.db_path):
+        try:
+            os.chmod(settings.db_path, 0o600)
+        except OSError:
+            pass
 
 
 def _rename_legacy() -> None:

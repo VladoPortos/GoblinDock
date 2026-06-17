@@ -37,6 +37,12 @@ class Settings:
     def __init__(self) -> None:
         self.data_dir = Path(os.environ.get("GOBLINDOCK_DATA_DIR", "./data")).resolve()
         self.data_dir.mkdir(parents=True, exist_ok=True)
+        # The data dir holds the SQLite DB (Argon2 password hashes, Fernet-encrypted
+        # secrets), the plaintext audit log and rotating backups — keep it owner-only.
+        try:
+            os.chmod(self.data_dir, 0o700)
+        except OSError:
+            pass
 
         self.db_path = os.environ.get(
             "GOBLINDOCK_DB", str(self.data_dir / "goblindock.sqlite3")

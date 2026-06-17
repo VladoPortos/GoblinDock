@@ -249,6 +249,7 @@
       iso_storage: conn ? (conn.isoStorage || 'local') : 'local',
       snippet_storage: conn ? (conn.snippetStorage || 'local') : 'local',
       bridge: conn ? conn.bridge : 'vmbr0',
+      verify_tls: conn ? !!conn.verifyTls : true,
       max_cores: conn ? (conn.maxCores || 0) : 0,
       max_ram_gb: conn ? (conn.maxRamGb || 0) : 0,
       max_disk_gb: conn ? (conn.maxDiskGb || 0) : 0,
@@ -263,7 +264,7 @@
       try {
         const r = await window.API.probeConnection({
           host: f.host, port: Number(f.port), token_id: f.token_id,
-          token_secret: f.token_secret, verify_tls: false,
+          token_secret: f.token_secret, verify_tls: f.verify_tls,
           conn_id: editing ? conn.connId : null,
         });
         if (r && r.ok) { setProbe(r); toast('Loaded from Proxmox', 'ok'); }
@@ -292,7 +293,7 @@
       try {
         const limits = { max_cores: Number(f.max_cores) || 0, max_ram_gb: Number(f.max_ram_gb) || 0, max_disk_gb: Number(f.max_disk_gb) || 0 };
         if (editing) {
-          const payload = { name: f.name, host: f.host, port: Number(f.port), node: f.node, storage: f.storage, iso_storage: f.iso_storage, snippet_storage: f.snippet_storage, bridge: f.bridge, ...limits };
+          const payload = { name: f.name, host: f.host, port: Number(f.port), node: f.node, storage: f.storage, iso_storage: f.iso_storage, snippet_storage: f.snippet_storage, bridge: f.bridge, verify_tls: f.verify_tls, ...limits };
           if (f.token_id) payload.token_id = f.token_id;
           if (f.token_secret) payload.token_secret = f.token_secret;
           await window.API.editConnection(conn.connId, payload);
@@ -315,6 +316,9 @@
             '✓ PVE ' + (probe.version || '—') + ' · ' + (probe.nodes || []).length + ' node' + ((probe.nodes || []).length === 1 ? '' : 's')),
           !probe && !canProbe && h('span', { className: 'hint', style: { fontSize: 11 } },
             'Enter host, token id' + (editing ? '' : ' and secret') + ' to load')),
+        h('div', { style: { gridColumn: '1 / -1' } },
+          h(Toggle, { label: 'Verify TLS certificate (uncheck for a self-signed homelab node)',
+                      on: f.verify_tls, onChange: (v) => set('verify_tls', v) })),
         probe
           ? h(SelectField, { label: 'Default node', value: f.node, onChange: (v) => set('node', v), options: nodeOpts })
           : h(Field, { label: 'Default node', value: f.node, onChange: (v) => set('node', v), mono: true }),

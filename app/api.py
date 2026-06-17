@@ -1527,7 +1527,7 @@ class ConnBody(BaseModel):
     port: int = 8006
     token_id: str
     token_secret: str
-    verify_tls: bool = False
+    verify_tls: bool = True   # verify the Proxmox TLS cert by default; opt out for self-signed
     node: str = ""
     storage: str = ""
     iso_storage: str = "local"
@@ -1588,7 +1588,7 @@ class ConnProbeBody(BaseModel):
     port: int = 8006
     token_id: str = ""
     token_secret: Optional[str] = None
-    verify_tls: bool = False
+    verify_tls: Optional[bool] = None   # None = unset (reuse stored / secure default)
     conn_id: Optional[int] = None
 
 
@@ -1611,14 +1611,19 @@ def probe_connection(body: ConnProbeBody, user: User = Depends(require_admin),
             raise HTTPException(404, "not found")
 
     token_id = body.token_id or (stored.token_id if stored else "")
-    verify_tls = body.verify_tls
     port = body.port or 8006
+    # verify_tls: an explicit value (True/False) wins; unset (None) reuses the stored
+    # connection's value, else falls back to the secure default. (Can't use falsy-ness
+    # to detect "unset" now that the default is True.)
+    if body.verify_tls is not None:
+        verify_tls = body.verify_tls
+    elif stored:
+        verify_tls = stored.verify_tls
+    else:
+        verify_tls = True
     if stored:
         if not body.token_id:
             token_id = stored.token_id
-        # reuse stored verify_tls/port when the form didn't send a meaningful value
-        if not body.verify_tls:
-            verify_tls = stored.verify_tls
         if not body.port:
             port = stored.port or 8006
 

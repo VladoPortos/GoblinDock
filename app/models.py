@@ -57,7 +57,7 @@ class Connection(SQLModel, table=True):
     port: int = 8006
     token_id: str  # e.g. goblindock@pve!app
     token_secret_enc: str = ""
-    verify_tls: bool = False
+    verify_tls: bool = True   # verify the Proxmox TLS cert by default (opt OUT for self-signed)
     node: str = ""          # default node
     storage: str = ""       # VM disk storage (zfs/lvm)
     iso_storage: str = "local"
