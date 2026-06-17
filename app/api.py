@@ -117,7 +117,9 @@ _STORAGE_ID_RE = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 def _clean_storage_id(value: str, what: str = "id") -> str:
     value = (value or "").strip()
-    if value and not _STORAGE_ID_RE.match(value):
+    # Reject `..` explicitly: the charset allows dots (for names like local.test) but a
+    # `..` segment could traverse the proxmoxer URL path the id lands in.
+    if value and (not _STORAGE_ID_RE.match(value) or ".." in value):
         raise HTTPException(400, f"invalid {what}: use letters, digits, dot, dash or underscore")
     return value
 
@@ -1571,11 +1573,13 @@ def edit_variable(var_id: int, body: VariableBody, user: User = Depends(current_
     if not _scoped_owned(v, user):
         raise HTTPException(403, "not yours")
     if body.name is not None and body.name.strip():
-        newname = _clean_ref_name(body.name, "variable name")
-        if newname != v.name and session.exec(select(Variable).where(
-                Variable.name == newname, Variable.scope == v.scope,
-                Variable.owner_id == v.owner_id, Variable.id != v.id)).first():
-            raise HTTPException(409, f"a {v.scope} variable named {newname!r} already exists")
+        newname = body.name.strip()
+        if newname != v.name:   # only enforce the resolver charset on an actual rename
+            newname = _clean_ref_name(body.name, "variable name")
+            if session.exec(select(Variable).where(
+                    Variable.name == newname, Variable.scope == v.scope,
+                    Variable.owner_id == v.owner_id, Variable.id != v.id)).first():
+                raise HTTPException(409, f"a {v.scope} variable named {newname!r} already exists")
         v.name = newname
     v.value = body.value
     session.add(v)
@@ -2470,14 +2474,22 @@ def edit_secret(sec_id: int, body: SecretEditBody, user: User = Depends(current_
     s = session.get(Secret, sec_id)
     if not s:
         raise HTTPException(404, "not found")
+    # App-managed secrets (fleet SSH key) are off-limits to edit, exactly like reveal
+    # and delete — a rename off the reserved prefix would otherwise re-open reveal.
+    if _is_system_secret(s):
+        raise HTTPException(403, "app-managed secret cannot be edited")
     if not _scoped_owned(s, user):
         raise HTTPException(403, "not yours")
     if body.name is not None and body.name.strip():
         newname = body.name.strip()
-        if newname != s.name and session.exec(select(Secret).where(
-                Secret.name == newname, Secret.scope == s.scope,
-                Secret.owner_id == s.owner_id, Secret.id != s.id)).first():
-            raise HTTPException(409, f"a {s.scope} secret named {newname!r} already exists")
+        if newname != s.name:   # only validate on an actual rename (value-only edits pass)
+            newname = _clean_ref_name(body.name, "secret name")
+            if newname.startswith(_SYSTEM_SECRET_PREFIX):
+                raise HTTPException(400, f"the {_SYSTEM_SECRET_PREFIX!r} name prefix is reserved for app-managed secrets")
+            if session.exec(select(Secret).where(
+                    Secret.name == newname, Secret.scope == s.scope,
+                    Secret.owner_id == s.owner_id, Secret.id != s.id)).first():
+                raise HTTPException(409, f"a {s.scope} secret named {newname!r} already exists")
         s.name = newname
     if body.value:
         s.value_enc = encrypt(body.value)

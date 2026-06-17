@@ -256,11 +256,13 @@ def base_image_dict(img: Image) -> dict:
 
 
 def _mask_recipe_passwords(session: Session, recipe: list) -> list:
-    """Return a copy of `recipe` with every password-typed block-input value replaced
-    by a masked placeholder. A literal value typed into a `password` field is stored
+    """Return a copy of `recipe` with every password/secret-typed block-input value
+    replaced by a masked placeholder. A literal typed into such a field is stored
     verbatim in recipe_json; when a template is served to a non-owner (public sharing)
-    that plaintext must never be exposed. (secret-typed fields use {{ secrets.NAME }}
-    references resolved at deploy time and carry no literal, so they need no masking.)"""
+    that plaintext must never be exposed. Both `password` AND `secret` types are masked:
+    the secret-picker is a plain text field, so a `secret`-typed input can hold a literal
+    (not just a {{ secrets.NAME }} reference) — this matches recipes.collect_sensitive_inputs,
+    which redacts both types from job logs."""
     refs = {b.get("ref") for sec in recipe if isinstance(sec, dict)
             for b in (sec.get("blocks") or []) if isinstance(b, dict) and b.get("ref")}
     if not refs:
@@ -279,7 +281,7 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
             except (json.JSONDecodeError, TypeError):
                 continue
             pw_fields = {f.get("name") for f in schema
-                         if isinstance(f, dict) and f.get("type") == "password"}
+                         if isinstance(f, dict) and f.get("type") in ("password", "secret")}
             inputs = b.get("inputs") or {}
             for name in pw_fields:
                 if inputs.get(name):
