@@ -346,6 +346,7 @@
     const [selConnId, setSelConnId] = useState(loadedTpl ? loadedTpl.connectionId : null);
     const [selNetId, setSelNetId] = useState(loadedTpl ? loadedTpl.networkId : null);
     const [desc, setDesc] = useState(loadedTpl ? (loadedTpl.desc || '') : '');
+    const [isPublic, setIsPublic] = useState(loadedTpl ? !!loadedTpl.public : false);
 
     const bases = GD.BASE_IMAGES || [];
     const conns = GD.CONNECTIONS || [];
@@ -421,10 +422,10 @@
       setBusy(true);
       try {
         if (loadedTpl) {
-          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: loadedTpl.public, os_family: selBase ? selBase.os : ((loadedTpl && loadedTpl.os) || 'ubuntu'), baseImageId: selBaseId || null, connectionId: selConnId || null, networkId: selNetId || null });
+          await window.API.editTemplate(loadedTpl.templateId, { name: recipeName.trim(), description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: isPublic, os_family: selBase ? selBase.os : ((loadedTpl && loadedTpl.os) || 'ubuntu'), baseImageId: selBaseId || null, connectionId: selConnId || null, networkId: selNetId || null });
           window.GDStore.toast('Template updated', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         } else {
-          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), os_family: selBase ? selBase.os : ((loadedTpl && loadedTpl.os) || 'ubuntu'), baseImageId: selBaseId || null, connectionId: selConnId || null, networkId: selNetId || null });
+          await window.API.saveTemplate({ name: recipeName.trim() || 'Custom template', description: desc, recipe: recipePayload(), cpu: Number(cpu), ram: Number(mem), disk: Number(disk), public: isPublic, os_family: selBase ? selBase.os : ((loadedTpl && loadedTpl.os) || 'ubuntu'), baseImageId: selBaseId || null, connectionId: selConnId || null, networkId: selNetId || null });
           window.GDStore.toast('Template saved', 'ok'); await window.GDStore.refresh().catch(() => {}); go('templates');
         }
       } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); setBusy(false); busyRef.current = false; }
@@ -444,6 +445,11 @@
           h('span', { className: 'hint mono', style: { fontSize: 11 } }, blockCount, ' blocks'),
           warnCount > 0 && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, h(Icon, { name: 'warn', size: 12 }), warnCount, ' need input')),
         h('div', { className: 'row', style: { marginLeft: 'auto', gap: 8 } },
+          h('button', { className: 'btn sm' + (isPublic ? ' primary' : ''),
+            title: isPublic ? 'Public — every user can see and deploy this template'
+                            : 'Private — only you can see this template',
+            onClick: () => setIsPublic((v) => !v) },
+            h(Icon, { name: isPublic ? 'globe' : 'lock', size: 15 }), isPublic ? 'Public' : 'Private'),
           h('button', { className: 'btn sm', onClick: openYaml }, h(Icon, { name: 'code', size: 15 }), 'View YAML'),
           h('button', { className: 'btn primary sm', onClick: doSave, disabled: busy }, h(Icon, { name: 'check', size: 15 }), busy ? 'Working…' : (loadedTpl ? 'Save changes' : 'Save template')))),
       h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
