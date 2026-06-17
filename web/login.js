@@ -59,7 +59,7 @@
             busy ? 'Working…' : (needsSetup ? 'Create admin' : 'Sign in'), h(Icon, { name: 'arrowRight', size: 16 }))),
         !needsSetup && h('p', { className: 'hint', style: { textAlign: 'center', fontSize: 11.5, marginTop: 18 } },
           'Ask your admin for an account if you don’t have one.')),
-      h('p', { className: 'mono', style: { position: 'fixed', bottom: 16, color: 'var(--text-faint)', fontSize: 11 } }, 'GoblinDock v2.2'));
+      h('p', { className: 'mono', style: { position: 'fixed', bottom: 16, color: 'var(--text-faint)', fontSize: 11 } }, 'GoblinDock v2.6.0'));
   }
 
   window.Login = Login;
