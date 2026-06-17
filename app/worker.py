@@ -43,6 +43,7 @@ from .proxmox import (
     write_snippet_over_ssh,
 )
 from .recipes import (
+    collect_sensitive_inputs,
     compile_ansible,
     compile_cloudinit,
     has_ansible_blocks,
@@ -278,6 +279,10 @@ def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_p
     vault: set = set()
     lookup = _secret_lookup_factory(owner_id, sink=vault)
     playbook = compile_ansible(recipe, blocks, lookup, name=label)
+    # Also redact LITERAL password/secret-typed input values: these never pass through
+    # `lookup` (only {{ secrets.NAME }} refs do), so they would otherwise appear
+    # unmasked in streamed Ansible output on a failed task.
+    vault |= collect_sensitive_inputs(recipe, blocks, lookup)
     red = _redactor(vault)
     ctx.log(f"[{_ts()}] ansible: applying {label} to {ip}…", "l-acc")
 

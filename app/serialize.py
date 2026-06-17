@@ -250,9 +250,46 @@ def base_image_dict(img: Image) -> dict:
     }
 
 
-def template_dict(session: Session, t: Template) -> dict:
+def _mask_recipe_passwords(session: Session, recipe: list) -> list:
+    """Return a copy of `recipe` with every password-typed block-input value replaced
+    by a masked placeholder. A literal value typed into a `password` field is stored
+    verbatim in recipe_json; when a template is served to a non-owner (public sharing)
+    that plaintext must never be exposed. (secret-typed fields use {{ secrets.NAME }}
+    references resolved at deploy time and carry no literal, so they need no masking.)"""
+    refs = {b.get("ref") for sec in recipe if isinstance(sec, dict)
+            for b in (sec.get("blocks") or []) if isinstance(b, dict) and b.get("ref")}
+    if not refs:
+        return recipe
+    blocks = {b.key: b for b in session.exec(select(Block).where(Block.key.in_(refs))).all()}
+    masked = json.loads(json.dumps(recipe))
+    for sec in masked:
+        for b in (sec.get("blocks") or []) if isinstance(sec, dict) else []:
+            if not isinstance(b, dict):
+                continue
+            blk = blocks.get(b.get("ref"))
+            if not blk:
+                continue
+            try:
+                schema = json.loads(blk.input_schema_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            pw_fields = {f.get("name") for f in schema
+                         if isinstance(f, dict) and f.get("type") == "password"}
+            inputs = b.get("inputs") or {}
+            for name in pw_fields:
+                if inputs.get(name):
+                    inputs[name] = "********"
+            b["inputs"] = inputs
+    return masked
+
+
+def template_dict(session: Session, t: Template, viewer: Optional["User"] = None) -> dict:
     used = session.exec(select(Deployment).where(Deployment.template_id == t.id)).all()
     recipe = json.loads(t.recipe_json or "[]")
+    # Mask literal password-field values for anyone who isn't the owner or an admin —
+    # public templates are visible to every authenticated user via /api/state.
+    if viewer is not None and viewer.role != "admin" and t.owner_id != viewer.id:
+        recipe = _mask_recipe_passwords(session, recipe)
     base = session.get(Image, t.base_image_id) if t.base_image_id else None
     if base and base.kind != "base":
         base = None

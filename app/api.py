@@ -418,7 +418,7 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     tpls = session.exec(select(Template).order_by(Template.id)).all()
     if user.role != "admin":
         tpls = [t for t in tpls if t.public or t.owner_id == user.id]
-    templates = [S.template_dict(session, t) for t in tpls]
+    templates = [S.template_dict(session, t, viewer=user) for t in tpls]
     blocks_all = session.exec(select(Block).order_by(Block.id)).all()
     if user.role != "admin":
         blocks_all = [b for b in blocks_all if b.builtin or b.owner_id == user.id]
@@ -1209,7 +1209,7 @@ class TemplateBody(BaseModel):
     cpu: int = Field(default=1, ge=1, le=256)
     ram: int = Field(default=2, ge=1, le=1024)        # GB
     disk: int = Field(default=20, ge=1, le=16384)     # GB
-    public: bool = True
+    public: bool = False   # private by default — publishing is an explicit opt-in
     baseImageId: Optional[int] = None
     connectionId: Optional[int] = None
     networkId: Optional[int] = None

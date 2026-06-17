@@ -207,6 +207,34 @@ def _merged_inputs(block: Block, placed: dict) -> dict:
     return merged
 
 
+def collect_sensitive_inputs(recipe: list, blocks_by_key: dict,
+                             secret_lookup: Callable[[str, str], str]) -> set:
+    """Resolved values of every password/secret-typed input across the recipe.
+
+    A LITERAL value typed into a password/secret field never passes through
+    secret_lookup (only {{ secrets.NAME }} references do), so without collecting these
+    the value would be absent from the job-log redaction vault and could leak into
+    streamed Ansible output on a failed task. {{ secrets }} refs resolve to their real
+    value here too (and are redacted at any length they meet the floor)."""
+    out: set = set()
+    for section in recipe:
+        if not isinstance(section, dict):
+            continue
+        for placed in section.get("blocks", []):
+            if not isinstance(placed, dict):
+                continue
+            block = blocks_by_key.get(placed.get("ref", ""))
+            if not block:
+                continue
+            types = _schema_types(block)
+            for k, v in _merged_inputs(block, placed).items():
+                if types.get(k) in ("password", "secret") and isinstance(v, str) and v:
+                    val = resolve_secrets(v, secret_lookup)
+                    if val:
+                        out.add(val)
+    return out
+
+
 def _ansible_playbook(recipe: list[dict], blocks_by_key: dict[str, Block],
                       name: str, secret_lookup: Optional[Callable[[str, str], str]] = None) -> str:
     """Build an Ansible playbook from the phase='ansible' blocks (post-boot)."""
