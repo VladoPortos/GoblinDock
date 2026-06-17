@@ -195,7 +195,7 @@ def test_execute_cancel_deploy_destroys_vm_and_deletes():
     record = []
 
     def _boom(ctx, job):
-        raise RuntimeError("cancelled by user")
+        raise worker.JobCancelled()
     _run_execute_with_dispatch(jid, "deploy", _boom, px=_stub_px(record))
 
     with session_scope() as s:
@@ -217,7 +217,7 @@ def test_execute_cancel_rebuild_keeps_everything():
     record = []
 
     def _boom(ctx, job):
-        raise RuntimeError("cancelled mid-rebuild")
+        raise worker.JobCancelled()
     _run_execute_with_dispatch(jid, "rebuild", _boom, px=_stub_px(record, present=(9200,)))
 
     with session_scope() as s:
@@ -239,7 +239,7 @@ def test_execute_cancel_destroy_vm_present_keeps():
     record = []
 
     def _boom(ctx, job):
-        raise RuntimeError("canceled before destroy")
+        raise worker.JobCancelled()
     _run_execute_with_dispatch(jid, "destroy", _boom, px=_stub_px(record, present=(9400,)))
 
     with session_scope() as s:
@@ -261,7 +261,7 @@ def test_execute_cancel_destroy_vm_gone_completes():
         s.add(j); s.flush(); jid = j.id
 
     def _boom(ctx, job):
-        raise RuntimeError("cancelled")
+        raise worker.JobCancelled()
     _run_execute_with_dispatch(jid, "destroy", _boom, px=_stub_px(present=()))   # VM gone
 
     with session_scope() as s:
@@ -281,7 +281,7 @@ def test_execute_cancel_rebuild_vm_gone_errors():
         s.add(j); s.flush(); jid = j.id
 
     def _boom(ctx, job):
-        raise RuntimeError("cancelled")
+        raise worker.JobCancelled()
     _run_execute_with_dispatch(jid, "rebuild", _boom, px=_stub_px(present=()))   # old VM gone
 
     with session_scope() as s:

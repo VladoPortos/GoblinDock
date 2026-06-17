@@ -26,6 +26,16 @@ class ProxmoxError(RuntimeError):
     pass
 
 
+class JobCancelled(Exception):
+    """Raised to signal that a job was cancelled by the user (cancel_requested).
+
+    A distinct TYPE so cancellation is never inferred from an error message — a
+    genuine failure whose text happens to contain the word "cancel" (e.g. a VM named
+    'cancel-svc' failing its ansible phase) must NOT be treated as a user cancel.
+    """
+    pass
+
+
 def base_disk_filename(src_url: str) -> str:
     """Cached per-URL qcow2 name on node storage. 'import' content needs a
     recognised extension (cloud .img files are qcow2), and the name flows into
@@ -152,7 +162,8 @@ class Proxmox:
         on_poll: Optional[Callable[[dict], None]] = None,
         cancelled: Optional[Callable[[], bool]] = None,
     ) -> None:
-        """Block until the task finishes OK; raise ProxmoxError on failure/timeout/cancel."""
+        """Block until the task finishes OK; raise ProxmoxError on failure/timeout,
+        or JobCancelled if the `cancelled` predicate fires."""
         node = node or self.pick_node()
         deadline = time.time() + timeout
         while time.time() < deadline:
@@ -161,7 +172,7 @@ class Proxmox:
                     self.api.nodes(node).tasks(upid).delete()
                 except ResourceException:
                     pass
-                raise ProxmoxError("cancelled")
+                raise JobCancelled()
             st = self.api.nodes(node).tasks(upid).status.get()
             if on_poll:
                 on_poll(st)

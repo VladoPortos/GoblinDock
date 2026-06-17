@@ -35,6 +35,7 @@ from .models import (
     utcnow,
 )
 from .proxmox import (
+    JobCancelled,
     Proxmox,
     ProxmoxError,
     base_disk_filename,
@@ -287,12 +288,17 @@ def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_p
     try:
         status, rc = run_playbook(
             playbook, ip, "goblin", managed_priv, on_line=_on_line,
+            cancelled=ctx.cancelled,
         )
     except Exception as e:  # noqa: BLE001
         ctx.log(f"[{_ts()}] ⚠ ansible run failed to start: {e}", "l-warn")
         return
     if status == "successful":
         ctx.log(f"[{_ts()}] ✓ ansible {label} complete", "l-ok")
+    elif status == "canceled":
+        # A user cancel terminated the run — signal it as a cancel (not a failure) so
+        # _execute reconciles it as cancelled rather than leaving the deploy "error".
+        raise JobCancelled()
     else:
         raise RuntimeError(f"ansible {label} failed (status={status}, rc={rc})")
 
@@ -546,11 +552,14 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         d.root_password_enc = encrypt(root_pw) if root_pw else ""
         d.cred_user = cred_user
         s.add(d)
-    # resize disk (grow only)
+    # resize disk (grow only). Track success so the deployment records the VM's REAL
+    # disk size rather than the requested grow target when the resize silently failed.
+    resize_ok = True
     try:
         px.resize_disk(new_vmid, "scsi0", f"{disk_gb}G", node=node)
         ctx.log(f"[{_ts()}] resize scsi0 → {disk_gb}G", "l-dim")
     except Exception as e:  # noqa: BLE001
+        resize_ok = False
         ctx.log(f"[{_ts()}] resize skipped: {e}", "l-warn")
     ctx.finish_step(st, t)
 
@@ -581,7 +590,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         d.mac = px.mac_of(new_vmid, node) or d.mac
         d.cpu = cores
         d.ram = ram_mb // 1024
-        d.disk = disk_gb
+        d.disk = _effective_disk_gb(resize_ok, disk_gb, _scsi0_size_gb(px, new_vmid, node))
         d.status = "running"
         d.error = ""
         s.add(d)
@@ -598,7 +607,7 @@ def _wait_for_ip(ctx: JobCtx, px: Proxmox, vmid: int, node: str, timeout: int = 
     logged_wait = False
     while time.time() < deadline:
         if ctx.cancelled():
-            raise ProxmoxError("cancelled")
+            raise JobCancelled()
         ip = px.agent_ipv4(vmid, node)
         if ip:
             ctx.log(f"[{_ts()}] ✓ guest agent reports {ip}", "l-ok")
@@ -615,7 +624,7 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     conn, dep = _load_job_targets(job)
     # rebuild destroys the existing VM first — honour a cancel that landed after claim
     if ctx.cancelled():
-        raise RuntimeError("canceled before rebuild")
+        raise JobCancelled()
     px = Proxmox(conn)
     node = dep.node or conn.node or px.pick_node()
 
@@ -632,6 +641,10 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
         try:
             upid = px.destroy(old_vmid, node=node)
             px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
+        except JobCancelled:
+            # A cancel during the pre-rebuild destroy: do NOT recreate — propagate so
+            # _execute reconciles the cancel against the VM's actual state.
+            raise
         except Exception as e:  # noqa: BLE001
             # The old VM may simply be gone already (then we continue), but if it
             # SURVIVED we must NOT recreate over it: reusing the VMID would collide on
@@ -654,7 +667,7 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
     # Honour a cancel requested before the first (irreversible) destroy op — the claim
     # filter catches still-queued cancels; this catches one that landed just after claim.
     if ctx.cancelled():
-        raise RuntimeError("canceled before destroy")
+        raise JobCancelled()
     px = Proxmox(conn)
     node = dep.node or conn.node or px.pick_node()
 
@@ -679,7 +692,7 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
         except Exception as e:  # noqa: BLE001
             # Idempotent: a VM that's already gone IS a successful destroy. Re-raise a
             # cancel (handled upstream) or a destroy that genuinely left the VM behind.
-            if "cancel" in str(e).lower() or _vm_exists(px, dep.vmid, node):
+            if isinstance(e, JobCancelled) or _vm_exists(px, dep.vmid, node):
                 raise
             ctx.log(f"[{_ts()}] {dep.name} (vmid {dep.vmid}) already absent — treating as destroyed", "l-warn")
     ctx.log(f"[{_ts()}] ✓ destroyed {dep.name}", "l-ok")
@@ -771,12 +784,15 @@ def _execute(job_id: int) -> None:
             s.add(job)
         statebus.bump()
     except Exception as e:  # noqa: BLE001
-        cancelled = "cancel" in str(e).lower()
-        ctx.log(f"[{_ts()}] ✗ {e}", "l-err")
+        # Cancellation is identified by TYPE, never by error text — a genuine failure
+        # whose message contains the word "cancel" (e.g. a VM named 'cancel-svc') must
+        # be treated as a failure, not a user cancel that would destroy the VM.
+        cancelled = isinstance(e, JobCancelled)
+        ctx.log(f"[{_ts()}] ✗ {'canceled' if cancelled else e}", "l-err")
         with session_scope() as s:
             job = s.get(Job, job_id)
             job.status = "canceled" if cancelled else "failed"
-            job.error = str(e)
+            job.error = "canceled" if cancelled else str(e)
             job.finished_at = utcnow()
             s.add(job)
             if job.image_id and job.type == "image_build":
@@ -855,6 +871,46 @@ def _best_effort_destroy(conn_id: Optional[int], vmid: Optional[int], node: Opti
         pass
 
 
+def _best_effort_delete_snippet(conn_id: Optional[int], vmid: Optional[int]) -> None:
+    """Remove the node-side cloud-init snippet (gd-deploy-<vmid>.yml — carries the
+    root-password hash + injected pubkeys) left behind by a deploy. Best-effort:
+    needs an SSH key on the connection and swallows every error."""
+    if not conn_id or not vmid:
+        return
+    with session_scope() as s:
+        conn = s.get(Connection, conn_id)
+        conn = Connection(**conn.model_dump()) if conn else None
+    if not conn or not conn.ssh_key_path:
+        return
+    try:
+        delete_snippet_over_ssh(conn, f"gd-deploy-{vmid}.yml")
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _scsi0_size_gb(px: Proxmox, vmid: int, node: Optional[str]) -> Optional[int]:
+    """The VM's actual scsi0 size in GiB from its live config, or None if it can't be
+    determined (config read fails / no scsi0 / unparsable size)."""
+    try:
+        cfg = px.vm_config(vmid, node=node)
+    except Exception:  # noqa: BLE001
+        return None
+    m = re.search(r"size=(\d+(?:\.\d+)?)\s*([KMGT])", str((cfg or {}).get("scsi0", "")))
+    if not m:
+        return None
+    factor = {"K": 1 / 1048576, "M": 1 / 1024, "G": 1, "T": 1024}[m.group(2)]
+    return int(float(m.group(1)) * factor) or 1
+
+
+def _effective_disk_gb(resize_ok: bool, requested: int, actual: Optional[int]) -> int:
+    """Disk size to record on the deployment: the requested grow target if the resize
+    succeeded, otherwise the VM's actual current size (falling back to the requested
+    value only when the actual size is unknown)."""
+    if resize_ok:
+        return requested
+    return actual if actual else requested
+
+
 def _reconcile_canceled_job(job_id: Optional[int]) -> None:
     """Leave a cancelled job's deployment consistent — reconciled against the VM's
     ACTUAL Proxmox state, because a cancel can land after the (irreversible) destroy
@@ -888,6 +944,7 @@ def _reconcile_canceled_job(job_id: Optional[int]) -> None:
 
     if job_type == "deploy":
         _best_effort_destroy(conn_id, vmid, node)
+        _best_effort_delete_snippet(conn_id, vmid)
         _drop_deployment(dep_id)
         return
 

@@ -18,11 +18,15 @@ def run_playbook(
     private_key_pem: str,
     on_line: Optional[Callable[[str], None]] = None,
     timeout: int = 1200,
+    cancelled: Optional[Callable[[], bool]] = None,
 ) -> tuple[str, int]:
     """Run the playbook against `host` over SSH. Returns (status, rc).
 
     status is ansible-runner's: 'successful' | 'failed' | 'timeout' | 'canceled'.
-    Streams stdout lines to `on_line` if provided.
+    Streams stdout lines to `on_line` if provided. If `cancelled` is given, it is
+    polled by ansible-runner between tasks and a true result terminates the run with
+    status 'canceled' — so a user cancel during the post-boot phase is honoured
+    instead of blocking the worker until the wall-clock `timeout`.
     """
     import ansible_runner
 
@@ -82,5 +86,6 @@ def run_playbook(
             cmdline=f"--private-key {key_path}",
             quiet=True,
             event_handler=_event,
+            cancel_callback=(lambda: bool(cancelled and cancelled())),
         )
         return r.status, (r.rc if r.rc is not None else 1)
