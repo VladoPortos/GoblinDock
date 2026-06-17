@@ -31,7 +31,7 @@ def test_deployment_has_password_columns():
 
 
 def test_password_helpers():
-    import crypt
+    from passlib.hash import sha512_crypt
     from app.security import gen_vm_password, crypt_sha512, encrypt, decrypt
     p = gen_vm_password()
     assert len(p) == 20, len(p)
@@ -39,7 +39,9 @@ def test_password_helpers():
     assert gen_vm_password() != gen_vm_password(), "must be random"
     h = crypt_sha512("hunter2hunter2")
     assert h.startswith("$6$"), h
-    assert crypt.crypt("hunter2hunter2", h) == h, "hash must verify"
+    # verify via passlib (not stdlib `crypt`, which is gone in Py3.13) — the hash must
+    # still be a valid $6$ SHA-512-crypt that chpasswd accepts.
+    assert sha512_crypt.verify("hunter2hunter2", h), "hash must verify"
     assert decrypt(encrypt(p)) == p, "encrypt/decrypt round-trip"
     print("test_password_helpers OK")
 

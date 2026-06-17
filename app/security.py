@@ -8,6 +8,7 @@ import secrets as _secrets
 from functools import lru_cache
 
 from argon2 import PasswordHasher
+from passlib.hash import sha512_crypt
 from cryptography.fernet import Fernet
 from cryptography.hazmat.primitives import hashes
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -95,9 +96,13 @@ def gen_vm_password(length: int = 20) -> str:
 
 def crypt_sha512(password: str) -> str:
     """SHA-512 crypt hash ($6$...) for embedding in a cloud-init `chpasswd` so the
-    plaintext never lands in the snippet written to the Proxmox node."""
-    import crypt  # Linux-only stdlib; present on CPython 3.12 (the runtime image).
-    return crypt.crypt(password, crypt.mksalt(crypt.METHOD_SHA512))
+    plaintext never lands in the snippet written to the Proxmox node.
+
+    Uses passlib rather than the stdlib `crypt` module (removed in Python 3.13);
+    imported at module top so a missing dependency fails fast at boot/CI instead of
+    silently at VM-deploy time. rounds=5000 keeps the canonical `$6$<salt>$<hash>`
+    form (no rounds field) that `chpasswd` accepts."""
+    return sha512_crypt.using(rounds=5000).hash(password)
 
 
 def new_csrf_token() -> str:

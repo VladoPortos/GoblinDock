@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import ipaddress
 import logging
 import os
 import re
@@ -27,6 +28,10 @@ log = logging.getLogger("goblindock")
 # Hosts we've already warned about running with TLS verification off — so the warning
 # fires once per host per process instead of on every Proxmox client construction.
 _warned_insecure_tls: set = set()
+
+# Docker's default bridge subnet — a guest running containers can report docker0's
+# 172.17.x gateway, which must never be mistaken for the VM's real management IP.
+_DOCKER_BRIDGE_NET = ipaddress.ip_network("172.17.0.0/16")
 
 
 class ProxmoxError(RuntimeError):
@@ -188,7 +193,10 @@ class Proxmox:
                 raise JobCancelled()
             st = self.api.nodes(node).tasks(upid).status.get()
             if on_poll:
-                on_poll(st)
+                try:
+                    on_poll(st)
+                except Exception:  # noqa: BLE001 — a raising telemetry callback must never fail the task
+                    pass
             if st.get("status") == "stopped":
                 exit_status = st.get("exitstatus", "")
                 if exit_status != "OK":
@@ -346,15 +354,34 @@ class Proxmox:
             res = self.api.nodes(node).qemu(vmid).agent("network-get-interfaces").get()
         except ResourceException:
             return None
+        candidates = []
         for iface in res.get("result", []):
             if iface.get("name") in ("lo", "lo0"):
                 continue
             for addr in iface.get("ip-addresses", []) or []:
-                if addr.get("ip-address-type") == "ipv4":
-                    ip = addr.get("ip-address", "")
-                    if ip and not ip.startswith("127."):
-                        return ip
-        return None
+                if addr.get("ip-address-type") != "ipv4":
+                    continue
+                raw = (addr.get("ip-address") or "").strip()
+                try:
+                    ip = ipaddress.ip_address(raw)
+                except ValueError:
+                    continue
+                # Skip non-routable noise so a wrong address can never latch as the
+                # deployment IP (which _reconcile_ips only fills when empty): loopback,
+                # link-local (169.254) and 0.0.0.0.
+                if ip.is_loopback or ip.is_link_local or ip.is_unspecified:
+                    continue
+                candidates.append(raw)
+        if not candidates:
+            return None
+        # Prefer a globally-routable address, then a LAN address, and push a Docker
+        # default-bridge address (172.17/16) last — a workload bridge must never shadow
+        # the VM's real management lease.
+        def _rank(r: str):
+            a = ipaddress.ip_address(r)
+            return (a in _DOCKER_BRIDGE_NET, a.is_private)
+        candidates.sort(key=_rank)
+        return candidates[0]
 
     def mac_of(self, vmid: int, node: Optional[str] = None) -> str:
         cfg = self.vm_config(vmid, node)

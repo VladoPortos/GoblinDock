@@ -1138,8 +1138,17 @@ async def vm_console(websocket: WebSocket, dep_id: int):
 _VNC_SESS: dict = {}
 
 
+def _sweep_vnc_sessions() -> None:
+    """Drop expired one-shot VNC tokens. Called from both the proxy-create POST and the
+    websocket-accept path so an abandoned token (created but never connected) doesn't
+    linger past its 30s expiry."""
+    now = time.time()
+    for k in [k for k, v in list(_VNC_SESS.items()) if v.get("exp", 0) < now]:
+        _VNC_SESS.pop(k, None)
+
+
 @router.post("/vms/{dep_id}/vncproxy")
-def vm_vncproxy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def vm_vncproxy(dep_id: int, response: Response, user: User = Depends(current_user), session: Session = Depends(get_session)):
     dep = _owned_deployment(session, dep_id, user)
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
@@ -1151,12 +1160,14 @@ def vm_vncproxy(dep_id: int, user: User = Depends(current_user), session: Sessio
     except Exception as e:  # noqa: BLE001
         raise HTTPException(502, f"proxmox: {e}")
     import secrets as _secrets
+    _sweep_vnc_sessions()
     now = time.time()
-    for k in [k for k, v in list(_VNC_SESS.items()) if v["exp"] < now]:
-        _VNC_SESS.pop(k, None)
     tok = _secrets.token_urlsafe(24)
     _VNC_SESS[tok] = {"vmid": dep.vmid, "node": node, "port": r["port"],
                       "ticket": r["ticket"], "dep_id": dep_id, "exp": now + 30}
+    # The VNC ticket is a short-lived credential — never cache it (mirrors the other
+    # reveal endpoints' no-store).
+    response.headers["Cache-Control"] = "no-store"
     return {"ticket": r["ticket"], "wsToken": tok}
 
 
@@ -1184,6 +1195,7 @@ def reveal_vm_credentials(dep_id: int, response: Response,
 async def vm_vnc(websocket: WebSocket, dep_id: int):
     tok = websocket.query_params.get("t")
     sess = _VNC_SESS.pop(tok, None) if tok else None
+    _sweep_vnc_sessions()   # clean any other abandoned tokens on each connect
     conn, _dep = await _ws_authorized_dep(websocket, dep_id)
     if not conn:
         return

@@ -7,6 +7,7 @@ sqlmodel
 proxmoxer
 requests
 argon2-cffi
+passlib  # $6$ SHA-512-crypt for cloud-init chpasswd (stdlib `crypt` removed in Python 3.13)
 cryptography
 python-multipart
 itsdangerous
