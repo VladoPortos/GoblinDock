@@ -267,6 +267,17 @@ def _scoped_owned(obj, user: User) -> bool:
     return obj.owner_id == user.id or user.role == "admin"
 
 
+# Reserved namespace for app-managed secrets (e.g. the fleet-wide SSH keypair
+# GD_MANAGED_PRIVKEY/PUBKEY injected into every VM). These are infrastructure, not
+# user secrets: they must never be revealed, deleted, listed, or shadowed by a
+# user-created secret — exposing the private key is root on every managed VM.
+_SYSTEM_SECRET_PREFIX = "GD_MANAGED_"
+
+
+def _is_system_secret(sec) -> bool:
+    return bool(getattr(sec, "name", "") and sec.name.startswith(_SYSTEM_SECRET_PREFIX))
+
+
 def _owned_deployment(session: Session, dep_id: int, user: User) -> Deployment:
     """Fetch a deployment and enforce the owner-or-admin rule (404 / 403)."""
     dep = session.get(Deployment, dep_id)
@@ -427,7 +438,8 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     secrets_q = session.exec(select(Secret)).all()
     if user.role != "admin":
         secrets_q = [s for s in secrets_q if s.scope == "global" or s.owner_id == user.id]
-    secrets = [S.secret_dict(s, users) for s in secrets_q]
+    # App-managed secrets (fleet SSH key) are infrastructure — never surface them.
+    secrets = [S.secret_dict(s, users) for s in secrets_q if not _is_system_secret(s)]
 
     variables_q = session.exec(select(Variable)).all()
     if user.role != "admin":
@@ -1079,14 +1091,15 @@ def reveal_vm_credentials(dep_id: int, response: Response,
     dep = _owned_deployment(session, dep_id, user)
     if not dep.root_password_enc:
         raise HTTPException(404, "no stored password for this VM")
+    # Decrypt BEFORE auditing so a decryption failure (key rotation / corruption) is
+    # surfaced as a 500 and never recorded as a successful credential reveal.
+    try:
+        password = decrypt(dep.root_password_enc, strict=True)
+    except ValueError:
+        raise HTTPException(500, "credential decryption failed (key mismatch or corrupt ciphertext)")
     response.headers["Cache-Control"] = "no-store"
     record_audit(session, user, "vm.password.reveal", "deployment", dep.id, dep.name)
     session.commit()
-    password = decrypt(dep.root_password_enc)
-    if not password:
-        # Stored token failed to decrypt (key rotation / corruption) — surface it rather
-        # than returning a misleading empty password.
-        raise HTTPException(500, "credential decryption failed")
     return {"user": dep.cred_user or "root", "password": password}
 
 
@@ -1347,6 +1360,8 @@ def add_secret(body: SecretBody, user: User = Depends(current_user), session: Se
     if scope == "global" and user.role != "admin":
         scope = "user"
     name = body.name.strip()
+    if name.startswith(_SYSTEM_SECRET_PREFIX):
+        raise HTTPException(400, f"the {_SYSTEM_SECRET_PREFIX!r} name prefix is reserved for app-managed secrets")
     owner = user.id if scope == "user" else None
     # Reject a duplicate (scope, owner, name) so resolution stays deterministic — two
     # same-named secrets in a scope would make the {{ secrets.NAME }} lookup ambiguous.
@@ -1366,6 +1381,8 @@ def del_secret(sec_id: int, user: User = Depends(current_user), session: Session
     sec = session.get(Secret, sec_id)
     if not sec:
         raise HTTPException(404, "not found")
+    if _is_system_secret(sec):
+        raise HTTPException(403, "app-managed secret cannot be deleted")
     if not _scoped_owned(sec, user):
         raise HTTPException(403, "not yours")
     session.delete(sec)
@@ -1382,13 +1399,22 @@ def reveal_secret(sec_id: int, response: Response, user: User = Depends(current_
     sec = session.get(Secret, sec_id)
     if not sec:
         raise HTTPException(404, "not found")
+    if _is_system_secret(sec):
+        raise HTTPException(403, "app-managed secret cannot be revealed")
     if not _scoped_owned(sec, user):
         raise HTTPException(403, "not yours")
+    # Decrypt BEFORE auditing so a decrypt failure (key mismatch / corruption) surfaces
+    # as a clear 500 and is not recorded as a successful reveal — and never returned as
+    # a misleading empty value with a 200.
+    try:
+        value = decrypt(sec.value_enc, strict=True)
+    except ValueError:
+        raise HTTPException(500, "secret decryption failed (key mismatch or corrupt ciphertext)")
     response.headers["Cache-Control"] = "no-store"
     record_audit(session, user, "secret.reveal", "secret", sec.id, sec.name)
     session.commit()
     users = {u.id: u for u in session.exec(select(User)).all()}
-    return S.secret_dict(sec, users, reveal=True)
+    return {**S.secret_dict(sec, users), "val": value}
 
 
 # --------------------------------------------------------------------------- #

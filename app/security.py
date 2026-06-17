@@ -59,12 +59,19 @@ def encrypt(value: str) -> str:
     return _fernet().encrypt(value.encode("utf-8")).decode("ascii")
 
 
-def decrypt(token: str) -> str:
+def decrypt(token: str, strict: bool = False) -> str:
+    """Decrypt a stored secret. By default fails CLOSED (returns "") on a rotated/
+    corrupt ciphertext so per-connection probes degrade gracefully. Pass strict=True
+    where the caller needs to tell a real decrypt failure (key mismatch / corruption)
+    apart from a legitimately empty value — it then raises instead of masking the
+    failure as an empty string. An empty token is always a legitimate empty value."""
     if not token:
         return ""
     try:
         return _fernet().decrypt(token.encode("ascii")).decode("utf-8")
-    except Exception:  # noqa: BLE001  (InvalidToken on rotated/corrupt — fail closed)
+    except Exception as e:  # noqa: BLE001  (InvalidToken on rotated/corrupt)
+        if strict:
+            raise ValueError("secret decryption failed — key mismatch or corrupt ciphertext") from e
         return ""
 
 

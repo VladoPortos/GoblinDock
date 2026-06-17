@@ -542,9 +542,13 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     if not used_snippet:
         params["ciuser"] = "goblin"
         if root_pw:
-            # Native cloud-init applies cipassword to the ciuser (goblin), not root.
-            params["cipassword"] = root_pw
-            cred_user = "goblin"
+            # The hashed-snippet path was unavailable (no SSH key on the connection), and
+            # native cloud-init can only take a cipassword in PLAINTEXT in the VM config
+            # (readable via `qm config`). Rather than persist a plaintext credential, skip
+            # it: there is no audited console password on this fallback path.
+            ctx.log(f"[{_ts()}] console password unavailable — connection has no SSH key for the hashed cloud-init snippet", "l-warn")
+            root_pw = ""
+            cred_user = ""
         if pubkeys:
             params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
     px.set_config(new_vmid, node=node, **params)
