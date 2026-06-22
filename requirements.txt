@@ -8,9 +8,9 @@ annotated-types==0.7.0 \
     --hash=sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53 \
     --hash=sha256:aff07c09a53a08bc8cfccb9c85b05f1aa9a2a6f23728d790723543408344ce89
     # via pydantic
-ansible-core==2.21.0 \
-    --hash=sha256:28ccd0e2d1849f1c7272cec39a74a8a5c83f3d51314658fa5ca57ea85a87f454 \
-    --hash=sha256:fed7dd076365aad9ccf885c6b8f938e0fd508f5dcdffe5d2ca87cfb5fac47940
+ansible-core==2.21.1 \
+    --hash=sha256:1403ff56bb69484ef90788126d06c65b4e28e8d2dcdcfb7f027d4c1495052d7e \
+    --hash=sha256:a5536ece95be84de15212b3644cdbbe9cbd9efd62e4e8a544cd6b0b27a083039
     # via -r requirements.in
 ansible-runner==2.4.3 \
     --hash=sha256:5f3025529bb968fdc3b627457dd8d418dbf9d53bc73735d50e69c28544d53031 \
@@ -448,9 +448,9 @@ cryptography==49.0.0 \
     #   -r requirements.in
     #   ansible-core
     #   paramiko
-fastapi==0.137.0 \
-    --hash=sha256:6dcbde8d464f92117c1accb9e42720f8e423fa9b86cb563b1f5862f785a06498 \
-    --hash=sha256:d0565d551f65a803ecff245390840867186f456ef98971f750724eed16e1541c
+fastapi==0.138.0 \
+    --hash=sha256:b6f54fd1bd72c80b0f899f172c61a600f6f7af9b43d4d772a018f35624048cb0 \
+    --hash=sha256:d445a4877636ad191e7053e08c9bf98cb921a6756776848400bb773d1740c061
     # via -r requirements.in
 greenlet==3.5.1 \
     --hash=sha256:001775efe7b8e758861294c7a27c28af87f3f3f1c20468a2bc618c45b346c061 \
@@ -1060,13 +1060,11 @@ typing-extensions==4.15.0 \
     --hash=sha256:0cea48d173cc12fa28ecabc3b837ea3cf6f38c6d1136f85cbaaf598984861466 \
     --hash=sha256:f0fa19c6845758ab08074a0cfa8b7aecb71c999ca73d62883bc25cc018c4e548
     # via
-    #   anyio
     #   fastapi
     #   pydantic
     #   pydantic-core
     #   sqlalchemy
     #   sqlmodel
-    #   starlette
     #   typing-inspection
 typing-inspection==0.4.2 \
     --hash=sha256:4ed1cacbdc298c220f1bd249ed5287caa16f34d44ef4e9c3d0cbad5b521545e7 \
@@ -1082,7 +1080,7 @@ urllib3==2.7.0 \
     --hash=sha256:231e0ec3b63ceb14667c67be60f2f2c40a518cb38b03af60abc813da26505f4c \
     --hash=sha256:9fb4c81ebbb1ce9531cce37674bbc6f1360472bc18ca9a553ede278ef7276897
     # via requests
-uvicorn==0.49.0 \
+uvicorn[standard]==0.49.0 \
     --hash=sha256:ba3d14c3ee7e41c6c654c46c9eb489d33213cdd30aa1696eab1374337c13f68f \
     --hash=sha256:ebf4271aa580d9de97f93192d4595176df6e91f9aae919ca73e4fc07df1e66a3
     # via -r requirements.in
