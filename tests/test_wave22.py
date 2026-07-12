@@ -175,6 +175,49 @@ def test_probe_redacts_errors():
     print("test_probe_redacts_errors OK")
 
 
+def test_probe_failure_log_excludes_attacker_controlled_text():
+    import logging
+
+    from app import api
+
+    uid = _mk_user("w22-log-injection@example.com")
+    records = []
+
+    class _Capture(logging.Handler):
+        def emit(self, record):
+            records.append(record.getMessage())
+
+    class _BoomPx:
+        def __init__(self, conn):
+            pass
+
+        def version(self):
+            raise RuntimeError("upstream failure\r\nFORGED-EXCEPTION-LINE")
+
+    logger = logging.getLogger("goblindock")
+    handler = _Capture()
+    logger.addHandler(handler)
+    orig = api.Proxmox
+    api.Proxmox = _BoomPx
+    try:
+        with session_scope() as s:
+            user = s.get(api.User, uid)
+            out = api.probe_connection(api.ConnProbeBody(
+                host="safe.example\r\nFORGED-HOST-LINE",
+                token_id="g@pve!app", token_secret="x"),
+                user=user, session=s)
+    finally:
+        api.Proxmox = orig
+        logger.removeHandler(handler)
+
+    assert out["ok"] is False, out
+    log_text = "\n".join(records)
+    assert "FORGED-HOST-LINE" not in log_text, log_text
+    assert "FORGED-EXCEPTION-LINE" not in log_text, log_text
+    assert "RuntimeError" in log_text, log_text
+    print("test_probe_failure_log_excludes_attacker_controlled_text OK")
+
+
 def test_probe_unknown_conn_id_404():
     from app import api
     from fastapi import HTTPException
@@ -199,5 +242,6 @@ if __name__ == "__main__":
     test_probe_categorizes_storages()
     test_probe_reuses_stored_secret()
     test_probe_redacts_errors()
+    test_probe_failure_log_excludes_attacker_controlled_text()
     test_probe_unknown_conn_id_404()
     print("\nALL WAVE 22 UNIT TESTS PASSED")
