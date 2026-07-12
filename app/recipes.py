@@ -185,6 +185,8 @@ def merge_deploy_inputs(recipe: list[dict], overrides: dict) -> list[dict]:
         if not isinstance(block, dict):
             continue
         inputs = block.get("inputs") or {}
+        if not isinstance(inputs, dict):
+            inputs = {}
         for name, value in answers.items():
             if name in names:
                 inputs[name] = value
@@ -204,6 +206,8 @@ def _merged_inputs(block: Block, placed: dict) -> dict:
     """Block schema defaults, overlaid with whatever the user filled in."""
     merged = _schema_defaults(block)
     user_inputs = placed.get("inputs") or {}
+    if not isinstance(user_inputs, dict):
+        user_inputs = {}
     for k, v in user_inputs.items():
         if v not in (None, ""):
             merged[k] = v

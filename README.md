@@ -202,7 +202,8 @@ every step live, download progress included.
   intentionally arbitrary shell — on your own VM. Password-typed inputs are masked in the
   builder (with a confirm box) and replaced with `********` in the YAML preview.
 - `{{ secrets.NAME }}` / `{{ variable.NAME }}` are resolved at run time (secrets stay
-  server-side and are masked in previews/logs).
+  server-side and are masked in previews/logs). Personal values resolve only for their
+  owner; global values are admin-only and resolve only for admin-owned deployments.
 
 ---
 

@@ -28,7 +28,7 @@ from starlette.requests import Request  # noqa: E402
 from fastapi import HTTPException  # noqa: E402
 from sqlmodel import Session, select  # noqa: E402
 
-from app import api, worker  # noqa: E402
+from app import api, recipes, worker  # noqa: E402
 from app import serialize as S  # noqa: E402
 from app.config import settings  # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
@@ -87,6 +87,17 @@ def test_admin_lookup_can_resolve_global_values():
     print("test_admin_lookup_can_resolve_global_values OK")
 
 
+def test_ownerless_lookup_cannot_resolve_global_values():
+    with session_scope() as s:
+        s.add(Secret(scope="global", name="OWNERLESS_GLOBAL", value_enc=encrypt("blocked")))
+        s.add(Variable(scope="global", name="OWNERLESS_VARIABLE", value="blocked"))
+
+    lookup = worker._secret_lookup_factory(None, allow_global=False)
+    assert lookup("secrets", "OWNERLESS_GLOBAL") == ""
+    assert lookup("variable", "OWNERLESS_VARIABLE") == ""
+    print("test_ownerless_lookup_cannot_resolve_global_values OK")
+
+
 def test_owner_secret_context_uses_deployment_owner_role():
     owner = _mk_user("w36-owner@example.com")
     actor = _mk_user("w36-actor@example.com", role="admin")
@@ -94,6 +105,78 @@ def test_owner_secret_context_uses_deployment_owner_role():
     assert worker._owner_secret_context(owner) == (owner, False)
     assert worker._owner_secret_context(actor) == (actor, True)
     print("test_owner_secret_context_uses_deployment_owner_role OK")
+
+
+def test_deploy_worker_uses_owner_not_admin_actor_for_secret_context():
+    owner = _mk_user("w36-worker-owner@example.com")
+    actor = _mk_user("w36-worker-actor@example.com", role="admin")
+    with session_scope() as s:
+        conn = Connection(name="w36-owner-context", host="pve", token_id="u@pve!t")
+        s.add(conn)
+        s.flush()
+        dep = Deployment(
+            name="owner-context-vm", owner_id=owner, connection_id=conn.id,
+            node="pve", status="working",
+        )
+        s.add(dep)
+        s.flush()
+        job = Job(
+            type="rebuild", status="running", deployment_id=dep.id,
+            connection_id=conn.id, created_by=actor,
+            context_json='{"src_url":"https://example.com/base.img"}',
+        )
+        s.add(job)
+        s.flush()
+        jid = job.id
+
+    observed = []
+
+    class StopAtOwner(RuntimeError):
+        pass
+
+    class OwnerPx:
+        def __init__(self, _conn):
+            pass
+
+        def next_free_vmid(self, *_args, **_kwargs):
+            return 8003
+
+        def storage_has_volume(self, *_args, **_kwargs):
+            return True
+
+        def iso_volume_path(self, filename):
+            return f"local:import/{filename}"
+
+        def create_vm_import(self, *_args, **_kwargs):
+            return "UPID:create"
+
+        def wait_task(self, *_args, **_kwargs):
+            return None
+
+    original_px = worker.Proxmox
+    original_key = worker._ssh_pubkey
+
+    def observe_key(owner_id, *, allow_global=False):
+        observed.append((owner_id, allow_global))
+        raise StopAtOwner("inspection complete")
+
+    worker.Proxmox = OwnerPx
+    worker._ssh_pubkey = observe_key
+    try:
+        with session_scope() as s:
+            job_copy = Job(**s.get(Job, jid).model_dump())
+        try:
+            worker._run_deploy(worker.JobCtx(jid), job_copy)
+        except StopAtOwner:
+            pass
+        else:
+            raise AssertionError("test must stop after observing owner context")
+    finally:
+        worker.Proxmox = original_px
+        worker._ssh_pubkey = original_key
+
+    assert observed == [(owner, False)], observed
+    print("test_deploy_worker_uses_owner_not_admin_actor_for_secret_context OK")
 
 
 def test_state_hides_global_secret_metadata_from_normal_users():
@@ -170,6 +253,73 @@ def test_create_call_collision_never_destroys_selected_vmid():
 
     assert destroyed == [], f"pre-existing VMID must not be cleaned up, got {destroyed}"
     print("test_create_call_collision_never_destroys_selected_vmid OK")
+
+
+def test_create_uses_connection_clamped_cpu_and_ram():
+    uid = _mk_user("w36-create-limits@example.com")
+    with session_scope() as s:
+        conn = Connection(
+            name="w36-create-limits", host="pve", token_id="u@pve!t",
+            max_cores=4, max_ram_mb=8192, max_disk_gb=50,
+        )
+        s.add(conn)
+        s.flush()
+        dep = Deployment(
+            name="limited-vm", owner_id=uid, connection_id=conn.id,
+            node="pve", status="working",
+        )
+        s.add(dep)
+        s.flush()
+        job = Job(
+            type="deploy", status="running", deployment_id=dep.id,
+            connection_id=conn.id, created_by=uid,
+            context_json=(
+                '{"src_url":"https://example.com/base.img",'
+                '"cpu":8,"ram":16,"disk":100}'
+            ),
+        )
+        s.add(job)
+        s.flush()
+        jid = job.id
+
+    observed = {}
+
+    class StopAfterCreate(RuntimeError):
+        pass
+
+    class LimitPx:
+        def __init__(self, _conn):
+            pass
+
+        def next_free_vmid(self, *_args, **_kwargs):
+            return 8002
+
+        def storage_has_volume(self, *_args, **_kwargs):
+            return True
+
+        def iso_volume_path(self, filename):
+            return f"local:import/{filename}"
+
+        def create_vm_import(self, _vmid, _name, _path, *, cores, ram_mb, node=None):
+            observed.update(cores=cores, ram_mb=ram_mb)
+            raise StopAfterCreate("inspection complete")
+
+    original = worker.Proxmox
+    worker.Proxmox = LimitPx
+    try:
+        with session_scope() as s:
+            job_copy = Job(**s.get(Job, jid).model_dump())
+        try:
+            worker._run_deploy(worker.JobCtx(jid), job_copy)
+        except StopAfterCreate:
+            pass
+        else:
+            raise AssertionError("test stub must stop after observing create parameters")
+    finally:
+        worker.Proxmox = original
+
+    assert observed == {"cores": 4, "ram_mb": 8192}, observed
+    print("test_create_uses_connection_clamped_cpu_and_ram OK")
 
 
 def test_worker_resource_clamp_treats_zero_as_unlimited():
@@ -344,6 +494,54 @@ def test_orphan_recovery_keeps_rebuild_and_destroy_ip_allocations():
     print("test_orphan_recovery_keeps_rebuild_and_destroy_ip_allocations OK")
 
 
+def test_rebuild_admission_uses_deploy_allocation_lock():
+    uid = _mk_user("w36-rebuild-lock@example.com")
+    template_id, network_id = _mk_deployable_template(uid, static=True)
+    with session_scope() as s:
+        template = s.get(Template, template_id)
+        dep = Deployment(
+            name="legacy-static-rebuild", owner_id=uid,
+            connection_id=template.connection_id, image_id=template.base_image_id,
+            template_id=template.id, network_id=network_id, vmid=8009,
+            status="running",
+        )
+        s.add(dep)
+        s.flush()
+        dep_id = dep.id
+
+    entered_build = threading.Event()
+    result = []
+    original = api._build_job_ctx
+
+    def observed_build(*_args, **_kwargs):
+        entered_build.set()
+        return "{}"
+
+    def rebuild():
+        with Session(engine) as s:
+            try:
+                result.append(api.vm_rebuild(dep_id, user=s.get(User, uid), session=s))
+            except Exception as exc:  # captured for assertion in the parent thread
+                result.append(exc)
+
+    api._build_job_ctx = observed_build
+    thread = threading.Thread(target=rebuild)
+    try:
+        with api._deploy_lock:
+            thread.start()
+            assert not entered_build.wait(timeout=0.25), \
+                "rebuild must wait behind deployment/IP admission lock"
+        thread.join(timeout=3)
+    finally:
+        api._build_job_ctx = original
+        if thread.is_alive():
+            thread.join(timeout=3)
+
+    assert entered_build.is_set(), "rebuild should proceed after the lock is released"
+    assert result and isinstance(result[0], dict), result
+    print("test_rebuild_admission_uses_deploy_allocation_lock OK")
+
+
 def test_template_write_rejects_malformed_recipe_shape():
     uid = _mk_user("w36-malformed@example.com")
     with session_scope() as s:
@@ -372,6 +570,38 @@ def test_template_write_rejects_private_block_from_another_user():
             user=s.get(User, other), session=s,
         ))
     print("test_template_write_rejects_private_block_from_another_user OK")
+
+
+def test_template_write_rejects_non_object_inputs():
+    uid = _mk_user("w36-input-shape@example.com")
+    with session_scope() as s:
+        s.add(Block(
+            key="c-w36-inputs", kind="custom", builtin=False, owner_id=uid,
+            name="inputs", phase="cloudinit", cloudinit_template="echo ok",
+        ))
+    with session_scope() as s:
+        _expect_http(400, lambda: api.save_template(
+            api.TemplateBody(
+                name="bad-inputs",
+                recipe=[{"blocks": [{"ref": "c-w36-inputs", "inputs": ["bad"]}]}],
+            ),
+            user=s.get(User, uid), session=s,
+        ))
+    print("test_template_write_rejects_non_object_inputs OK")
+
+
+def test_legacy_non_object_inputs_compile_as_empty():
+    block = Block(
+        key="c-w36-legacy-inputs", name="legacy inputs", phase="cloudinit",
+        cloudinit_template="echo {value}",
+        input_schema_json='[{"name":"value","default":"safe"}]',
+    )
+    compiled = recipes.compile_cloudinit(
+        [{"blocks": [{"ref": block.key, "inputs": ["bad"]}]}],
+        {block.key: block}, lambda _ns, _name: "",
+    )
+    assert compiled[-1] == "echo safe", compiled
+    print("test_legacy_non_object_inputs_compile_as_empty OK")
 
 
 def test_legacy_malformed_recipe_serializes_without_crashing():
@@ -489,17 +719,23 @@ def test_delete_network_rejects_template_reference():
 if __name__ == "__main__":
     test_non_admin_lookup_cannot_resolve_global_values()
     test_admin_lookup_can_resolve_global_values()
+    test_ownerless_lookup_cannot_resolve_global_values()
     test_owner_secret_context_uses_deployment_owner_role()
+    test_deploy_worker_uses_owner_not_admin_actor_for_secret_context()
     test_state_hides_global_secret_metadata_from_normal_users()
     test_create_call_collision_never_destroys_selected_vmid()
+    test_create_uses_connection_clamped_cpu_and_ram()
     test_worker_resource_clamp_treats_zero_as_unlimited()
     test_worker_resource_clamp_honors_nonzero_limit()
     test_ansible_startup_exception_fails_phase()
     test_exhausted_static_pool_leaves_no_partial_deployment_or_job()
     test_concurrent_deploy_admission_cannot_exceed_quota()
     test_orphan_recovery_keeps_rebuild_and_destroy_ip_allocations()
+    test_rebuild_admission_uses_deploy_allocation_lock()
     test_template_write_rejects_malformed_recipe_shape()
     test_template_write_rejects_private_block_from_another_user()
+    test_template_write_rejects_non_object_inputs()
+    test_legacy_non_object_inputs_compile_as_empty()
     test_legacy_malformed_recipe_serializes_without_crashing()
     test_delete_template_rejects_live_deployment_reference()
     test_delete_block_rejects_template_reference()

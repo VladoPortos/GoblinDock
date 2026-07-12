@@ -806,6 +806,13 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
 
 @router.post("/deployments/{dep_id}/rebuild")
 def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    # Rebuild may need to recreate a missing legacy/static allocation. Keep its flush
+    # and final commit inside the same lock used by new deployment admission.
+    with _deploy_lock:
+        return _vm_rebuild_transaction(dep_id, user, session)
+
+
+def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     dep = _owned_deployment(session, dep_id, user)
     if not dep.template_id:
         raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
@@ -1398,6 +1405,8 @@ def _validate_recipe(session: Session, recipe: list, user: User) -> None:
                 raise HTTPException(400, f"recipe block {si}.{bi} needs a string ref")
             if ref not in visible:
                 raise HTTPException(400, f"recipe block {si}.{bi} is unknown or not visible")
+            if "inputs" in placed and not isinstance(placed["inputs"], dict):
+                raise HTTPException(400, f"recipe block {si}.{bi}.inputs must be an object")
 
 
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:

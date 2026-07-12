@@ -160,10 +160,14 @@ def _secret_lookup_factory(owner_id: Optional[int], sink: Optional[set] = None,
             if ns == "variable":
                 # per-user variable overrides global; value is plaintext. order_by(id)
                 # keeps resolution deterministic if a legacy duplicate name exists.
-                var = s.exec(
-                    select(Variable).where(Variable.name == name, Variable.owner_id == owner_id)
-                    .order_by(Variable.id)
-                ).first()
+                var = None
+                if owner_id is not None:
+                    var = s.exec(
+                        select(Variable).where(
+                            Variable.name == name, Variable.scope == "user",
+                            Variable.owner_id == owner_id,
+                        ).order_by(Variable.id)
+                    ).first()
                 if not var and allow_global:
                     var = s.exec(
                         select(Variable).where(Variable.name == name, Variable.scope == "global")
@@ -171,10 +175,14 @@ def _secret_lookup_factory(owner_id: Optional[int], sink: Optional[set] = None,
                     ).first()
                 return var.value if var else ""
             # per-user secret overrides global
-            sec = s.exec(
-                select(Secret).where(Secret.name == name, Secret.owner_id == owner_id)
-                .order_by(Secret.id)
-            ).first()
+            sec = None
+            if owner_id is not None:
+                sec = s.exec(
+                    select(Secret).where(
+                        Secret.name == name, Secret.scope == "user",
+                        Secret.owner_id == owner_id,
+                    ).order_by(Secret.id)
+                ).first()
             if not sec and allow_global:
                 sec = s.exec(
                     select(Secret).where(Secret.name == name, Secret.scope == "global")
@@ -441,6 +449,11 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     cfg = json.loads(job.context_json or "{}")
     conn, dep = _load_job_targets(job)
     secret_owner_id, allow_global_secrets = _owner_secret_context(dep.owner_id)
+    # Clamp before the create request so a stale queued context cannot reserve more
+    # than the connection's current limits even temporarily.
+    cores = _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores)
+    ram_mb = _clamp_resource(int(cfg.get("ram", 2)) * 1024, conn.max_ram_mb)
+    disk_gb = _clamp_resource(int(cfg.get("disk", 20)), conn.max_disk_gb)
 
     px = Proxmox(conn)
     # Build on the deployment's node — set at deploy-creation from the template's connection.
@@ -472,8 +485,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     create_submitted = False
     try:
         upid = px.create_vm_import(new_vmid, dep.name, import_path,
-                                   cores=int(cfg.get("cpu", 1)),
-                                   ram_mb=int(cfg.get("ram", 2)) * 1024, node=node)
+                                   cores=cores, ram_mb=ram_mb, node=node)
         create_submitted = True
         px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
     except Exception:
@@ -495,10 +507,6 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ctx.progress(45, f"Phase {_ph(4)} of {phase_total} · Configure")
     st = ctx.add_step("Apply cloud-init (name, SSH key, network, size)")
     t = ctx.start_step(st)
-    # Mirror the API: a zero connection limit is unlimited in every dimension.
-    cores = _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores)
-    ram_mb = _clamp_resource(int(cfg.get("ram", 2)) * 1024, conn.max_ram_mb)
-    disk_gb = _clamp_resource(int(cfg.get("disk", 20)), conn.max_disk_gb)
     user_pubkey = _ssh_pubkey(secret_owner_id, allow_global=allow_global_secrets)
     managed_priv, managed_pub = _managed_keypair()
     pubkeys = [k for k in (user_pubkey, managed_pub) if k]
