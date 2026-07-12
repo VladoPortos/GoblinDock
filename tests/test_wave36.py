@@ -604,6 +604,48 @@ def test_legacy_non_object_inputs_compile_as_empty():
     print("test_legacy_non_object_inputs_compile_as_empty OK")
 
 
+def test_legacy_non_object_inputs_fail_deploy_validation_cleanly():
+    uid = _mk_user("w36-legacy-deploy-inputs@example.com")
+    with session_scope() as s:
+        block = Block(
+            key="c-w36-legacy-deploy", kind="custom", builtin=False, owner_id=uid,
+            name="legacy deploy", phase="cloudinit", cloudinit_template="echo {value}",
+            input_schema_json='[{"name":"value","type":"text"}]',
+        )
+        s.add(block)
+        template = Template(
+            name="legacy-deploy-inputs", owner_id=uid,
+            recipe_json=json.dumps([{"blocks": [{
+                "ref": block.key, "ask": ["value"], "inputs": ["bad"],
+            }]}]),
+        )
+        s.add(template)
+        s.flush()
+        _expect_http(400, lambda: api._validate_deploy_inputs(s, template, {}))
+    print("test_legacy_non_object_inputs_fail_deploy_validation_cleanly OK")
+
+
+def test_compile_preview_normalizes_non_object_inputs():
+    uid = _mk_user("w36-preview-inputs@example.com")
+    with session_scope() as s:
+        block = Block(
+            key="c-w36-preview", kind="custom", builtin=False, owner_id=uid,
+            name="preview", phase="ansible",
+            ansible_template="- name: preview\n  ansible.builtin.debug: {msg: {password_yamlq}}",
+            input_schema_json='[{"name":"password","type":"password"}]',
+        )
+        s.add(block)
+    with session_scope() as s:
+        result = api.compile_template(
+            api.CompileBody(recipe=[{"blocks": [{
+                "ref": "c-w36-preview", "inputs": ["bad"],
+            }]}]),
+            user=s.get(User, uid), session=s,
+        )
+    assert "yaml" in result and "tasks:" in result["yaml"]
+    print("test_compile_preview_normalizes_non_object_inputs OK")
+
+
 def test_legacy_malformed_recipe_serializes_without_crashing():
     uid = _mk_user("w36-legacy-recipe@example.com")
     with session_scope() as s:
@@ -736,6 +778,8 @@ if __name__ == "__main__":
     test_template_write_rejects_private_block_from_another_user()
     test_template_write_rejects_non_object_inputs()
     test_legacy_non_object_inputs_compile_as_empty()
+    test_legacy_non_object_inputs_fail_deploy_validation_cleanly()
+    test_compile_preview_normalizes_non_object_inputs()
     test_legacy_malformed_recipe_serializes_without_crashing()
     test_delete_template_rejects_live_deployment_reference()
     test_delete_block_rejects_template_reference()

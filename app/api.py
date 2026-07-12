@@ -684,7 +684,10 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                 out[name] = v
             elif ftype in ("text", "secret", "password"):
                 # unanswered: the template's stored value must carry it
-                stored = (placed.get("inputs") or {}).get(name)
+                stored_inputs = placed.get("inputs") or {}
+                if not isinstance(stored_inputs, dict):
+                    stored_inputs = {}
+                stored = stored_inputs.get(name)
                 if not (stored and str(stored).strip()):
                     raise HTTPException(400, f"template requires input {name!r}")
         if out:
@@ -1534,6 +1537,8 @@ def compile_template(body: CompileBody, user: User = Depends(current_user), sess
                 continue
             pw_fields = {f.get("name") for f in schema if isinstance(f, dict) and f.get("type") == "password"}
             inputs = b.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                inputs = {}
             for name in pw_fields:
                 if inputs.get(name):
                     inputs[name] = "********"
