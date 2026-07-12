@@ -31,6 +31,7 @@ from .models import (
     JobStep,
     Template,
     Secret,
+    User,
     Variable,
     utcnow,
 )
@@ -134,6 +135,12 @@ def _ts() -> str:
     return datetime.now(timezone.utc).strftime("%H:%M:%S")
 
 
+def _clamp_resource(requested: int, limit: int) -> int:
+    """Clamp a positive request only when the connection has a real limit."""
+    requested = max(1, int(requested))
+    return min(requested, int(limit)) if int(limit) > 0 else requested
+
+
 # --------------------------------------------------------------------------- #
 # helpers                                                                      #
 # --------------------------------------------------------------------------- #
@@ -142,7 +149,8 @@ def _blocks_by_key() -> dict[str, Block]:
         return {b.key: Block(**b.model_dump()) for b in s.exec(select(Block)).all()}
 
 
-def _secret_lookup_factory(owner_id: Optional[int], sink: Optional[set] = None):
+def _secret_lookup_factory(owner_id: Optional[int], sink: Optional[set] = None,
+                           *, allow_global: bool = False):
     """Resolve {{ secrets.NAME }} / {{ variable.NAME }}. If `sink` is given, every
     resolved SECRET plaintext is collected into it so the caller can redact those
     values out of streamed job logs (variables are plaintext-by-design and shown in
@@ -156,7 +164,7 @@ def _secret_lookup_factory(owner_id: Optional[int], sink: Optional[set] = None):
                     select(Variable).where(Variable.name == name, Variable.owner_id == owner_id)
                     .order_by(Variable.id)
                 ).first()
-                if not var:
+                if not var and allow_global:
                     var = s.exec(
                         select(Variable).where(Variable.name == name, Variable.scope == "global")
                         .order_by(Variable.id)
@@ -167,7 +175,7 @@ def _secret_lookup_factory(owner_id: Optional[int], sink: Optional[set] = None):
                 select(Secret).where(Secret.name == name, Secret.owner_id == owner_id)
                 .order_by(Secret.id)
             ).first()
-            if not sec:
+            if not sec and allow_global:
                 sec = s.exec(
                     select(Secret).where(Secret.name == name, Secret.scope == "global")
                     .order_by(Secret.id)
@@ -181,6 +189,17 @@ def _secret_lookup_factory(owner_id: Optional[int], sink: Optional[set] = None):
                 return val
         return ""
     return lookup
+
+
+def _owner_secret_context(owner_id: Optional[int]) -> tuple[Optional[int], bool]:
+    """Return the identity and global-value permission used to compile a deployment.
+
+    The deployment owner is the security principal.  The actor who queued a rebuild may
+    be an admin acting on somebody else's VM and must not substitute their own values.
+    """
+    with session_scope() as s:
+        owner = s.get(User, owner_id) if owner_id else None
+        return owner_id, bool(owner and owner.role == "admin")
 
 
 def _redactor(values: set):
@@ -221,8 +240,8 @@ def _valid_pubkey(key: str) -> bool:
     return len(parts[1]) >= 40
 
 
-def _ssh_pubkey(owner_id: Optional[int]) -> str:
-    lookup = _secret_lookup_factory(owner_id)
+def _ssh_pubkey(owner_id: Optional[int], *, allow_global: bool = False) -> str:
+    lookup = _secret_lookup_factory(owner_id, allow_global=allow_global)
     for name in ("DEPLOY_SSH_PUBKEY", "TEAM_SSH_PUBKEY"):
         val = lookup("secrets", name)
         if val and _valid_pubkey(val):
@@ -266,7 +285,7 @@ def _managed_keypair() -> tuple[str, str]:
 
 
 def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_priv: str,
-                       label: str) -> None:
+                       label: str, *, allow_global: bool = False) -> None:
     """Run the post-boot ansible-phase blocks of a recipe against a live VM."""
     if not (recipe and ip):
         return
@@ -277,7 +296,7 @@ def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_p
     # streamed Ansible stdout — a task that echoes a secret (debug/failed command)
     # must NOT land its plaintext in the job log (which the job's owner can read).
     vault: set = set()
-    lookup = _secret_lookup_factory(owner_id, sink=vault)
+    lookup = _secret_lookup_factory(owner_id, sink=vault, allow_global=allow_global)
     playbook = compile_ansible(recipe, blocks, lookup, name=label)
     # Also redact LITERAL password/secret-typed input values: these never pass through
     # `lookup` (only {{ secrets.NAME }} refs do), so they would otherwise appear
@@ -296,8 +315,8 @@ def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_p
             cancelled=ctx.cancelled,
         )
     except Exception as e:  # noqa: BLE001
-        ctx.log(f"[{_ts()}] ⚠ ansible run failed to start: {e}", "l-warn")
-        return
+        ctx.log(f"[{_ts()}] ✕ ansible run failed to start: {e}", "l-err")
+        raise RuntimeError(f"ansible run failed to start: {e}") from e
     if status == "successful":
         ctx.log(f"[{_ts()}] ✓ ansible {label} complete", "l-ok")
     elif status == "canceled":
@@ -421,6 +440,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         return phase_base + n
     cfg = json.loads(job.context_json or "{}")
     conn, dep = _load_job_targets(job)
+    secret_owner_id, allow_global_secrets = _owner_secret_context(dep.owner_id)
 
     px = Proxmox(conn)
     # Build on the deployment's node — set at deploy-creation from the template's connection.
@@ -449,17 +469,20 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     t = ctx.start_step(st)
     import_path = px.iso_volume_path(filename)
     ctx.log(f"[{_ts()}] create vm {new_vmid} import-from {import_path}", "l-acc")
+    create_submitted = False
     try:
         upid = px.create_vm_import(new_vmid, dep.name, import_path,
                                    cores=int(cfg.get("cpu", 1)),
                                    ram_mb=int(cfg.get("ram", 2)) * 1024, node=node)
+        create_submitted = True
         px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
     except Exception:
-        # best-effort cleanup of a half-created VM so the vmid doesn't orphan
-        try:
-            px.destroy(new_vmid, node=node)
-        except Exception:  # noqa: BLE001
-            pass
+        # A pre-submission failure can be a collision with a VM we do not own.
+        if create_submitted:
+            try:
+                px.destroy(new_vmid, node=node)
+            except Exception:  # noqa: BLE001
+                pass
         raise
     ctx.log(f"[{_ts()}] ✓ disk imported", "l-ok")
     ctx.finish_step(st, t)
@@ -472,20 +495,11 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ctx.progress(45, f"Phase {_ph(4)} of {phase_total} · Configure")
     st = ctx.add_step("Apply cloud-init (name, SSH key, network, size)")
     t = ctx.start_step(st)
-    # Clamp to the TARGET connection's per-VM ceilings (0 = inherit the global default),
-    # mirroring the API. This honours a connection configured with HIGHER limits than the
-    # global default, and still acts as a defense-in-depth cap on a stale/oversized context.
-    eff_cores = conn.max_cores or settings.max_cores
-    eff_ram_mb = conn.max_ram_mb or settings.max_ram_mb
-    eff_disk_gb = conn.max_disk_gb or settings.max_disk_gb
-    # Floor at 1 (mirroring the API's max(1, min(...))) so a MAX_CORES=0/MAX_RAM_MB=0
-    # misconfiguration can't push cores=0/memory=0 to Proxmox.
-    cores = max(1, min(int(cfg.get("cpu", 1)), eff_cores))
-    ram_mb = max(1, min(int(cfg.get("ram", 2)) * 1024, eff_ram_mb))
-    disk_gb = int(cfg.get("disk", 20))
-    if eff_disk_gb:
-        disk_gb = min(disk_gb, eff_disk_gb)
-    user_pubkey = _ssh_pubkey(job.created_by)
+    # Mirror the API: a zero connection limit is unlimited in every dimension.
+    cores = _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores)
+    ram_mb = _clamp_resource(int(cfg.get("ram", 2)) * 1024, conn.max_ram_mb)
+    disk_gb = _clamp_resource(int(cfg.get("disk", 20)), conn.max_disk_gb)
+    user_pubkey = _ssh_pubkey(secret_owner_id, allow_global=allow_global_secrets)
     managed_priv, managed_pub = _managed_keypair()
     pubkeys = [k for k in (user_pubkey, managed_pub) if k]
     root_pw = gen_vm_password() if auto_root_password_enabled() else ""
@@ -524,7 +538,10 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         overrides = {}
     if recipe and overrides:
         recipe = merge_deploy_inputs(recipe, overrides)
-    recipe_cmds = compile_cloudinit(recipe, _blocks_by_key(), _secret_lookup_factory(job.created_by)) if recipe else []
+    recipe_cmds = compile_cloudinit(
+        recipe, _blocks_by_key(),
+        _secret_lookup_factory(secret_owner_id, allow_global=allow_global_secrets),
+    ) if recipe else []
 
     used_snippet = False
     if conn.ssh_key_path:
@@ -587,7 +604,10 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         st = ctx.add_step("Apply recipe (ansible, post-boot)")
         t = ctx.start_step(st)
         try:
-            _run_ansible_phase(ctx, recipe, job.created_by, ip, managed_priv, dep.name)
+            _run_ansible_phase(
+                ctx, recipe, secret_owner_id, ip, managed_priv, dep.name,
+                allow_global=allow_global_secrets,
+            )
             ctx.finish_step(st, t)
         except Exception:  # noqa: BLE001
             ctx.finish_step(st, t, state="failed")
@@ -1031,9 +1051,13 @@ def _recover_orphans() -> None:
                     dep.status = "error"
                     dep.error = "interrupted by restart"
                     s.add(dep)
-                    # free the interrupted deploy's static-IP reservation
-                    for a in s.exec(select(IpAllocation).where(IpAllocation.deployment_id == dep.id)).all():
-                        s.delete(a)
+                    # Only an interrupted initial deploy produced no stable VM identity.
+                    # Rebuild/destroy recovery keeps the live VM's reservation so it
+                    # cannot be handed to another deployment after a process restart.
+                    if job.type == "deploy":
+                        for a in s.exec(select(IpAllocation).where(
+                                IpAllocation.deployment_id == dep.id)).all():
+                            s.delete(a)
             if job.image_id:
                 img = s.get(Image, job.image_id)
                 if img and img.build_status == "building":

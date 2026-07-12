@@ -130,6 +130,21 @@ def load_recipe(recipe_json: str) -> list[dict]:
         return []
 
 
+def _placed_blocks(recipe):
+    """Yield well-formed block placements, ignoring malformed legacy recipe rows."""
+    if not isinstance(recipe, list):
+        return
+    for section in recipe:
+        if not isinstance(section, dict):
+            continue
+        blocks = section.get("blocks") or []
+        if not isinstance(blocks, list):
+            continue
+        for placed in blocks:
+            if isinstance(placed, dict):
+                yield placed
+
+
 def ask_map(recipe: list[dict]) -> dict[str, list[str]]:
     """Ask-on-deploy index: ``{"<sectionIdx>.<blockIdx>": [input names]}`` for
     every placed block carrying a non-empty ``ask`` list."""
@@ -137,7 +152,10 @@ def ask_map(recipe: list[dict]) -> dict[str, list[str]]:
     for si, sec in enumerate(recipe):
         if not isinstance(sec, dict):
             continue
-        for bi, block in enumerate(sec.get("blocks") or []):
+        blocks = sec.get("blocks") or []
+        if not isinstance(blocks, list):
+            continue
+        for bi, block in enumerate(blocks):
             if not isinstance(block, dict):
                 continue
             asks = [a for a in (block.get("ask") or []) if isinstance(a, str)]
@@ -209,21 +227,16 @@ def collect_sensitive_inputs(recipe: list, blocks_by_key: dict,
     streamed Ansible output on a failed task. {{ secrets }} refs resolve to their real
     value here too (and are redacted at any length they meet the floor)."""
     out: set = set()
-    for section in recipe:
-        if not isinstance(section, dict):
+    for placed in _placed_blocks(recipe):
+        block = blocks_by_key.get(placed.get("ref", ""))
+        if not block:
             continue
-        for placed in section.get("blocks", []):
-            if not isinstance(placed, dict):
-                continue
-            block = blocks_by_key.get(placed.get("ref", ""))
-            if not block:
-                continue
-            types = _schema_types(block)
-            for k, v in _merged_inputs(block, placed).items():
-                if types.get(k) in ("password", "secret") and isinstance(v, str) and v:
-                    val = resolve_secrets(v, secret_lookup)
-                    if val:
-                        out.add(val)
+        types = _schema_types(block)
+        for k, v in _merged_inputs(block, placed).items():
+            if types.get(k) in ("password", "secret") and isinstance(v, str) and v:
+                val = resolve_secrets(v, secret_lookup)
+                if val:
+                    out.add(val)
     return out
 
 
@@ -244,20 +257,19 @@ def _ansible_playbook(recipe: list[dict], blocks_by_key: dict[str, Block],
         "  tasks:",
     ]
     any_task = False
-    for section in recipe:
-        for placed in section.get("blocks", []):
-            block = blocks_by_key.get(placed.get("ref", ""))
-            if not block or block.phase != "ansible" or not block.ansible_template:
-                continue
-            flat = _ansible_flat(_merged_inputs(block, placed), _schema_types(block), secret_lookup)
-            rendered = _substitute(block.ansible_template, flat)
-            # belt-and-braces: resolve/mask any secret ref written directly in a template
-            rendered = (resolve_secrets(rendered, secret_lookup) if secret_lookup
-                        else mask_secrets(rendered))
-            for ln in rendered.splitlines():
-                lines.append("    " + ln if ln.strip() else ln)
-            lines.append("")
-            any_task = True
+    for placed in _placed_blocks(recipe):
+        block = blocks_by_key.get(placed.get("ref", ""))
+        if not block or block.phase != "ansible" or not block.ansible_template:
+            continue
+        flat = _ansible_flat(_merged_inputs(block, placed), _schema_types(block), secret_lookup)
+        rendered = _substitute(block.ansible_template, flat)
+        # belt-and-braces: resolve/mask any secret ref written directly in a template
+        rendered = (resolve_secrets(rendered, secret_lookup) if secret_lookup
+                    else mask_secrets(rendered))
+        for ln in rendered.splitlines():
+            lines.append("    " + ln if ln.strip() else ln)
+        lines.append("")
+        any_task = True
     if not any_task:
         lines.append("    - name: nothing to do (no post-boot blocks)")
         lines.append("      ansible.builtin.debug: { msg: 'ok' }")
@@ -271,11 +283,10 @@ def compile_ansible(recipe: list[dict], blocks_by_key: dict[str, Block],
 
 
 def has_ansible_blocks(recipe: list[dict], blocks_by_key: dict[str, Block]) -> bool:
-    for section in recipe:
-        for placed in section.get("blocks", []):
-            b = blocks_by_key.get(placed.get("ref", ""))
-            if b and b.phase == "ansible" and b.ansible_template:
-                return True
+    for placed in _placed_blocks(recipe):
+        b = blocks_by_key.get(placed.get("ref", ""))
+        if b and b.phase == "ansible" and b.ansible_template:
+            return True
     return False
 
 
@@ -285,11 +296,10 @@ def compile_playbook(recipe: list[dict], blocks_by_key: dict[str, Block],
     cloud-init (first-boot) steps. Secrets are masked."""
     pb = _ansible_playbook(recipe, blocks_by_key, template_name)
     ci = []
-    for section in recipe:
-        for placed in section.get("blocks", []):
-            b = blocks_by_key.get(placed.get("ref", ""))
-            if b and b.phase == "cloudinit" and b.cloudinit_template:
-                ci.append(f"#   - {b.name}")
+    for placed in _placed_blocks(recipe):
+        b = blocks_by_key.get(placed.get("ref", ""))
+        if b and b.phase == "cloudinit" and b.cloudinit_template:
+            ci.append(f"#   - {b.name}")
     if ci:
         pb += "\n# --- cloud-init (first-boot) steps in this template ---\n" + "\n".join(ci) + "\n"
     return pb
@@ -303,19 +313,18 @@ def compile_cloudinit(
     """Shell command lines for cloud-init runcmd — only phase='cloudinit' blocks
     (run as root at first boot). Inputs/secrets are shell-quoted (injection-safe)."""
     cmds: list[str] = ["set -e"]
-    for section in recipe:
-        for placed in section.get("blocks", []):
-            block = blocks_by_key.get(placed.get("ref", ""))
-            if not block or block.phase != "cloudinit" or not block.cloudinit_template:
-                continue
-            rendered = render_shell(
-                block.cloudinit_template, _merged_inputs(block, placed),
-                _schema_types(block), secret_lookup,
-            )
-            cmds.append("echo " + shlex.quote(f">>> GoblinDock: {block.name}"))
-            for ln in rendered.splitlines():
-                if ln.strip():
-                    cmds.append(ln)
+    for placed in _placed_blocks(recipe):
+        block = blocks_by_key.get(placed.get("ref", ""))
+        if not block or block.phase != "cloudinit" or not block.cloudinit_template:
+            continue
+        rendered = render_shell(
+            block.cloudinit_template, _merged_inputs(block, placed),
+            _schema_types(block), secret_lookup,
+        )
+        cmds.append("echo " + shlex.quote(f">>> GoblinDock: {block.name}"))
+        for ln in rendered.splitlines():
+            if ln.strip():
+                cmds.append(ln)
     return cmds
 
 
@@ -431,7 +440,6 @@ def lint_block(phase: str, input_schema, ansible_template: str,
 
 def recipe_block_chips(recipe: list[dict]) -> list[str]:
     chips: list[str] = []
-    for section in recipe:
-        for placed in section.get("blocks", []):
-            chips.append(placed.get("name", placed.get("ref", "block")))
+    for placed in _placed_blocks(recipe):
+        chips.append(placed.get("name", placed.get("ref", "block")))
     return chips

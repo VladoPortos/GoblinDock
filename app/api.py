@@ -234,7 +234,10 @@ def allocate_ip(session: Session, net: Network, deployment_id: int) -> Optional[
             if ip not in taken:
                 session.add(IpAllocation(network_id=net.id, ip=ip,
                                          deployment_id=deployment_id, state="reserved"))
-                session.commit()   # persist within the lock so the next waiter sees it
+                # Join the caller's transaction. Deployment admission holds
+                # `_deploy_lock` until its final commit, so the next waiter cannot read
+                # past this uncommitted reservation in the single-process runtime.
+                session.flush()
                 return ip
             cur = cur + 1
         raise HTTPException(409, "static IP pool exhausted")
@@ -517,13 +520,13 @@ def state(request: Request, user: User = Depends(current_user), session: Session
 
     secrets_q = session.exec(select(Secret)).all()
     if user.role != "admin":
-        secrets_q = [s for s in secrets_q if s.scope == "global" or s.owner_id == user.id]
+        secrets_q = [s for s in secrets_q if s.owner_id == user.id]
     # App-managed secrets (fleet SSH key) are infrastructure — never surface them.
     secrets = [S.secret_dict(s, users) for s in secrets_q if not _is_system_secret(s)]
 
     variables_q = session.exec(select(Variable)).all()
     if user.role != "admin":
-        variables_q = [v for v in variables_q if v.scope == "global" or v.owner_id == user.id]
+        variables_q = [v for v in variables_q if v.owner_id == user.id]
     variables = [S.variable_dict(v, users) for v in variables_q]
 
     conn_list = list(conns.values())
@@ -697,8 +700,19 @@ def _auto_name(session: Session, base: str = "gd") -> str:
     return f"{base}-{n}"
 
 
+_deploy_lock = threading.Lock()
+
+
 @router.post("/deployments")
 def deploy(body: DeployBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    # Quota admission, deployment row, IP reservation, job and audit must be one
+    # serialized transaction. Sync FastAPI handlers run concurrently in a threadpool
+    # even with one Uvicorn worker, so an unlocked count-then-insert is racy.
+    with _deploy_lock:
+        return _deploy_transaction(body, user, session)
+
+
+def _deploy_transaction(body: DeployBody, user: User, session: Session):
     _enforce_quota(session, user, "vm")
     tpl = session.get(Template, body.templateId)
     # TRUST BOUNDARY (accepted Run-Script model): a PUBLIC template may be deployed by
@@ -745,8 +759,7 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
                      network_id=net.id, tags=body.tags, notes=body.notes,
                      deploy_inputs_json=deploy_inputs_json)
     session.add(dep)
-    session.commit()
-    session.refresh(dep)
+    session.flush()
 
     job = Job(type="deploy", title=f"Deploying {name}", deployment_id=dep.id,
               connection_id=conn.id, created_by=user.id, status="queued",
@@ -1363,6 +1376,30 @@ class TemplateBody(BaseModel):
     networkId: Optional[int] = None
 
 
+def _validate_recipe(session: Session, recipe: list, user: User) -> None:
+    """Validate stored recipe shape and ensure every block is visible to its author."""
+    if not isinstance(recipe, list):
+        raise HTTPException(400, "recipe must be a list of sections")
+    visible = {
+        block.key for block in session.exec(select(Block)).all()
+        if user.role == "admin" or block.builtin or block.owner_id == user.id
+    }
+    for si, section in enumerate(recipe):
+        if not isinstance(section, dict):
+            raise HTTPException(400, f"recipe section {si} must be an object")
+        blocks = section.get("blocks", [])
+        if not isinstance(blocks, list):
+            raise HTTPException(400, f"recipe section {si}.blocks must be a list")
+        for bi, placed in enumerate(blocks):
+            if not isinstance(placed, dict):
+                raise HTTPException(400, f"recipe block {si}.{bi} must be an object")
+            ref = placed.get("ref")
+            if not isinstance(ref, str) or not ref:
+                raise HTTPException(400, f"recipe block {si}.{bi} needs a string ref")
+            if ref not in visible:
+                raise HTTPException(400, f"recipe block {si}.{bi} is unknown or not visible")
+
+
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:
     """Resolve baseImageId/connectionId/networkId or 400. The network must belong
     to the template's connection — deploys use them together."""
@@ -1389,6 +1426,7 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
 
 @router.post("/templates")
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    _validate_recipe(session, body.recipe, user)
     bid, cid, nid = _validate_template_refs(session, body)
     # Store the authored sizes verbatim. The per-VM ceiling is enforced at deploy
     # time from the connection (0 = unlimited), so a template default is never
@@ -1408,6 +1446,18 @@ def _template_owned(rc: Template, user: User) -> bool:
     return user.role == "admin" or rc.owner_id == user.id
 
 
+def _template_uses_block(template: Template, key: str) -> bool:
+    for section in load_recipe(template.recipe_json):
+        if not isinstance(section, dict):
+            continue
+        blocks = section.get("blocks") or []
+        if not isinstance(blocks, list):
+            continue
+        if any(isinstance(placed, dict) and placed.get("ref") == key for placed in blocks):
+            return True
+    return False
+
+
 @router.put("/templates/{rid}")
 def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     rc = session.get(Template, rid)
@@ -1415,6 +1465,7 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
         raise HTTPException(404, "not found")
     if not _template_owned(rc, user):
         raise HTTPException(403, "not yours")
+    _validate_recipe(session, body.recipe, user)
     rc.name = body.name.strip() or rc.name
     rc.description = body.description
     rc.os_family = body.os_family
@@ -1437,6 +1488,8 @@ def delete_template_ep(rid: int, user: User = Depends(current_user), session: Se
         raise HTTPException(404, "not found")
     if not _template_owned(rc, user):
         raise HTTPException(403, "not yours")
+    if session.exec(select(Deployment).where(Deployment.template_id == rid)).first():
+        raise HTTPException(409, "template is used by a deployment")
     session.delete(rc)
     record_audit(session, user, "template.delete", "template", rid, rc.name)
     session.commit()
@@ -2275,6 +2328,13 @@ def delete_connection(conn_id: int, user: User = Depends(require_admin),
         raise HTTPException(404, "not found")
     if session.exec(select(Deployment).where(Deployment.connection_id == conn_id)).first():
         raise HTTPException(409, "connection still has deployments — destroy them first")
+    if session.exec(select(Template).where(Template.connection_id == conn_id)).first():
+        raise HTTPException(409, "connection is referenced by a template")
+    if session.exec(select(Job).where(
+            Job.connection_id == conn_id,
+            Job.status.in_(["queued", "running"]),
+    )).first():
+        raise HTTPException(409, "connection is referenced by an active job")
     if session.exec(select(Image).where(Image.connection_id == conn_id, Image.kind == "golden")).first():
         raise HTTPException(409, "connection still has golden images — delete them first")
     for n in session.exec(select(Network).where(Network.connection_id == conn_id)).all():
@@ -2384,6 +2444,8 @@ def delete_network(net_id: int, user: User = Depends(require_admin),
         raise HTTPException(404, "not found")
     if session.exec(select(Deployment).where(Deployment.network_id == net_id)).first():
         raise HTTPException(409, "network is in use by a deployment")
+    if session.exec(select(Template).where(Template.network_id == net_id)).first():
+        raise HTTPException(409, "network is referenced by a template")
     for a in session.exec(select(IpAllocation).where(IpAllocation.network_id == net_id)).all():
         session.delete(a)
     session.delete(n)
@@ -2614,6 +2676,9 @@ def delete_block(key: str, user: User = Depends(current_user), session: Session 
         raise HTTPException(403, "built-in blocks can't be deleted")
     if b.owner_id != user.id and user.role != "admin":
         raise HTTPException(403, "not yours")
+    for template in session.exec(select(Template)).all():
+        if _template_uses_block(template, key):
+            raise HTTPException(409, "block is referenced by a template")
     session.delete(b)
     record_audit(session, user, "block.delete", "block", key, b.name)
     session.commit()
@@ -2669,6 +2734,8 @@ def delete_image(img_id: int, user: User = Depends(current_user), session: Sessi
         raise HTTPException(403, "admin only")
     if session.exec(select(Deployment).where(Deployment.image_id == img_id)).first():
         raise HTTPException(409, "image has deployed VMs — destroy them first")
+    if session.exec(select(Template).where(Template.base_image_id == img_id)).first():
+        raise HTTPException(409, "image is referenced by a template")
     session.delete(img)
     record_audit(session, user, "image.delete", "image", img_id, img.name)
     session.commit()
