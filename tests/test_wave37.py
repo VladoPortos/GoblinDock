@@ -14,6 +14,8 @@ import os
 import sys
 import tempfile
 import json
+from datetime import timedelta
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -34,10 +36,16 @@ from fastapi import HTTPException  # noqa: E402
 
 from app import api, recipes  # noqa: E402
 from app.db import init_db, session_scope  # noqa: E402
-from app.models import Block, Template, User  # noqa: E402
+from app.models import Block, Deployment, Job, Template, User, utcnow  # noqa: E402
 from app.security import hash_password  # noqa: E402
 
 init_db()
+
+
+def _login_req():
+    # Minimal stand-in for a Starlette Request: login only touches .session and the
+    # client-IP resolution (.client.host + .headers).
+    return SimpleNamespace(session={}, client=SimpleNamespace(host="203.0.113.7"), headers={})
 
 
 def _mk_user(email: str, role: str = "user") -> int:
@@ -181,6 +189,128 @@ def test_code_field_still_renders_multiline_in_cloudinit():
     joined = "\n".join(cmds)
     assert "echo one" in joined and "echo two" in joined, cmds
     print("test_code_field_still_renders_multiline_in_cloudinit OK")
+
+
+# --------------------------------------------------------------------------- #
+# HIGH — open first-run /api/auth/setup admin-takeover race                      #
+# --------------------------------------------------------------------------- #
+def test_setup_refused_once_a_user_exists():
+    """Setup can only ever mint the very first account; after that it is closed even to
+    an unauthenticated caller (the race window is the concern, not a second admin)."""
+    _mk_user("w37-setup-guard@example.com")  # a user now exists
+    req = _login_req()
+    with session_scope() as s:
+        _expect_http(400, lambda: api.auth_setup(
+            api.SetupBody(email="attacker@evil.example", name="x", password="StrongPass12!"),
+            req, session=s))
+    print("test_setup_refused_once_a_user_exists OK")
+
+
+# --------------------------------------------------------------------------- #
+# MEDIUM — unbounded rebuild/destroy job flood (worker starvation)              #
+# --------------------------------------------------------------------------- #
+def test_rebuild_rejected_when_a_job_is_active():
+    uid = _mk_user("w37-rebuild-flood@example.com")
+    with session_scope() as s:
+        dep = Deployment(name="gd-w37-a", owner_id=uid, status="running")
+        s.add(dep)
+        s.flush()
+        s.add(Job(type="deploy", title="x", deployment_id=dep.id, created_by=uid,
+                  status="running"))
+        s.flush()
+        did = dep.id
+    with session_scope() as s:
+        exc = _expect_http(409, lambda: api._vm_rebuild_transaction(did, s.get(User, uid), s))
+    assert "in progress" in exc.detail, exc.detail
+    print("test_rebuild_rejected_when_a_job_is_active OK")
+
+
+def test_destroy_dedups_an_active_destroy():
+    uid = _mk_user("w37-destroy-dedup@example.com")
+    with session_scope() as s:
+        dep = Deployment(name="gd-w37-b", owner_id=uid, status="working")
+        s.add(dep)
+        s.flush()
+        job = Job(type="destroy", title="x", deployment_id=dep.id, created_by=uid,
+                  status="queued")
+        s.add(job)
+        s.flush()
+        did, jid = dep.id, job.id
+    with session_scope() as s:
+        res = api.vm_destroy(did, user=s.get(User, uid), session=s)
+    assert res.get("deduped") is True and res["jobId"] == jid, res
+    print("test_destroy_dedups_an_active_destroy OK")
+
+
+def test_destroy_rejected_while_rebuild_active():
+    uid = _mk_user("w37-destroy-block@example.com")
+    with session_scope() as s:
+        dep = Deployment(name="gd-w37-c", owner_id=uid, status="working")
+        s.add(dep)
+        s.flush()
+        s.add(Job(type="rebuild", title="x", deployment_id=dep.id, created_by=uid,
+                  status="running"))
+        s.flush()
+        did = dep.id
+    with session_scope() as s:
+        _expect_http(409, lambda: api.vm_destroy(did, user=s.get(User, uid), session=s))
+    print("test_destroy_rejected_while_rebuild_active OK")
+
+
+# --------------------------------------------------------------------------- #
+# LOW — login user-enumeration (uniform failure, no lockout oracle)             #
+# --------------------------------------------------------------------------- #
+def test_login_unknown_email_is_generic_401():
+    with session_scope() as s:
+        exc = _expect_http(401, lambda: api.login(
+            api.LoginBody(email="w37-nobody@nowhere.example", password="whatever123!"),
+            _login_req(), session=s))
+    assert exc.detail == "invalid email or password", exc.detail
+    print("test_login_unknown_email_is_generic_401 OK")
+
+
+def test_login_locked_account_is_generic_401_not_429():
+    """A locked account (even with the correct password) returns the same 401 as a wrong
+    password — no 429 'account locked' oracle to confirm an email exists."""
+    uid = _mk_user("w37-locked@example.com")
+    with session_scope() as s:
+        u = s.get(User, uid)
+        u.locked_until = utcnow() + timedelta(minutes=15)
+        s.add(u)
+    with session_scope() as s:
+        exc = _expect_http(401, lambda: api.login(
+            api.LoginBody(email="w37-locked@example.com", password="StrongPass12!"),
+            _login_req(), session=s))
+    assert exc.detail == "invalid email or password", exc.detail
+    print("test_login_locked_account_is_generic_401_not_429 OK")
+
+
+# --------------------------------------------------------------------------- #
+# LOW — logout must revoke the session (epoch bump), not just drop the cookie    #
+# --------------------------------------------------------------------------- #
+def test_logout_bumps_session_epoch():
+    uid = _mk_user("w37-logout@example.com")
+    with session_scope() as s:
+        before = s.get(User, uid).session_epoch or 0
+    req = SimpleNamespace(session={"uid": uid, "sv": before})
+    with session_scope() as s:
+        api.logout(req, session=s)
+        after = s.get(User, uid).session_epoch or 0
+    assert after == before + 1, (before, after)
+    assert req.session == {}, req.session  # this browser's cookie is cleared too
+    print("test_logout_bumps_session_epoch OK")
+
+
+# --------------------------------------------------------------------------- #
+# LOW — snippet path allowlist must reject '.' / '..' traversal tokens          #
+# --------------------------------------------------------------------------- #
+def test_snippet_path_token_rejects_traversal():
+    from app.proxmox import _safe_path_token
+    for good in ("gd-deploy-8000.yml", "local", "local.test", "cephfs"):
+        assert _safe_path_token(good), good
+    for bad in ("", ".", "..", "../etc/passwd", ".ssh", "a/b", "a b", "..\\x"):
+        assert not _safe_path_token(bad), bad
+    print("test_snippet_path_token_rejects_traversal OK")
 
 
 if __name__ == "__main__":

@@ -4,13 +4,16 @@ first admin + the test Proxmox connection from environment variables.
 from __future__ import annotations
 
 import json
+import logging
 
 from sqlmodel import select
 
 from .config import settings
 from .db import session_scope
 from .models import Block, Connection, Image, Network, Template, User
-from .security import encrypt, hash_password
+from .security import encrypt, hash_password, password_problem
+
+log = logging.getLogger("goblindock")
 
 UBUNTU_2404_URL = "https://cloud-images.ubuntu.com/noble/current/noble-server-cloudimg-amd64.img"
 
@@ -1205,6 +1208,16 @@ def maybe_seed_admin() -> None:
         if s.exec(select(User)).first():
             return
         if settings.admin_email and settings.admin_password:
+            # Hold the env-seeded admin to the same password policy as every interactive
+            # path (web setup, /users, resets). A weak bootstrap password would otherwise
+            # create an unchecked internet-facing admin. Rather than fail boot, skip the
+            # seed and fall back to token-gated web setup so the operator can fix the env.
+            problem = password_problem(settings.admin_password)
+            if problem:
+                log.warning(
+                    "GOBLINDOCK_ADMIN_PASSWORD rejected (%s) — NOT creating the env admin; "
+                    "fix the value or complete first-run web setup instead.", problem)
+                return
             s.add(User(
                 email=settings.admin_email, name=settings.admin_name,
                 password_hash=hash_password(settings.admin_password), role="admin",
