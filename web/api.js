@@ -75,7 +75,7 @@ window.API = (function () {
     authStatus: () => req('GET', '/api/auth/status'),
     me: () => req('GET', '/api/auth/me'),
     login: (email, password) => req('POST', '/api/auth/login', { email, password }),
-    setup: (email, name, password) => req('POST', '/api/auth/setup', { email, name, password }),
+    setup: (email, name, password, token) => req('POST', '/api/auth/setup', { email, name, password, token }),
     logout: () => req('POST', '/api/auth/logout'),
     state: () => req('GET', '/api/state'),
 

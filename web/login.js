@@ -9,6 +9,7 @@
     const [email, setEmail] = useState('');
     const [name, setName] = useState('');
     const [pw, setPw] = useState('');
+    const [token, setToken] = useState('');
     const [err, setErr] = useState('');
     const [busy, setBusy] = useState(false);
 
@@ -22,7 +23,7 @@
       if (!email || !pw || (needsSetup && !name)) { setErr('Fill in all fields to continue.'); return; }
       setBusy(true);
       try {
-        if (needsSetup) await window.API.setup(email, name, pw);
+        if (needsSetup) await window.API.setup(email, name, pw, token.trim());
         else await window.API.login(email, pw);
         await window.GDStore.refresh();
         go('dashboard');
@@ -53,6 +54,12 @@
             h('label', { className: 'field-label' }, 'Password'),
             h('input', { className: 'input', type: 'password', placeholder: '••••••••', value: pw,
               onChange: (e) => { setPw(e.target.value); setErr(''); } })),
+          needsSetup && h('div', null,
+            h('label', { className: 'field-label' }, 'Setup token'),
+            h('input', { className: 'input mono', value: token, placeholder: 'from the server logs',
+              onChange: (e) => { setToken(e.target.value); setErr(''); }, autoComplete: 'off' }),
+            h('p', { className: 'hint', style: { fontSize: 11, marginTop: 5 } },
+              'Printed in the server logs as “FIRST-RUN SETUP TOKEN”. Not required in dev mode.')),
           err && h('div', { className: 'row', style: { gap: 7, color: 'var(--err)', fontSize: 12.5 } },
             h(Icon, { name: 'warn', size: 14 }), err),
           h('button', { className: 'btn primary', type: 'submit', style: { height: 42, marginTop: 4 }, disabled: busy },

@@ -4,13 +4,17 @@ templates, blocks, secrets, settings and jobs (incl. SSE).
 from __future__ import annotations
 
 import asyncio
+import hmac
 import ipaddress
 import json
+import logging
 import re
+import secrets as _secrets
 import socket
 import threading
 import time
 from datetime import datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Optional
 from urllib.parse import urlparse
 
@@ -58,6 +62,7 @@ from .security import (
 from . import serialize as S
 
 router = APIRouter(prefix="/api")
+log = logging.getLogger("goblindock")
 
 
 # --------------------------------------------------------------------------- #
@@ -349,6 +354,17 @@ def _owned_deployment(session: Session, dep_id: int, user: User) -> Deployment:
     return dep
 
 
+def _active_job_for(session: Session, dep_id: int) -> Optional[Job]:
+    """The queued/running job for a deployment, if any. Used to reject a second
+    lifecycle job for the same VM — the single worker drains jobs serially, so an
+    unbounded flood of rebuild/destroy jobs for one deployment would otherwise starve
+    every other tenant's work (and grow the jobs table without bound)."""
+    return session.exec(
+        select(Job).where(Job.deployment_id == dep_id,
+                          Job.status.in_(("queued", "running"))).order_by(Job.id.desc())
+    ).first()
+
+
 # --------------------------------------------------------------------------- #
 # auth                                                                          #
 # --------------------------------------------------------------------------- #
@@ -361,6 +377,7 @@ class SetupBody(BaseModel):
     email: str
     name: str
     password: str
+    token: str = ""      # first-run setup token (see auth_setup); ignored in dev
 
 
 @router.get("/auth/status")
@@ -382,12 +399,51 @@ def auth_status(request: Request, session: Session = Depends(get_session)):
 # the deployment note about running uvicorn with --workers 1.
 _setup_lock = threading.Lock()
 
+# First-run setup token. /auth/setup is unauthenticated (it creates the very first
+# account), so on an internet-facing instance an attacker could race the operator to
+# claim admin. In production we require a random token that is only printed to the
+# server logs — an attacker who can reach the HTTP endpoint still can't read the logs,
+# so only the operator can complete setup. Regenerated each boot; consumed on success.
+# Bypassed in dev (GOBLINDOCK_DEV=1) and moot when GOBLINDOCK_ADMIN_* env-seeds the admin.
+_setup_token: Optional[str] = None
+_setup_token_lock = threading.Lock()
+
+
+def _get_or_make_setup_token() -> str:
+    global _setup_token
+    with _setup_token_lock:
+        if _setup_token is None:
+            _setup_token = _secrets.token_urlsafe(24)
+            log.warning(
+                "FIRST-RUN SETUP TOKEN: %s\n"
+                "Enter this on the setup page to create the first admin account. It is "
+                "shown only in these logs (regenerated on restart). Alternatively set "
+                "GOBLINDOCK_ADMIN_EMAIL/GOBLINDOCK_ADMIN_PASSWORD to bootstrap the admin "
+                "non-interactively and skip web setup entirely.", _setup_token)
+        return _setup_token
+
+
+def announce_setup_token(session: Session) -> None:
+    """At boot, log the first-run setup token if the instance still has no users (and it
+    isn't dev). Called from the app lifespan after seeding so the operator sees the token
+    in the startup logs."""
+    if settings.dev_mode:
+        return
+    if session.exec(select(User)).first() is None:
+        _get_or_make_setup_token()
+
 
 @router.post("/auth/setup")
 def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get_session)):
+    global _setup_token
     with _setup_lock:
         if session.exec(select(User)).first():
             raise HTTPException(400, "already initialised")
+        # Gate the unauthenticated first-run window with the log-only token (prod only).
+        if not settings.dev_mode:
+            if not hmac.compare_digest(body.token or "", _get_or_make_setup_token()):
+                raise HTTPException(403, "invalid or missing setup token — check the "
+                                         "server logs for 'FIRST-RUN SETUP TOKEN'")
         _check_password(body.password)
         user = User(email=body.email.strip().lower(), name=body.name.strip() or "Admin",
                     password_hash=hash_password(body.password), role="admin",
@@ -395,6 +451,7 @@ def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get
         session.add(user)
         session.commit()
         session.refresh(user)
+        _setup_token = None   # consumed — setup is closed now that an admin exists
     request.session["uid"] = user.id
     request.session["sv"] = user.session_epoch
     csrf = ensure_csrf(request)
@@ -434,6 +491,15 @@ _LOCK_THRESHOLD = 5      # consecutive failures before a temporary lock
 _LOCK_MINUTES = 15
 
 
+@lru_cache(maxsize=1)
+def _decoy_password_hash() -> str:
+    """A fixed Argon2 hash used to equalise login timing. An absent / disabled / locked
+    account is verified against this decoy so the response takes the same ~Argon2 time as
+    a real account with a wrong password — without it, `not user` short-circuits before
+    verify_password and the fast reply reveals which emails exist (user enumeration)."""
+    return hash_password("goblindock-login-timing-decoy")
+
+
 @router.post("/auth/login")
 def login(body: LoginBody, request: Request, session: Session = Depends(get_session)):
     ip = client_ip(request) or "?"
@@ -444,19 +510,27 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     # Per-account lockout — persists across restarts (unlike the in-memory IP throttle),
     # blunting password-spray and proxy-IP-collapsed brute force. SQLite returns the
     # stored datetime as naive, so normalise to UTC before comparing with utcnow().
-    if user and user.locked_until:
-        lu = ensure_utc(user.locked_until)
-        if lu > utcnow():
-            raise HTTPException(429, "account temporarily locked — try again later")
-    if not user or user.disabled or not verify_password(body.password, user.password_hash):
+    locked = bool(user and user.locked_until and ensure_utc(user.locked_until) > utcnow())
+    active = bool(user and not user.disabled and not locked)
+    # Always run exactly one Argon2 verification — the real hash for a live account, a
+    # fixed decoy otherwise — so absent / disabled / locked accounts can't be told apart
+    # from a wrong password by timing. A locked/disabled account never authenticates.
+    if active:
+        ok = verify_password(body.password, user.password_hash)
+    else:
+        verify_password(body.password, _decoy_password_hash())
+        ok = False
+    if not ok:
         _record_attempt(key)
-        if user and not user.disabled:
+        if active:
             user.failed_logins = (user.failed_logins or 0) + 1
             if user.failed_logins >= _LOCK_THRESHOLD:
                 user.locked_until = utcnow() + timedelta(minutes=_LOCK_MINUTES)
                 user.failed_logins = 0
             session.add(user)
             session.commit()
+        # One identical response for every failure mode (unknown email, wrong password,
+        # disabled, locked) — no status/message oracle to enumerate accounts with.
         raise HTTPException(401, "invalid email or password")
     _login_attempts.pop(key, None)
     user.failed_logins = 0
@@ -471,7 +545,19 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
 
 
 @router.post("/auth/logout")
-def logout(request: Request):
+def logout(request: Request, session: Session = Depends(get_session)):
+    # Bump the session epoch so EVERY cookie signed for this user — this browser and any
+    # other or captured one — stops validating. An explicit logout must revoke a stolen
+    # cookie, not merely drop this browser's copy (password change already does this).
+    # Note: this signs the user out on all devices, which is the intended security
+    # posture for a logout on an internet-facing panel.
+    uid = request.session.get("uid")
+    if uid:
+        u = session.get(User, uid)
+        if u:
+            u.session_epoch = (u.session_epoch or 0) + 1
+            session.add(u)
+            session.commit()
     request.session.clear()
     return {"ok": True}
 
@@ -733,6 +819,9 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
     conn = session.get(Connection, tpl.connection_id) if tpl.connection_id else None
     if not conn:
         raise HTTPException(400, "template has no location — edit it and pick a Proxmox connection")
+    # Re-check at deploy: a legacy template (or one whose block author was demoted) must
+    # not run a non-admin custom Ansible block on the control node.
+    _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
 
     deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs)
 
@@ -817,12 +906,18 @@ def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session
 
 def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     dep = _owned_deployment(session, dep_id, user)
+    # One in-flight lifecycle job per VM — stops a user flooding the single serial
+    # worker with unbounded rebuild jobs (cross-tenant starvation / jobs-table growth).
+    if _active_job_for(session, dep.id):
+        raise HTTPException(409, "a job is already in progress for this VM — "
+                                 "wait for it to finish or cancel it first")
     if not dep.template_id:
         raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
     tpl = session.get(Template, dep.template_id)
     base = session.get(Image, tpl.base_image_id) if tpl and tpl.base_image_id else None
     if not base or base.kind != "base":
         raise HTTPException(400, "template has no base image — edit it first")
+    _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
     dep.status = "working"
     session.add(dep)
     # Preserve the VM's network identity (static IP / VLAN) across the rebuild.
@@ -844,6 +939,15 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
 @router.delete("/deployments/{dep_id}")
 def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
     dep = _owned_deployment(session, dep_id, user)
+    # De-dupe / serialise lifecycle jobs per VM (worker-starvation guard). A destroy
+    # already in flight is returned as-is; a deploy/rebuild in flight must finish or be
+    # cancelled before a destroy is queued.
+    active = _active_job_for(session, dep.id)
+    if active:
+        if active.type == "destroy":
+            return {"ok": True, "jobId": active.id, "deduped": True}
+        raise HTTPException(409, "a job is already in progress for this VM — "
+                                 "wait for it to finish or cancel it first")
     dep.status = "working"
     session.add(dep)
     job = Job(type="destroy", title=f"Destroying {dep.name}", deployment_id=dep.id,
@@ -1386,12 +1490,72 @@ class TemplateBody(BaseModel):
     networkId: Optional[int] = None
 
 
+def _reject_control_char_inputs(block: Optional[Block], inputs: dict, si: int, bi: int) -> None:
+    """Reject a control char / newline in any non-'code' stored input VALUE.
+
+    A stored recipe input is spliced into the generated Ansible playbook / cloud-init.
+    Built-in Ansible blocks place raw ``{k}`` into YAML scalars, so a newline in a
+    non-'code' value can break the scalar and inject a sibling task (e.g. one carrying
+    ``delegate_to: localhost`` — code execution on the GoblinDock control node, not the
+    tenant's VM). Ask-on-deploy answers are already screened this way
+    (``_validate_deploy_inputs`` → ``_has_control_chars``); stored recipe inputs were not,
+    so this closes the same hole at the storage boundary. 'code' fields (Run Script /
+    file content) are intentionally multi-line and are left untouched."""
+    ftypes: dict = {}
+    if block:
+        try:
+            schema = json.loads(block.input_schema_json or "[]")
+        except (json.JSONDecodeError, TypeError):
+            schema = []
+        ftypes = {f.get("name"): f.get("type", "text")
+                  for f in schema if isinstance(f, dict) and "name" in f}
+    for name, value in inputs.items():
+        if ftypes.get(name, "text") == "code":
+            continue
+        for item in (value if isinstance(value, list) else [value]):
+            if isinstance(item, str) and _has_control_chars(item):
+                raise HTTPException(
+                    400, f"recipe block {si}.{bi} input {name!r} must not contain "
+                         "control characters or newlines")
+
+
+def _assert_trusted_ansible_blocks(session: Session, recipe: list,
+                                   blocks_by_key: Optional[dict] = None) -> None:
+    """Every Ansible-phase block used in a recipe must be built-in or authored by an
+    admin. An Ansible task runs on the shared GoblinDock control node (delegate_to,
+    local_action and every ``{{ lookup(...) }}`` / template expression execute there),
+    so an untrusted custom Ansible block is control-plane RCE — full compromise of all
+    tenants' secrets and Proxmox tokens. Custom CLOUD-INIT blocks are unrestricted: they
+    run inside the deployer's own VM. Enforced at template save AND at deploy/rebuild so
+    a block that lost admin trust (or predates this rule) can't still run."""
+    if not isinstance(recipe, list):
+        return
+    if blocks_by_key is None:
+        blocks_by_key = {block.key: block for block in session.exec(select(Block)).all()}
+    admin_ids = {u.id for u in session.exec(select(User).where(User.role == "admin")).all()}
+    for section in recipe:
+        if not isinstance(section, dict):
+            continue
+        for placed in (section.get("blocks") or []):
+            if not isinstance(placed, dict):
+                continue
+            block = blocks_by_key.get(placed.get("ref"))
+            if (block and block.phase == "ansible" and not block.builtin
+                    and block.owner_id not in admin_ids):
+                raise HTTPException(
+                    403, "this recipe uses a custom Ansible block that isn't admin-authored"
+                         " — Ansible runs on the control node, so custom Ansible blocks are "
+                         "admin-only. Convert it to a cloud-init block, or have an admin own "
+                         "and publish it.")
+
+
 def _validate_recipe(session: Session, recipe: list, user: User) -> None:
-    """Validate stored recipe shape and ensure every block is visible to its author."""
+    """Validate stored recipe shape, block visibility, input values, and Ansible trust."""
     if not isinstance(recipe, list):
         raise HTTPException(400, "recipe must be a list of sections")
+    blocks_by_key = {block.key: block for block in session.exec(select(Block)).all()}
     visible = {
-        block.key for block in session.exec(select(Block)).all()
+        key for key, block in blocks_by_key.items()
         if user.role == "admin" or block.builtin or block.owner_id == user.id
     }
     for si, section in enumerate(recipe):
@@ -1408,8 +1572,12 @@ def _validate_recipe(session: Session, recipe: list, user: User) -> None:
                 raise HTTPException(400, f"recipe block {si}.{bi} needs a string ref")
             if ref not in visible:
                 raise HTTPException(400, f"recipe block {si}.{bi} is unknown or not visible")
-            if "inputs" in placed and not isinstance(placed["inputs"], dict):
+            inputs = placed.get("inputs")
+            if inputs is not None and not isinstance(inputs, dict):
                 raise HTTPException(400, f"recipe block {si}.{bi}.inputs must be an object")
+            if inputs:
+                _reject_control_char_inputs(blocks_by_key.get(ref), inputs, si, bi)
+    _assert_trusted_ansible_blocks(session, recipe, blocks_by_key)
 
 
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:
@@ -2614,9 +2782,20 @@ def _new_block_key(session: Session) -> str:
             return k
 
 
+# Authoring a custom Ansible-phase block is authoring code that runs on the shared
+# control node (see _assert_trusted_ansible_blocks) — restrict it to admins. Custom
+# cloud-init blocks stay open to everyone (they run inside the deployer's own VM).
+_CUSTOM_ANSIBLE_ADMIN_ONLY = (
+    "custom Ansible blocks are admin-only — an Ansible task runs on the GoblinDock "
+    "control node, not inside your VM. Use the cloud-init phase for per-VM scripting, "
+    "or ask an admin to publish the block.")
+
+
 @router.post("/blocks")
 def create_block(body: BlockBody, user: User = Depends(current_user),
                  session: Session = Depends(get_session)):
+    if body.phase != "cloudinit" and user.role != "admin":
+        raise HTTPException(403, _CUSTOM_ANSIBLE_ADMIN_ONLY)
     problems = lint_block(body.phase, body.input_schema or [],
                           body.ansible_template, body.cloudinit_template)
     if problems:
@@ -2643,6 +2822,10 @@ def fork_block(key: str, user: User = Depends(current_user), session: Session = 
     # copyable by key. 404 (not 403) so keys can't be probed.
     if not (src.builtin or src.owner_id == user.id or user.role == "admin"):
         raise HTTPException(404, "not found")
+    # A fork of an Ansible block becomes a non-builtin, user-owned Ansible block — that
+    # is exactly the untrusted-control-node-code path, so gate it to admins too.
+    if src.phase == "ansible" and user.role != "admin":
+        raise HTTPException(403, _CUSTOM_ANSIBLE_ADMIN_ONLY)
     b = Block(key=_new_block_key(session), kind="custom", builtin=False,
               name=src.name + " (copy)", category=src.category, icon=src.icon,
               section=src.section, phase=src.phase, description=src.description,
@@ -2664,6 +2847,9 @@ def edit_block(key: str, body: BlockBody, user: User = Depends(current_user),
         raise HTTPException(403, "built-in blocks can't be edited — fork it first")
     if b.owner_id != user.id and user.role != "admin":
         raise HTTPException(403, "not yours")
+    # A non-admin may keep/convert to cloud-init but never (re)author an Ansible block.
+    if body.phase != "cloudinit" and user.role != "admin":
+        raise HTTPException(403, _CUSTOM_ANSIBLE_ADMIN_ONLY)
     problems = lint_block(body.phase, body.input_schema or [],
                           body.ansible_template, body.cloudinit_template)
     if problems:
