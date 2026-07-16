@@ -1212,11 +1212,13 @@ def maybe_seed_admin() -> None:
             # path (web setup, /users, resets). A weak bootstrap password would otherwise
             # create an unchecked internet-facing admin. Rather than fail boot, skip the
             # seed and fall back to token-gated web setup so the operator can fix the env.
-            problem = password_problem(settings.admin_password)
-            if problem:
+            # NB: log a STATIC policy hint — never the policy message derived from the
+            # password value — so nothing password-derived reaches the logs.
+            if password_problem(settings.admin_password):
                 log.warning(
-                    "GOBLINDOCK_ADMIN_PASSWORD rejected (%s) — NOT creating the env admin; "
-                    "fix the value or complete first-run web setup instead.", problem)
+                    "GOBLINDOCK_ADMIN_PASSWORD does not meet the password policy "
+                    "(min 10 chars, at least 3 of lower/upper/digit/symbol) — NOT creating "
+                    "the env admin; fix the value or use first-run web setup instead.")
                 return
             s.add(User(
                 email=settings.admin_email, name=settings.admin_name,
