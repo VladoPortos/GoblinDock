@@ -1386,12 +1386,42 @@ class TemplateBody(BaseModel):
     networkId: Optional[int] = None
 
 
+def _reject_control_char_inputs(block: Optional[Block], inputs: dict, si: int, bi: int) -> None:
+    """Reject a control char / newline in any non-'code' stored input VALUE.
+
+    A stored recipe input is spliced into the generated Ansible playbook / cloud-init.
+    Built-in Ansible blocks place raw ``{k}`` into YAML scalars, so a newline in a
+    non-'code' value can break the scalar and inject a sibling task (e.g. one carrying
+    ``delegate_to: localhost`` — code execution on the GoblinDock control node, not the
+    tenant's VM). Ask-on-deploy answers are already screened this way
+    (``_validate_deploy_inputs`` → ``_has_control_chars``); stored recipe inputs were not,
+    so this closes the same hole at the storage boundary. 'code' fields (Run Script /
+    file content) are intentionally multi-line and are left untouched."""
+    ftypes: dict = {}
+    if block:
+        try:
+            schema = json.loads(block.input_schema_json or "[]")
+        except (json.JSONDecodeError, TypeError):
+            schema = []
+        ftypes = {f.get("name"): f.get("type", "text")
+                  for f in schema if isinstance(f, dict) and "name" in f}
+    for name, value in inputs.items():
+        if ftypes.get(name, "text") == "code":
+            continue
+        for item in (value if isinstance(value, list) else [value]):
+            if isinstance(item, str) and _has_control_chars(item):
+                raise HTTPException(
+                    400, f"recipe block {si}.{bi} input {name!r} must not contain "
+                         "control characters or newlines")
+
+
 def _validate_recipe(session: Session, recipe: list, user: User) -> None:
-    """Validate stored recipe shape and ensure every block is visible to its author."""
+    """Validate stored recipe shape, block visibility, and input values."""
     if not isinstance(recipe, list):
         raise HTTPException(400, "recipe must be a list of sections")
+    blocks_by_key = {block.key: block for block in session.exec(select(Block)).all()}
     visible = {
-        block.key for block in session.exec(select(Block)).all()
+        key for key, block in blocks_by_key.items()
         if user.role == "admin" or block.builtin or block.owner_id == user.id
     }
     for si, section in enumerate(recipe):
@@ -1408,8 +1438,11 @@ def _validate_recipe(session: Session, recipe: list, user: User) -> None:
                 raise HTTPException(400, f"recipe block {si}.{bi} needs a string ref")
             if ref not in visible:
                 raise HTTPException(400, f"recipe block {si}.{bi} is unknown or not visible")
-            if "inputs" in placed and not isinstance(placed["inputs"], dict):
+            inputs = placed.get("inputs")
+            if inputs is not None and not isinstance(inputs, dict):
                 raise HTTPException(400, f"recipe block {si}.{bi}.inputs must be an object")
+            if inputs:
+                _reject_control_char_inputs(blocks_by_key.get(ref), inputs, si, bi)
 
 
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:
