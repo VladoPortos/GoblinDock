@@ -268,10 +268,13 @@
   // ---------- Custom block editor ----------
   function BlockEditorModal({ initial, onClose, onSaved }) {
     const editing = initial && !initial.builtin && initial.key;
+    // Ansible-phase blocks run on the shared control node, so authoring them is admin-only
+    // (the API enforces this too). Non-admins get cloud-init blocks (run in their own VM).
+    const isAdmin = !!(window.GD && window.GD.me && window.GD.me.isAdmin);
     const [f, setF] = useState(() => ({
       name: initial ? (editing ? initial.name : initial.name + ' (copy)') : 'My block',
       category: (initial && initial.cat) || 'Custom', icon: (initial && initial.icon) || 'spark',
-      section: (initial && initial.section) || 'Scripts', phase: (initial && initial.phase) || 'ansible',
+      section: (initial && initial.section) || 'Scripts', phase: (initial && initial.phase) || (isAdmin ? 'ansible' : 'cloudinit'),
       description: (initial && initial.desc) || '',
       cloudinit: (initial && initial.cloudinit) || 'echo hello', ansible: (initial && initial.ansible) || '- name: my task\n  ansible.builtin.debug: { msg: hi }',
       schema: (initial && initial.schema) ? JSON.parse(JSON.stringify(initial.schema)) : [],
@@ -293,7 +296,10 @@
       h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
         h(Field, { label: 'Name', value: f.name, onChange: (v) => set('name', v) }),
         h(SelectField, { label: 'Section', value: f.section, onChange: (v) => set('section', v), options: ['OS Setup', 'Accounts', 'Install', 'Configure', 'Scripts', 'Cleanup'] }),
-        h(SelectField, { label: 'Phase', value: f.phase, onChange: (v) => set('phase', v), options: [{ value: 'cloudinit', label: 'cloud-init (first boot)' }, { value: 'ansible', label: 'ansible (post-boot)' }] }),
+        h(SelectField, { label: 'Phase', value: f.phase, onChange: (v) => set('phase', v),
+          options: isAdmin
+            ? [{ value: 'cloudinit', label: 'cloud-init (first boot)' }, { value: 'ansible', label: 'ansible (post-boot)' }]
+            : [{ value: 'cloudinit', label: 'cloud-init (first boot)' }] }),
         h(SelectField, { label: 'Icon', value: f.icon, onChange: (v) => set('icon', v), options: ['spark', 'code', 'package', 'settings', 'sliders', 'docker', 'key', 'file', 'trash'] })),
       h(Field, { label: 'Description', value: f.description, onChange: (v) => set('description', v) }),
       f.phase === 'cloudinit'

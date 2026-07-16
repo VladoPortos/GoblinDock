@@ -819,6 +819,9 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
     conn = session.get(Connection, tpl.connection_id) if tpl.connection_id else None
     if not conn:
         raise HTTPException(400, "template has no location — edit it and pick a Proxmox connection")
+    # Re-check at deploy: a legacy template (or one whose block author was demoted) must
+    # not run a non-admin custom Ansible block on the control node.
+    _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
 
     deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs)
 
@@ -914,6 +917,7 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     base = session.get(Image, tpl.base_image_id) if tpl and tpl.base_image_id else None
     if not base or base.kind != "base":
         raise HTTPException(400, "template has no base image — edit it first")
+    _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
     dep.status = "working"
     session.add(dep)
     # Preserve the VM's network identity (static IP / VLAN) across the rebuild.
@@ -1515,8 +1519,38 @@ def _reject_control_char_inputs(block: Optional[Block], inputs: dict, si: int, b
                          "control characters or newlines")
 
 
+def _assert_trusted_ansible_blocks(session: Session, recipe: list,
+                                   blocks_by_key: Optional[dict] = None) -> None:
+    """Every Ansible-phase block used in a recipe must be built-in or authored by an
+    admin. An Ansible task runs on the shared GoblinDock control node (delegate_to,
+    local_action and every ``{{ lookup(...) }}`` / template expression execute there),
+    so an untrusted custom Ansible block is control-plane RCE — full compromise of all
+    tenants' secrets and Proxmox tokens. Custom CLOUD-INIT blocks are unrestricted: they
+    run inside the deployer's own VM. Enforced at template save AND at deploy/rebuild so
+    a block that lost admin trust (or predates this rule) can't still run."""
+    if not isinstance(recipe, list):
+        return
+    if blocks_by_key is None:
+        blocks_by_key = {block.key: block for block in session.exec(select(Block)).all()}
+    admin_ids = {u.id for u in session.exec(select(User).where(User.role == "admin")).all()}
+    for section in recipe:
+        if not isinstance(section, dict):
+            continue
+        for placed in (section.get("blocks") or []):
+            if not isinstance(placed, dict):
+                continue
+            block = blocks_by_key.get(placed.get("ref"))
+            if (block and block.phase == "ansible" and not block.builtin
+                    and block.owner_id not in admin_ids):
+                raise HTTPException(
+                    403, "this recipe uses a custom Ansible block that isn't admin-authored"
+                         " — Ansible runs on the control node, so custom Ansible blocks are "
+                         "admin-only. Convert it to a cloud-init block, or have an admin own "
+                         "and publish it.")
+
+
 def _validate_recipe(session: Session, recipe: list, user: User) -> None:
-    """Validate stored recipe shape, block visibility, and input values."""
+    """Validate stored recipe shape, block visibility, input values, and Ansible trust."""
     if not isinstance(recipe, list):
         raise HTTPException(400, "recipe must be a list of sections")
     blocks_by_key = {block.key: block for block in session.exec(select(Block)).all()}
@@ -1543,6 +1577,7 @@ def _validate_recipe(session: Session, recipe: list, user: User) -> None:
                 raise HTTPException(400, f"recipe block {si}.{bi}.inputs must be an object")
             if inputs:
                 _reject_control_char_inputs(blocks_by_key.get(ref), inputs, si, bi)
+    _assert_trusted_ansible_blocks(session, recipe, blocks_by_key)
 
 
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:
@@ -2747,9 +2782,20 @@ def _new_block_key(session: Session) -> str:
             return k
 
 
+# Authoring a custom Ansible-phase block is authoring code that runs on the shared
+# control node (see _assert_trusted_ansible_blocks) — restrict it to admins. Custom
+# cloud-init blocks stay open to everyone (they run inside the deployer's own VM).
+_CUSTOM_ANSIBLE_ADMIN_ONLY = (
+    "custom Ansible blocks are admin-only — an Ansible task runs on the GoblinDock "
+    "control node, not inside your VM. Use the cloud-init phase for per-VM scripting, "
+    "or ask an admin to publish the block.")
+
+
 @router.post("/blocks")
 def create_block(body: BlockBody, user: User = Depends(current_user),
                  session: Session = Depends(get_session)):
+    if body.phase != "cloudinit" and user.role != "admin":
+        raise HTTPException(403, _CUSTOM_ANSIBLE_ADMIN_ONLY)
     problems = lint_block(body.phase, body.input_schema or [],
                           body.ansible_template, body.cloudinit_template)
     if problems:
@@ -2776,6 +2822,10 @@ def fork_block(key: str, user: User = Depends(current_user), session: Session = 
     # copyable by key. 404 (not 403) so keys can't be probed.
     if not (src.builtin or src.owner_id == user.id or user.role == "admin"):
         raise HTTPException(404, "not found")
+    # A fork of an Ansible block becomes a non-builtin, user-owned Ansible block — that
+    # is exactly the untrusted-control-node-code path, so gate it to admins too.
+    if src.phase == "ansible" and user.role != "admin":
+        raise HTTPException(403, _CUSTOM_ANSIBLE_ADMIN_ONLY)
     b = Block(key=_new_block_key(session), kind="custom", builtin=False,
               name=src.name + " (copy)", category=src.category, icon=src.icon,
               section=src.section, phase=src.phase, description=src.description,
@@ -2797,6 +2847,9 @@ def edit_block(key: str, body: BlockBody, user: User = Depends(current_user),
         raise HTTPException(403, "built-in blocks can't be edited — fork it first")
     if b.owner_id != user.id and user.role != "admin":
         raise HTTPException(403, "not yours")
+    # A non-admin may keep/convert to cloud-init but never (re)author an Ansible block.
+    if body.phase != "cloudinit" and user.role != "admin":
+        raise HTTPException(403, _CUSTOM_ANSIBLE_ADMIN_ONLY)
     problems = lint_block(body.phase, body.input_schema or [],
                           body.ansible_template, body.cloudinit_template)
     if problems:
