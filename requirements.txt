@@ -8,9 +8,9 @@ annotated-types==0.7.0 \
     --hash=sha256:1f02e8b43a8fbbc3f3e0d4f0f4bfc8131bcb4eebe8849b8e5c773f3a1c582a53 \
     --hash=sha256:aff07c09a53a08bc8cfccb9c85b05f1aa9a2a6f23728d790723543408344ce89
     # via pydantic
-ansible-core==2.21.1 \
-    --hash=sha256:1403ff56bb69484ef90788126d06c65b4e28e8d2dcdcfb7f027d4c1495052d7e \
-    --hash=sha256:a5536ece95be84de15212b3644cdbbe9cbd9efd62e4e8a544cd6b0b27a083039
+ansible-core==2.21.2 \
+    --hash=sha256:c6139e662eda1bfb5af16029f12afa5edfc7f95f8cd44281b1bdb434a6d9dc70 \
+    --hash=sha256:c7d696c717da03109a32a569a5fe57925812a86734344eab775cba169bf57cf8
     # via -r requirements.in
 ansible-runner==2.4.3 \
     --hash=sha256:5f3025529bb968fdc3b627457dd8d418dbf9d53bc73735d50e69c28544d53031 \
@@ -448,9 +448,9 @@ cryptography==49.0.0 \
     #   -r requirements.in
     #   ansible-core
     #   paramiko
-fastapi==0.139.0 \
-    --hash=sha256:99ab7b2d92223c76d6cf10757ab3f89d45b38267fc20b2a136cf02f6beac3145 \
-    --hash=sha256:cf15e1e9e667ddb0ad63811e60bd11390d1aac838ca4a7a23f421807b2308189
+fastapi==0.139.2 \
+    --hash=sha256:333145a6891e9b5b3cfceb69baf817e8240cde4d4588ae5a10bf56ffacb6255e \
+    --hash=sha256:b9ad015a835173d59865e2f5d8296fbc2b317bf56a2ba1a5bfbdd03de2fd4b1c
     # via -r requirements.in
 greenlet==3.5.1 \
     --hash=sha256:001775efe7b8e758861294c7a27c28af87f3f3f1c20468a2bc618c45b346c061 \
