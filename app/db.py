@@ -119,10 +119,13 @@ def _migrate() -> None:
             ("deploy_inputs_json", "TEXT NOT NULL DEFAULT '{}'"),
             ("root_password_enc", "TEXT NOT NULL DEFAULT ''"),
             ("cred_user", "TEXT NOT NULL DEFAULT ''"),
+            ("cleanup_last_attempt_at", "TIMESTAMP"),
         ],
         "jobs": [
             ("dismissed", "INTEGER NOT NULL DEFAULT 0"),
             ("dismissed_at", "TIMESTAMP"),
+            ("execution_plan_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("waiting_since", "TIMESTAMP"),
         ],
     }
     # Columns REMOVED from the models (2026-06 dead-code cleanup). They must be

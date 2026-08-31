@@ -157,13 +157,12 @@ def _ansible_phase_with_status(status, rc):
         j = Job(type="deploy", status="running"); s.add(j); s.flush(); jid = j.id
     ctx = worker.JobCtx(jid)
     saved = {k: getattr(worker, k) for k in
-             ("run_playbook", "has_ansible_blocks", "compile_ansible", "_blocks_by_key")}
+             ("run_playbook", "has_ansible_blocks", "compile_ansible")}
     worker.run_playbook = lambda *a, **k: (status, rc)
     worker.has_ansible_blocks = lambda *a, **k: True
     worker.compile_ansible = lambda *a, **k: "- hosts: all\n  tasks: []"
-    worker._blocks_by_key = lambda: {}
     try:
-        worker._run_ansible_phase(ctx, [{"ref": "x"}], None, "10.0.60.5", "KEY", "cfg")
+        worker._run_ansible_phase(ctx, [{"ref": "x"}], {}, None, "10.0.60.5", "KEY", "cfg")
         return None
     except BaseException as e:  # noqa: BLE001
         return e

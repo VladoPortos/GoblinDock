@@ -19,6 +19,12 @@ from sqlmodel import select
 
 from .config import settings
 from .db import session_scope
+from .execution_plan import (
+    build_execution_plan,
+    materialize_execution_plan,
+    open_execution_plan,
+    seal_execution_plan,
+)
 from .ansible_exec import run_playbook
 from .models import (
     Block,
@@ -29,7 +35,6 @@ from .models import (
     Job,
     JobEvent,
     JobStep,
-    Template,
     Secret,
     User,
     Variable,
@@ -48,8 +53,6 @@ from .recipes import (
     compile_ansible,
     compile_cloudinit,
     has_ansible_blocks,
-    load_recipe,
-    merge_deploy_inputs,
 )
 from .security import crypt_sha512, decrypt, encrypt, gen_vm_password
 from .appsettings import auto_root_password_enabled
@@ -292,12 +295,11 @@ def _managed_keypair() -> tuple[str, str]:
     return p, pubk
 
 
-def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_priv: str,
+def _run_ansible_phase(ctx: "JobCtx", recipe: list, blocks: dict[str, Block], owner_id, ip: str, managed_priv: str,
                        label: str, *, allow_global: bool = False) -> None:
     """Run the post-boot ansible-phase blocks of a recipe against a live VM."""
     if not (recipe and ip):
         return
-    blocks = _blocks_by_key()
     if not has_ansible_blocks(recipe, blocks):
         return
     # Collect resolved secret values while compiling so we can redact them from the
@@ -441,6 +443,36 @@ def _load_job_targets(job: Job) -> tuple[Connection, Deployment]:
     return conn, dep
 
 
+def _load_materialized_job_plan(job: Job, dep: Deployment) -> tuple[dict, list[dict], dict[str, Block]]:
+    """Load the immutable job snapshot, creating one once for legacy queued jobs."""
+    ciphertext = job.execution_plan_enc
+    if not ciphertext and dep.template_id:
+        with session_scope() as s:
+            stored_job = s.get(Job, job.id)
+            stored_dep = s.get(Deployment, dep.id)
+            if stored_job and stored_job.execution_plan_enc:
+                ciphertext = stored_job.execution_plan_enc
+            elif stored_job and stored_dep:
+                template = s.get(Template, stored_dep.template_id)
+                if not template:
+                    raise RuntimeError("missing template for legacy execution plan")
+                ciphertext = seal_execution_plan(build_execution_plan(
+                    s, template, stored_dep.owner_id, stored_dep.deploy_inputs_json,
+                ))
+                stored_job.execution_plan_enc = ciphertext
+                s.add(stored_job)
+    if not ciphertext:
+        return {"owner_id": dep.owner_id}, [], {}
+    try:
+        plan = open_execution_plan(ciphertext)
+    except ValueError as exc:
+        raise RuntimeError("invalid execution plan") from exc
+    if plan["owner_id"] != dep.owner_id:
+        raise RuntimeError("execution plan owner mismatch")
+    recipe, blocks = materialize_execution_plan(plan)
+    return plan, recipe, blocks
+
+
 def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5) -> None:
     # phase_base/phase_total let a rebuild present this as a continuation (e.g. phases
     # 2..6 of 6) instead of resetting the progress bar to "Phase 1 of 5".
@@ -448,7 +480,8 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         return phase_base + n
     cfg = json.loads(job.context_json or "{}")
     conn, dep = _load_job_targets(job)
-    secret_owner_id, allow_global_secrets = _owner_secret_context(dep.owner_id)
+    plan, recipe, blocks = _load_materialized_job_plan(job, dep)
+    secret_owner_id, allow_global_secrets = _owner_secret_context(plan["owner_id"])
     # Clamp before the create request so a stale queued context cannot reserve more
     # than the connection's current limits even temporarily.
     cores = _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores)
@@ -533,21 +566,8 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         params["net0"] = _net0
     if cfg.get("dns"):
         params["nameserver"] = cfg["dns"]
-    # The optional template (applied on top of every deploy). Split into the
-    # first-boot (cloud-init) part and the post-boot (ansible) part. Ask-on-deploy
-    # answers live on the deployment row so a REBUILD re-applies them too.
-    with session_scope() as s:
-        tpl = s.get(Template, dep.template_id) if dep.template_id else None
-        recipe_json = tpl.recipe_json if tpl else "[]"
-    recipe = load_recipe(recipe_json)
-    try:
-        overrides = json.loads(dep.deploy_inputs_json or "{}")
-    except (json.JSONDecodeError, TypeError):
-        overrides = {}
-    if recipe and overrides:
-        recipe = merge_deploy_inputs(recipe, overrides)
     recipe_cmds = compile_cloudinit(
-        recipe, _blocks_by_key(),
+        recipe, blocks,
         _secret_lookup_factory(secret_owner_id, allow_global=allow_global_secrets),
     ) if recipe else []
 
@@ -608,12 +628,12 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ctx.finish_step(st, t)
 
     # Post-boot: apply the ansible-phase blocks of the runtime recipe (if any).
-    if recipe and ip and has_ansible_blocks(recipe, _blocks_by_key()):
+    if recipe and ip and has_ansible_blocks(recipe, blocks):
         st = ctx.add_step("Apply recipe (ansible, post-boot)")
         t = ctx.start_step(st)
         try:
             _run_ansible_phase(
-                ctx, recipe, secret_owner_id, ip, managed_priv, dep.name,
+                ctx, recipe, blocks, secret_owner_id, ip, managed_priv, dep.name,
                 allow_global=allow_global_secrets,
             )
             ctx.finish_step(st, t)

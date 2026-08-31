@@ -22,6 +22,7 @@ from sqlmodel import Session, select
 
 from .config import settings
 from .db import engine, get_session
+from .execution_plan import build_execution_plan, seal_execution_plan
 from .deps import current_user, require_admin, widget_key_user
 from .netutil import client_ip, current_request_ip
 from .models import (
@@ -764,9 +765,14 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
     session.add(dep)
     session.flush()
 
+    execution_plan_enc = seal_execution_plan(
+        build_execution_plan(session, tpl, user.id, deploy_inputs_json)
+    )
+
     job = Job(type="deploy", title=f"Deploying {name}", deployment_id=dep.id,
               connection_id=conn.id, created_by=user.id, status="queued",
-              context_json=_build_job_ctx(session, base, cpu, ram, disk, net, dep.id))
+              context_json=_build_job_ctx(session, base, cpu, ram, disk, net, dep.id),
+              execution_plan_enc=execution_plan_enc)
     session.add(job)
     record_audit(session, user, "deploy", "deployment", dep.id, name)
     session.commit()
@@ -830,9 +836,13 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     # it looks up the deployment_id and returns the same IP, so no new address is
     # allocated and the VM keeps its reserved static IP after the rebuild.
     net = session.get(Network, dep.network_id) if dep.network_id else None
+    execution_plan_enc = seal_execution_plan(
+        build_execution_plan(session, tpl, dep.owner_id, dep.deploy_inputs_json)
+    )
     job = Job(type="rebuild", title=f"Rebuilding {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
-              context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id))
+              context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id),
+              execution_plan_enc=execution_plan_enc)
     session.add(job)
     record_audit(session, user, "vm.rebuild", "deployment", dep.id, dep.name)
     session.commit()

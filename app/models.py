@@ -183,6 +183,7 @@ class Deployment(SQLModel, table=True):
     root_password_enc: str = ""
     # OS user the password is for: 'root' (snippet path) | 'goblin' (native cloud-init fallback).
     cred_user: str = ""
+    cleanup_last_attempt_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -201,6 +202,9 @@ class Job(SQLModel, table=True):
     cancel_requested: bool = False
     error: str = ""
     context_json: str = "{}"
+    # Encrypted admission-time recipe, accepted inputs, and block definitions.
+    execution_plan_enc: str = ""
+    waiting_since: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None

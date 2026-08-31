@@ -345,16 +345,15 @@ def test_ansible_startup_exception_fails_phase():
 
     saved = {
         name: getattr(worker, name)
-        for name in ("run_playbook", "has_ansible_blocks", "compile_ansible", "_blocks_by_key")
+        for name in ("run_playbook", "has_ansible_blocks", "compile_ansible")
     }
     worker.has_ansible_blocks = lambda *_a, **_k: True
     worker.compile_ansible = lambda *_a, **_k: "- hosts: all\n  tasks: []"
-    worker._blocks_by_key = lambda: {}
     worker.run_playbook = lambda *_a, **_k: (_ for _ in ()).throw(RuntimeError("runner missing"))
     try:
         try:
             worker._run_ansible_phase(
-                worker.JobCtx(jid), [{"blocks": []}], None,
+                worker.JobCtx(jid), [{"blocks": []}], {}, None,
                 "10.0.0.5", "KEY", "cfg",
             )
         except RuntimeError as exc:
