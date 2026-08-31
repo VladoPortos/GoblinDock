@@ -1285,6 +1285,8 @@ for (const [status, label, exactError] of [
     `${status} detail must not render lifecycle controls`);
   assert.equal(buttons.some((button) => button.props['aria-label'] === 'Delete VM'), false,
     `${status} detail must not render Delete VM`);
+  assert.equal(buttons.some((button) => textOf(button) === 'Console'), false,
+    `${status} detail must not expose console launch`);
   assert.ok(textOf(tree).includes('visible-snapshot'),
     `${status} detail must keep snapshot viewing available`);
   assert.equal(buttons.some((button) => ['Take snapshot', 'Roll back', 'Delete'].includes(textOf(button))), false,

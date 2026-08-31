@@ -9,6 +9,7 @@ import tempfile
 import threading
 import time
 import json
+import asyncio
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
@@ -1154,8 +1155,11 @@ def test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy():
             dep_id = _mk_lifecycle_deployment(uid)
             snapshot_waiting = threading.Event()
             release_snapshot = threading.Event()
+            snapshot_audit_pending = threading.Event()
+            release_snapshot_audit = threading.Event()
             lifecycle_finished = threading.Event()
             results = {}
+            saved_audit = api.record_audit
 
             class _Px:
                 def __init__(self, _conn): pass
@@ -1168,6 +1172,16 @@ def test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy():
                         if not release_snapshot.wait(timeout=3):
                             raise AssertionError("test did not release snapshot task")
                 def vm_current(self, *_args, **_kwargs): return {"status": "running"}
+
+            def blocking_snapshot_audit(
+                session, user, action, target_type, target_id, detail="",
+            ):
+                result = saved_audit(session, user, action, target_type, target_id, detail)
+                if action == f"vm.snapshot.{mutation}":
+                    snapshot_audit_pending.set()
+                    if not release_snapshot_audit.wait(timeout=3):
+                        raise AssertionError("test did not release snapshot audit boundary")
+                return result
 
             def run_snapshot():
                 with Session(engine) as s:
@@ -1192,6 +1206,7 @@ def test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy():
 
             saved_px = api.Proxmox
             api.Proxmox = _Px
+            api.record_audit = blocking_snapshot_audit
             snapshot = threading.Thread(target=run_snapshot, name=f"snapshot-{mutation}")
             lifecycle = threading.Thread(target=run_lifecycle, name=lifecycle_name)
             try:
@@ -1206,15 +1221,21 @@ def test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy():
                         Job.type.in_(("rebuild", "destroy")),
                     )).all() == []
                 release_snapshot.set()
+                assert snapshot_audit_pending.wait(timeout=2), (mutation, lifecycle_name)
+                assert not lifecycle_finished.is_set(), \
+                    "lifecycle admission escaped while snapshot audit was uncommitted"
+                release_snapshot_audit.set()
                 snapshot.join(timeout=3)
                 lifecycle.join(timeout=3)
                 assert not snapshot.is_alive() and not lifecycle.is_alive()
             finally:
                 release_snapshot.set()
+                release_snapshot_audit.set()
                 snapshot.join(timeout=3)
                 if lifecycle.ident is not None:
                     lifecycle.join(timeout=3)
                 api.Proxmox = saved_px
+                api.record_audit = saved_audit
 
             assert isinstance(results["snapshot"], dict), (mutation, lifecycle_name, results)
             assert isinstance(results["lifecycle"], dict), (mutation, lifecycle_name, results)
@@ -1362,6 +1383,377 @@ def test_blocked_snapshot_does_not_block_other_deployment_lifecycle_admission():
         assert snapshot_dep_id not in api._deployment_operation_locks
         assert other_dep_id not in api._deployment_operation_locks
     print("test_blocked_snapshot_does_not_block_other_deployment_lifecycle_admission OK")
+
+
+class _SerialBrowser:
+    def __init__(self, uid: int | None, session_epoch: int = 0, *, headers=None):
+        self.session = {"uid": uid, "sv": session_epoch} if uid is not None else {}
+        self.headers = headers or {}
+        self.scope = {"subprotocols": ["binary"]}
+        self.accepted = False
+        self.close_codes = []
+        self.sent = []
+
+    async def accept(self, subprotocol=None):
+        self.accepted = True
+
+    async def close(self, code=1000):
+        self.close_codes.append(code)
+
+    async def send_text(self, value):
+        self.sent.append(value)
+
+    async def send_bytes(self, value):
+        self.sent.append(value)
+
+    async def receive(self):
+        return {"type": "websocket.disconnect"}
+
+
+class _ImmediateSerialPve:
+    def __init__(self, on_enter=None):
+        self.on_enter = on_enter
+    async def __aenter__(self):
+        if self.on_enter is not None:
+            self.on_enter()
+        return self
+    async def __aexit__(self, *_args): return None
+    def __aiter__(self): return self
+    async def __anext__(self): raise StopAsyncIteration
+    async def send(self, _value): return None
+    async def close(self): return None
+
+
+def _serial_px_class(ensure_serial):
+    class _Px:
+        def __init__(self, _conn): pass
+        def pick_node(self): return "pve"
+        def ensure_serial(self, _vmid, _node): return ensure_serial()
+        def termproxy(self, _vmid, _node):
+            return {"ticket": "ticket", "port": 5900, "user": "console-user"}
+        def console_ws_url(self, *_args): return "wss://pve.invalid/console"
+        def token_auth_header(self): return "PVEAPIToken=test"
+    return _Px
+
+
+def _run_serial_console(dep_id: int, uid: int) -> _SerialBrowser:
+    browser = _SerialBrowser(uid)
+    asyncio.run(api.vm_console(browser, dep_id))
+    return browser
+
+
+def test_serial_console_rejects_active_lifecycle_and_cleanup_before_ensure_serial():
+    uid = _mk_user("w36-serial-active@example.com")
+    ensure_calls = []
+    saved_px = api.Proxmox
+    import websockets
+    saved_connect = websockets.connect
+    api.Proxmox = _serial_px_class(lambda: ensure_calls.append("ensure"))
+    websockets.connect = lambda *_args, **_kwargs: _ImmediateSerialPve()
+    try:
+        for active_type in ("deploy", "rebuild", "destroy"):
+            for active_status in ("queued", "running", "waiting"):
+                dep_id = _mk_lifecycle_deployment(uid)
+                with session_scope() as s:
+                    dep = s.get(Deployment, dep_id)
+                    s.add(Job(
+                        type=active_type, status=active_status,
+                        deployment_id=dep_id, connection_id=dep.connection_id,
+                        created_by=uid,
+                    ))
+                browser = _run_serial_console(dep_id, uid)
+                assert browser.accepted
+                assert ensure_calls == [], (active_type, active_status, browser.sent)
+                with api._deployment_operation_locks_guard:
+                    assert dep_id not in api._deployment_operation_locks
+
+        cleanup_id = _mk_lifecycle_deployment(uid, status="cleanup_pending")
+        browser = _run_serial_console(cleanup_id, uid)
+        assert browser.accepted
+        assert ensure_calls == [], browser.sent
+        with api._deployment_operation_locks_guard:
+            assert cleanup_id not in api._deployment_operation_locks
+    finally:
+        api.Proxmox = saved_px
+        websockets.connect = saved_connect
+    print("test_serial_console_rejects_active_lifecycle_and_cleanup_before_ensure_serial OK")
+
+
+def test_serial_console_authorization_precedes_deployment_lock_without_side_channel():
+    owner_id = _mk_user("w36-serial-auth-owner@example.com")
+    other_id = _mk_user("w36-serial-auth-other@example.com")
+    dep_id = _mk_lifecycle_deployment(owner_id)
+    original_lock = api._deployment_operation_lock
+    api._deployment_operation_lock = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("unauthorized serial handshake entered deployment lock")
+    )
+    try:
+        cases = [
+            _SerialBrowser(None),
+            _SerialBrowser(other_id),
+            _SerialBrowser(owner_id, headers={"origin": "https://evil.invalid", "host": "good.invalid"}),
+        ]
+        for browser in cases:
+            asyncio.run(api.vm_console(browser, dep_id))
+            assert browser.close_codes == [4403]
+            assert not browser.accepted
+        missing = _SerialBrowser(owner_id)
+        asyncio.run(api.vm_console(missing, dep_id + 10_000_000))
+        assert missing.close_codes == [4403]
+        assert not missing.accepted
+    finally:
+        api._deployment_operation_lock = original_lock
+    print("test_serial_console_authorization_precedes_deployment_lock_without_side_channel OK")
+
+
+def test_serial_setup_serializes_same_deployment_rebuild_and_destroy_both_orders():
+    uid = _mk_user("w36-serial-lifecycle-order@example.com")
+    import websockets
+    saved_connect = websockets.connect
+    websockets.connect = lambda *_args, **_kwargs: _ImmediateSerialPve()
+    try:
+        for lifecycle_name in ("rebuild", "destroy"):
+            dep_id = _mk_lifecycle_deployment(uid)
+            ensure_started = threading.Event()
+            release_ensure = threading.Event()
+            lifecycle_finished = threading.Event()
+            results = {}
+            saved_px = api.Proxmox
+            api.Proxmox = _serial_px_class(
+                lambda: (
+                    ensure_started.set(),
+                    release_ensure.wait(timeout=3) or (_ for _ in ()).throw(
+                        AssertionError("test did not release ensure_serial")
+                    ),
+                )
+            )
+
+            def run_console():
+                try:
+                    results["console"] = _run_serial_console(dep_id, uid)
+                except Exception as exc:
+                    results["console"] = exc
+
+            def run_lifecycle():
+                with Session(engine) as s:
+                    try:
+                        operation = api.vm_rebuild if lifecycle_name == "rebuild" else api.vm_destroy
+                        results["lifecycle"] = operation(
+                            dep_id, user=s.get(User, uid), session=s,
+                        )
+                    except Exception as exc:
+                        results["lifecycle"] = exc
+                    finally:
+                        lifecycle_finished.set()
+
+            console = threading.Thread(target=run_console)
+            lifecycle = threading.Thread(target=run_lifecycle)
+            try:
+                console.start()
+                assert ensure_started.wait(timeout=2), lifecycle_name
+                lifecycle.start()
+                _wait_for_deployment_lock_users(dep_id, 2)
+                assert not lifecycle_finished.is_set(), lifecycle_name
+                release_ensure.set()
+                console.join(timeout=3)
+                lifecycle.join(timeout=3)
+                assert not console.is_alive() and not lifecycle.is_alive()
+            finally:
+                release_ensure.set()
+                console.join(timeout=3)
+                if lifecycle.ident is not None:
+                    lifecycle.join(timeout=3)
+                api.Proxmox = saved_px
+
+            assert isinstance(results["console"], _SerialBrowser), results
+            assert isinstance(results["lifecycle"], dict), results
+            with api._deployment_operation_locks_guard:
+                assert dep_id not in api._deployment_operation_locks
+
+        for lifecycle_name in ("rebuild", "destroy"):
+            dep_id = _mk_lifecycle_deployment(uid)
+            before_commit = threading.Event()
+            release_commit = threading.Event()
+            ensure_called = threading.Event()
+            results = {}
+            saved_audit = api.record_audit
+            saved_px = api.Proxmox
+            api.Proxmox = _serial_px_class(lambda: ensure_called.set())
+
+            def blocking_audit(session, user, action, target_type, target_id, detail=""):
+                if action == f"vm.{lifecycle_name}":
+                    before_commit.set()
+                    if not release_commit.wait(timeout=3):
+                        raise AssertionError("test did not release lifecycle commit")
+                return saved_audit(session, user, action, target_type, target_id, detail)
+
+            def run_lifecycle_first():
+                with Session(engine) as s:
+                    try:
+                        operation = api.vm_rebuild if lifecycle_name == "rebuild" else api.vm_destroy
+                        results["lifecycle"] = operation(
+                            dep_id, user=s.get(User, uid), session=s,
+                        )
+                    except Exception as exc:
+                        results["lifecycle"] = exc
+
+            def run_console_second():
+                try:
+                    results["console"] = _run_serial_console(dep_id, uid)
+                except Exception as exc:
+                    results["console"] = exc
+
+            api.record_audit = blocking_audit
+            lifecycle = threading.Thread(target=run_lifecycle_first)
+            console = threading.Thread(target=run_console_second)
+            try:
+                lifecycle.start()
+                assert before_commit.wait(timeout=2), lifecycle_name
+                console.start()
+                _wait_for_deployment_lock_users(dep_id, 2)
+                assert not ensure_called.is_set(), lifecycle_name
+                release_commit.set()
+                lifecycle.join(timeout=3)
+                console.join(timeout=3)
+                assert not lifecycle.is_alive() and not console.is_alive()
+            finally:
+                release_commit.set()
+                lifecycle.join(timeout=3)
+                if console.ident is not None:
+                    console.join(timeout=3)
+                api.record_audit = saved_audit
+                api.Proxmox = saved_px
+
+            assert isinstance(results["lifecycle"], dict), results
+            assert isinstance(results["console"], _SerialBrowser), results
+            assert not ensure_called.is_set(), lifecycle_name
+            with api._deployment_operation_locks_guard:
+                assert dep_id not in api._deployment_operation_locks
+    finally:
+        websockets.connect = saved_connect
+    print("test_serial_setup_serializes_same_deployment_rebuild_and_destroy_both_orders OK")
+
+
+def test_serial_setup_does_not_block_unrelated_vm_and_reclaims_after_exception():
+    uid = _mk_user("w36-serial-independent@example.com")
+    serial_dep_id = _mk_lifecycle_deployment(uid)
+    other_dep_id = _mk_lifecycle_deployment(uid)
+    ensure_started = threading.Event()
+    release_ensure = threading.Event()
+    lifecycle_finished = threading.Event()
+    results = {}
+    saved_px = api.Proxmox
+    import websockets
+    saved_connect = websockets.connect
+    api.Proxmox = _serial_px_class(
+        lambda: (
+            ensure_started.set(),
+            release_ensure.wait(timeout=3) or (_ for _ in ()).throw(
+                AssertionError("test did not release independent ensure_serial")
+            ),
+        )
+    )
+    websockets.connect = lambda *_args, **_kwargs: _ImmediateSerialPve()
+
+    def run_console():
+        results["console"] = _run_serial_console(serial_dep_id, uid)
+
+    def run_other_lifecycle():
+        with Session(engine) as s:
+            try:
+                results["lifecycle"] = api.vm_rebuild(
+                    other_dep_id, user=s.get(User, uid), session=s,
+                )
+            finally:
+                lifecycle_finished.set()
+
+    console = threading.Thread(target=run_console)
+    lifecycle = threading.Thread(target=run_other_lifecycle)
+    try:
+        console.start()
+        assert ensure_started.wait(timeout=2)
+        lifecycle.start()
+        assert lifecycle_finished.wait(timeout=2), \
+            "unrelated lifecycle admission was blocked by serial setup"
+        release_ensure.set()
+        console.join(timeout=3)
+        lifecycle.join(timeout=3)
+    finally:
+        release_ensure.set()
+        console.join(timeout=3)
+        if lifecycle.ident is not None:
+            lifecycle.join(timeout=3)
+        api.Proxmox = saved_px
+        websockets.connect = saved_connect
+
+    assert isinstance(results["lifecycle"], dict), results
+    with api._deployment_operation_locks_guard:
+        assert serial_dep_id not in api._deployment_operation_locks
+        assert other_dep_id not in api._deployment_operation_locks
+
+    failure_dep_id = _mk_lifecycle_deployment(uid)
+    api.Proxmox = _serial_px_class(
+        lambda: (_ for _ in ()).throw(RuntimeError("serial setup failed"))
+    )
+    websockets.connect = lambda *_args, **_kwargs: _ImmediateSerialPve()
+    try:
+        browser = _run_serial_console(failure_dep_id, uid)
+        assert any("serial setup failed" in str(value) for value in browser.sent)
+    finally:
+        api.Proxmox = saved_px
+        websockets.connect = saved_connect
+    with api._deployment_operation_locks_guard:
+        assert failure_dep_id not in api._deployment_operation_locks
+    print("test_serial_setup_does_not_block_unrelated_vm_and_reclaims_after_exception OK")
+
+
+def test_serial_setup_lock_wait_runs_off_event_loop():
+    uid = _mk_user("w36-serial-event-loop@example.com")
+    dep_id = _mk_lifecycle_deployment(uid)
+    ensure_started = threading.Event()
+    release_ensure = threading.Event()
+    saved_px = api.Proxmox
+    import websockets
+    saved_connect = websockets.connect
+
+    def blocking_ensure():
+        ensure_started.set()
+        release_ensure.wait(timeout=0.4)
+
+    def assert_proxy_starts_unlocked():
+        with api._deployment_operation_locks_guard:
+            assert dep_id not in api._deployment_operation_locks, \
+                "live serial proxy must start after releasing the deployment lock"
+
+    api.Proxmox = _serial_px_class(blocking_ensure)
+    websockets.connect = lambda *_args, **_kwargs: _ImmediateSerialPve(
+        assert_proxy_starts_unlocked
+    )
+
+    async def scenario():
+        browser = _SerialBrowser(uid)
+        started_at = time.monotonic()
+        console = asyncio.create_task(api.vm_console(browser, dep_id))
+        try:
+            observed = await asyncio.to_thread(ensure_started.wait, 1)
+            elapsed = time.monotonic() - started_at
+            assert observed, "ensure_serial never started"
+            assert elapsed < 0.2, f"serial setup blocked the event loop for {elapsed:.3f}s"
+            assert not console.done(), "serial setup did not remain blocked for responsiveness probe"
+        finally:
+            release_ensure.set()
+            await console
+
+    try:
+        asyncio.run(scenario())
+        assert ensure_started.is_set()
+    finally:
+        release_ensure.set()
+        api.Proxmox = saved_px
+        websockets.connect = saved_connect
+    with api._deployment_operation_locks_guard:
+        assert dep_id not in api._deployment_operation_locks
+    print("test_serial_setup_lock_wait_runs_off_event_loop OK")
 
 
 def test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status():
@@ -1709,6 +2101,11 @@ if __name__ == "__main__":
     test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy()
     test_lifecycle_commit_before_snapshot_rejects_every_snapshot_mutation()
     test_blocked_snapshot_does_not_block_other_deployment_lifecycle_admission()
+    test_serial_console_rejects_active_lifecycle_and_cleanup_before_ensure_serial()
+    test_serial_console_authorization_precedes_deployment_lock_without_side_channel()
+    test_serial_setup_serializes_same_deployment_rebuild_and_destroy_both_orders()
+    test_serial_setup_does_not_block_unrelated_vm_and_reclaims_after_exception()
+    test_serial_setup_lock_wait_runs_off_event_loop()
     test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status()
     test_active_lifecycle_jobs_reject_direct_actions_before_proxmox_prerequisites()
     test_cleanup_pending_rejects_every_vm_lifecycle_operation()

@@ -93,6 +93,51 @@ Reviewer round 2 baseline: `3588effa875acb5ee8c10df58349e09b60cfaa2a`
   `20/20` JavaScript syntax checks, Python compilation, diff validation, and the setup
   and disclosure scans.
 
+Reviewer round 3 baseline: `9735304ebc8b1a5ff12b4112309fc1ae24554949`
+
+## Reviewer round 3 — serial-console setup/lifecycle serialization
+
+- Serial-console WebSocket origin, session, and ownership authorization still completes
+  before any deployment lock. Missing, unauthenticated, cross-origin, and non-owner
+  handshakes all close with the existing 4403 behavior and never enter the lock, so no
+  deployment-existence side channel was introduced.
+- After authorization, `asyncio.to_thread` performs guarded synchronous preparation so
+  waiting for the per-deployment `threading.Lock` cannot block the event loop. Under
+  that lock a fresh database session re-reads the user, deployment, connection, VMID,
+  cleanup state, and active lifecycle state before touching Proxmox.
+- Cleanup-pending or an active queued/running/waiting deploy/rebuild/destroy rejects
+  before `ensure_serial`. The lock covers persistent `ensure_serial` configuration and
+  the dependent serial termproxy preparation, then releases before the live WebSocket
+  connection and proxy pump. Only detached URL, TLS/header options, ticket, and proxy
+  user data cross that boundary. VNC/transient proxy behavior was not expanded.
+- The shared detail lock predicate now removes Console launch and any already-open
+  console surface for `working` and `cleanup_pending`; ordinary running/stopped detail
+  continues to expose Console.
+
+### Round 3 strict TDD evidence
+
+- RED: with a queued deploy, the serial WebSocket reached the patched `ensure_serial`;
+  the rendered working-detail fixture also still exposed Console.
+- GREEN: the serial guard rejects all nine lifecycle type/status combinations plus
+  cleanup before `ensure_serial`. Authorization-order cases prove the lock is never
+  entered for an invalid origin/session/owner or missing deployment.
+- Deterministic registry-waiter tests cover serial setup before rebuild and destroy,
+  plus rebuild/destroy held at their uncommitted audit boundary before serial setup.
+  The first ordering blocks lifecycle admission until serial preparation returns; the
+  reverse ordering makes serial preparation observe the committed job and skip
+  `ensure_serial`. An unrelated deployment proceeds independently, setup exceptions
+  reclaim the registry entry, and a scheduled event-loop ticker remains responsive
+  while synchronous serial setup waits in its worker thread.
+- The snapshot forward-order regression now releases Proxmox `wait_task`, blocks after
+  `record_audit` has staged its row but before commit, and proves rebuild/destroy remain
+  blocked until that audit/commit boundary releases. Registry reclamation remains
+  asserted after every case.
+- Focused Waves 16, 35, 36, 37, 38, and 39 Python passed, including existing live
+  serial/VNC revocation and coordinated-close coverage. Both rendered UI suites passed.
+- Fresh verification passed `39/39` Python wave scripts, `2/2` UI behavior suites,
+  `20/20` JavaScript syntax checks, Python compilation, diff validation, and setup and
+  disclosure scans.
+
 ## Scope and outcome
 
 - Direct start, stop, and restart now perform the existing ownership lookup first,
@@ -109,8 +154,8 @@ Reviewer round 2 baseline: `3588effa875acb5ee8c10df58349e09b60cfaa2a`
   active-job map is stale, without a misleading working overlay or job chip.
 - One shared UI predicate defines `working` and `cleanup_pending` as lifecycle-locked.
   VM detail renders `Cleanup pending` and its exact error while omitting VM power and
-  delete controls. It also omits snapshot mutations while retaining snapshot viewing.
-  Normal running/stopped detail controls remain unchanged.
+  delete controls. It also omits snapshot mutations and console launch while retaining
+  snapshot viewing. Normal running/stopped detail controls remain unchanged.
 - Dashboard table rows and cards omit selection and lifecycle actions for locked VMs.
   Select-all, selected count, bulk confirmation copy, and bulk execution use only VMs
   that are currently unlocked; execution re-filters a mixed/stale selection.
@@ -179,3 +224,6 @@ Reviewer round 1 requested commit message:
 
 Reviewer round 2 requested commit message:
 `fix: guard snapshot mutations during lifecycle work`.
+
+Reviewer round 3 requested commit message:
+`fix: guard serial console setup during lifecycle work`.

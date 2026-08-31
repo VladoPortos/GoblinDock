@@ -355,7 +355,7 @@
             ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
             : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy }, h(Icon, { name: 'play', size: 14 }), 'Start')),
           !locked && h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
-          h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
+          !locked && h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
           !locked && h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
             onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 }))),
       ),
@@ -378,7 +378,7 @@
             : '—' })),
 
       // console (toggle between the Proxmox graphical console and the serial console)
-      showConsole && h('div', { className: 'card card-pad', style: { marginBottom: 16 } },
+      !locked && showConsole && h('div', { className: 'card card-pad', style: { marginBottom: 16 } },
         h('div', { className: 'row', style: { marginBottom: 12 } },
           h('div', { className: 'seg' },
             h('button', { className: conMode === 'vnc' ? 'active' : '', onClick: () => setConMode('vnc') }, h(Icon, { name: 'server', size: 14 }), 'Graphical'),

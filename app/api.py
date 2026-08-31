@@ -1492,6 +1492,46 @@ def _pve_ws_kwargs(px: Proxmox, conn: Connection) -> dict:
             "ssl": ctx, "subprotocols": ["binary"], "max_size": None, "open_timeout": 15}
 
 
+@dataclass(frozen=True)
+class _SerialConsolePreparation:
+    """Detached inputs needed after guarded serial configuration is complete."""
+
+    ws_url: str
+    ws_kwargs: dict
+    ticket: object
+    proxy_user: object
+
+
+def _prepare_serial_console(dep_id: int, grant: _ConsoleGrant) -> _SerialConsolePreparation:
+    """Guard persistent serial setup without holding the lock for the live proxy."""
+    with _deployment_operation_lock(dep_id):
+        with Session(engine) as session:
+            user = session.get(User, grant.user_id)
+            dep = session.get(Deployment, dep_id)
+            if (not user or user.disabled or user.session_epoch != grant.session_epoch
+                    or not dep or (dep.owner_id != user.id and user.role != "admin")):
+                raise HTTPException(403, "console authorization expired")
+            _reject_cleanup_pending(dep)
+            active = _active_lifecycle_job(session, dep.id)
+            if active:
+                raise HTTPException(409, f"{active.type} job already active for this deployment")
+            conn = session.get(Connection, dep.connection_id)
+            if not conn or not dep.vmid:
+                raise HTTPException(400, "VM not provisioned")
+            px = Proxmox(conn)
+            node = dep.node or conn.node or px.pick_node()
+            px.ensure_serial(dep.vmid, node)
+            proxy = px.termproxy(dep.vmid, node)
+            ticket = proxy.get("ticket")
+            port = proxy.get("port")
+            return _SerialConsolePreparation(
+                ws_url=px.console_ws_url(dep.vmid, node, port, ticket),
+                ws_kwargs=_pve_ws_kwargs(px, conn),
+                ticket=ticket,
+                proxy_user=proxy.get("user"),
+            )
+
+
 @router.websocket("/vms/{dep_id}/console")
 async def vm_console(websocket: WebSocket, dep_id: int):
     """Bridge the browser's xterm to the VM's serial console. We open a Proxmox
@@ -1500,25 +1540,19 @@ async def vm_console(websocket: WebSocket, dep_id: int):
     grant = await _ws_authorized_dep(websocket, dep_id)
     if not grant:
         return
-    conn, dep = grant.conn, grant.deployment
-    if not dep.vmid:
+    if not grant.deployment.vmid:
         await websocket.close(code=4403)
         return
-    vmid, node = dep.vmid, dep.node or conn.node
     await _accept_binary(websocket)
 
     import websockets as _ws
 
     try:
-        px = Proxmox(conn)
-        node = node or px.pick_node()
-        px.ensure_serial(vmid, node)
-        tp = px.termproxy(vmid, node)
-        ticket, port, puser = tp.get("ticket"), tp.get("port"), tp.get("user")
+        prep = await asyncio.to_thread(_prepare_serial_console, dep_id, grant)
         async with _ws.connect(
-            px.console_ws_url(vmid, node, port, ticket), **_pve_ws_kwargs(px, conn),
+            prep.ws_url, **prep.ws_kwargs,
         ) as pve:
-            await pve.send(f"{puser}:{ticket}\n")
+            await pve.send(f"{prep.proxy_user}:{prep.ticket}\n")
             await _pump_ws(websocket, pve, prefer_bytes=False, grant=grant)
     except Exception as e:  # noqa: BLE001
         try:
