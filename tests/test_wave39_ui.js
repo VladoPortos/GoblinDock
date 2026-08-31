@@ -707,9 +707,26 @@ assert.equal(renderedSpacePrevented, 1,
   'the rendered placed block must prevent page scrolling for Space');
 const placedActions = findAll(placedBlock, (node) => node.type === 'button');
 assert.deepEqual(placedActions.map((button) => button.props['aria-label']), [
-  'Move Install packages up', 'Duplicate Install packages', 'Remove Install packages',
+  'Move Install packages down', 'Move Install packages up',
+  'Duplicate Install packages', 'Remove Install packages',
 ]);
 assert.ok(placedActions.every((button) => button.props.type === 'button'));
+const moveDown = placedActions[0];
+assert.equal(moveDown.props.title, 'Move down');
+let moveDownPropagationStops = 0;
+const changesBeforeMoveDown = keyboardBuilder.stateChanges.length;
+moveDown.props.onClick({ stopPropagation() { moveDownPropagationStops += 1; } });
+const moveDownChanges = keyboardBuilder.stateChanges.slice(changesBeforeMoveDown);
+assert.equal(moveDownPropagationStops, 1, 'Move down must not bubble into block selection');
+assert.equal(moveDownChanges.length, 1, 'Move down must dispatch exactly one state change');
+assert.equal(moveDownChanges[0].index, 0,
+  'Move down must update sections without dispatching parent selection state');
+const placedUid = placedBlock.props.key;
+const reordered = moveDownChanges[0].value([{
+  id: 's-inst', blocks: [{ uid: placedUid }, { uid: 'following-block' }],
+}]);
+assert.deepEqual(reordered[0].blocks.map((block) => block.uid), ['following-block', placedUid],
+  'Move down must dispatch onMove with direction +1');
 const nestedChangesBefore = keyboardBuilder.stateChanges.length;
 const nestedActionTarget = { closest() { return placedActions[0]; } };
 placedBlock.props.onClick({
@@ -719,8 +736,7 @@ placedBlock.props.onClick({
 assert.equal(keyboardBuilder.stateChanges.length, nestedChangesBefore,
   'the rendered placed block must ignore click bubbling from nested action buttons');
 const placedGrip = findAll(placedBlock, (node) => node.props.className === 'pb-grip')[0];
-assert.equal(placedGrip.props.onClick, undefined, 'the decorative grip must not masquerade as a control');
-assert.equal(placedGrip.props['aria-hidden'], true);
+assert.equal(placedGrip, moveDown, 'the existing placed-block grip must remain the Move down control');
 const dropzone = findAll(builderTree, (node) => String(node.props.className || '').includes('dropzone'))[0];
 assert.equal(typeof dropzone.props.onDragOver, 'function');
 assert.equal(typeof dropzone.props.onDrop, 'function',

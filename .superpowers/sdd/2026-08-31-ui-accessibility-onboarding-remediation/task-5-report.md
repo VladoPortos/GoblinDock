@@ -16,7 +16,8 @@ accessible names. Block actions remain visible during `focus-within` as well as 
 or selection.
 
 The existing pointer-sized code-preview target and palette/dropzone drag/drop handlers
-remain available. Decorative grip icons no longer masquerade as controls.
+remain available. The palette grip stays decorative; the placed-block grip remains an
+explicit native Move down control.
 
 ## Automated verification
 
@@ -40,3 +41,27 @@ session. Keyboard-only browser acceptance therefore remains the sole unexecuted 
 check; no automated-test or source-audit residual was found.
 
 Requested commit message: `fix: add keyboard access to navigation and builder`.
+
+## Fix Round 1
+
+### Finding addressed
+
+The first implementation made the placed-block grip decorative and thereby removed its
+existing pointer Move down action. This was an Important behavior regression even though
+the separate Move up action remained available.
+
+### Red/green evidence and correction
+
+- RED: the focused rendered-handler test expected `Move Install packages down` and failed
+  because only Move up, Duplicate, and Remove were rendered.
+- The placed-block grip is now a native `button type="button"` with title `Move down` and
+  contextual accessible name `Move <block name> down`.
+- Its click handler stops propagation and calls `onMove(sectionId, blockId, 1)`. The
+  rendered test invokes the handler, confirms exactly one sections-state dispatch,
+  applies the updater to a two-block fixture to prove downward reordering, and confirms
+  no parent selection-state dispatch.
+- The palette grip remains decorative because it never owned an action.
+- GREEN: focused Wave 39 UI, both UI Node suites, builder syntax, all 39 Python waves,
+  Python compileall, and diff checks passed.
+
+Fix Round 1 requested commit message: `fix: preserve builder move-down control`.

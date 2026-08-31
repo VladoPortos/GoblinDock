@@ -473,7 +473,9 @@ a { color: var(--accent); text-decoration: none; }
 .palette-block:active { cursor: grabbing; transform: scale(.98); }
 .pb-ico { width: 28px; height: 28px; border-radius: 8px; flex-shrink: 0; display: grid; place-items: center; background: var(--surface-3); color: var(--text-dim); }
 .palette-block:hover .pb-ico { color: var(--accent); }
-.pb-grip { color: var(--text-faint); display: grid; place-items: center; flex-shrink: 0; opacity: .5; }
+.pb-grip { color: var(--text-faint); display: grid; place-items: center; flex-shrink: 0; opacity: .5;
+  border: 0; padding: 0; background: transparent; font: inherit; }
+.placed-block > button.pb-grip { cursor: pointer; }
 .palette-block:hover .pb-grip { opacity: 1; }
 
 /* canvas */
