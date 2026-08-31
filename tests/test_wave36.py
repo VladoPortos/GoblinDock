@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 import threading
+import time
 import json
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
@@ -749,6 +750,24 @@ def _mk_lifecycle_deployment(uid: int, *, status: str = "running") -> int:
         return dep.id
 
 
+def _wait_for_deployment_lock_users(
+    dep_id: int, expected: int, registered: threading.Event | None = None,
+) -> None:
+    """Wait until owners/waiters are registered in the real lock registry."""
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        with api._deployment_operation_locks_guard:
+            entry = api._deployment_operation_locks.get(dep_id)
+            if entry is not None and entry.users >= expected:
+                if registered is not None:
+                    registered.set()
+                return
+        threading.Event().wait(0.01)
+    raise AssertionError(
+        f"deployment {dep_id} never registered {expected} lock owners/waiters"
+    )
+
+
 def test_sequential_duplicate_destroy_returns_one_active_job():
     """A repeated delete must return the first job instead of admitting a duplicate."""
     uid = _mk_user("w36-destroy-sequential@example.com")
@@ -808,8 +827,7 @@ def test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission():
     dep_id = _mk_lifecycle_deployment(uid)
     power_waiting = threading.Event()
     release_power = threading.Event()
-    attempted = {name: threading.Event() for name in ("rebuild", "destroy")}
-    at_deployment_lock = {name: threading.Event() for name in ("rebuild", "destroy")}
+    contenders_registered = threading.Event()
     finished = {name: threading.Event() for name in ("rebuild", "destroy")}
     results = {}
 
@@ -832,7 +850,6 @@ def test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission():
                 results["power"] = exc
 
     def run_lifecycle(name):
-        attempted[name].set()
         with Session(engine) as s:
             try:
                 operation = api.vm_rebuild if name == "rebuild" else api.vm_destroy
@@ -843,16 +860,7 @@ def test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission():
                 finished[name].set()
 
     saved_px = api.Proxmox
-    saved_operation_lock = api._deployment_operation_lock
-
-    def observed_operation_lock(deployment_id):
-        event = at_deployment_lock.get(threading.current_thread().name)
-        if event is not None:
-            event.set()
-        return saved_operation_lock(deployment_id)
-
     api.Proxmox = _Px
-    api._deployment_operation_lock = observed_operation_lock
     threads = []
     try:
         power = threading.Thread(target=run_power, name="power")
@@ -864,9 +872,8 @@ def test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission():
             thread = threading.Thread(target=run_lifecycle, args=(name,), name=name)
             thread.start()
             threads.append(thread)
-        assert all(event.wait(timeout=2) for event in attempted.values())
-        assert all(event.wait(timeout=2) for event in at_deployment_lock.values()), \
-            "same-VM lifecycle contender did not reach the deployment lock"
+        _wait_for_deployment_lock_users(dep_id, 3, contenders_registered)
+        assert contenders_registered.is_set()
         assert not any(event.is_set() for event in finished.values()), \
             "same-VM lifecycle admission completed while power wait still owned the VM"
         with session_scope() as s:
@@ -884,7 +891,6 @@ def test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission():
         for thread in threads:
             thread.join(timeout=3)
         api.Proxmox = saved_px
-        api._deployment_operation_lock = saved_operation_lock
 
     assert results["power"] == {"ok": True}, results
     lifecycle_results = [results["rebuild"], results["destroy"]]
@@ -911,11 +917,10 @@ def test_lifecycle_commit_before_power_makes_power_observe_active_job():
         before_commit = threading.Event()
         release_commit = threading.Event()
         power_submitted = threading.Event()
-        power_at_deployment_lock = threading.Event()
+        power_registered_at_lock = threading.Event()
         results = {}
         saved_audit = api.record_audit
         saved_px = api.Proxmox
-        saved_operation_lock = api._deployment_operation_lock
 
         def blocking_audit(session, user, action, target_type, target_id, detail=""):
             if action == f"vm.{operation_name}":
@@ -930,11 +935,6 @@ def test_lifecycle_commit_before_power_makes_power_observe_active_job():
                 power_submitted.set()
                 return "UPID:start"
             def wait_task(self, *_args, **_kwargs): return None
-
-        def observed_operation_lock(deployment_id):
-            if threading.current_thread().name == "power":
-                power_at_deployment_lock.set()
-            return saved_operation_lock(deployment_id)
 
         def run_lifecycle():
             with Session(engine) as s:
@@ -958,15 +958,14 @@ def test_lifecycle_commit_before_power_makes_power_observe_active_job():
 
         api.record_audit = blocking_audit
         api.Proxmox = _Px
-        api._deployment_operation_lock = observed_operation_lock
         lifecycle = threading.Thread(target=run_lifecycle, name=operation_name)
         power = threading.Thread(target=run_power, name="power")
         try:
             lifecycle.start()
             assert before_commit.wait(timeout=2), f"{operation_name} never reached commit boundary"
             power.start()
-            assert power_at_deployment_lock.wait(timeout=2), \
-                f"power never reached the lock behind {operation_name}"
+            _wait_for_deployment_lock_users(dep_id, 2, power_registered_at_lock)
+            assert power_registered_at_lock.is_set()
             assert not power_submitted.is_set(), \
                 f"power submitted while {operation_name} admission was uncommitted"
             release_commit.set()
@@ -980,13 +979,15 @@ def test_lifecycle_commit_before_power_makes_power_observe_active_job():
                 power.join(timeout=3)
             api.record_audit = saved_audit
             api.Proxmox = saved_px
-            api._deployment_operation_lock = saved_operation_lock
 
         assert isinstance(results["lifecycle"], dict), (operation_name, results)
         assert isinstance(results["power"], HTTPException), (operation_name, results)
         assert results["power"].status_code == 409, (operation_name, results["power"])
         assert operation_name in str(results["power"].detail), results["power"].detail
         assert not power_submitted.is_set(), operation_name
+        with api._deployment_operation_locks_guard:
+            assert dep_id not in api._deployment_operation_locks, \
+                "reverse-order lock entry must be reclaimed after HTTP 409"
     print("test_lifecycle_commit_before_power_makes_power_observe_active_job OK")
 
 
@@ -1059,6 +1060,308 @@ def test_power_wait_does_not_block_other_deployment_lifecycle_admission():
         assert power_dep_id not in api._deployment_operation_locks
         assert other_dep_id not in api._deployment_operation_locks
     print("test_power_wait_does_not_block_other_deployment_lifecycle_admission OK")
+
+
+def _call_snapshot_mutation(kind: str, dep_id: int, user: User, session: Session):
+    if kind == "create":
+        return api.create_vm_snapshot(
+            dep_id, api.SnapshotBody(name="guarded-snapshot"), user=user, session=session,
+        )
+    if kind == "delete":
+        return api.delete_vm_snapshot(
+            dep_id, "guarded-snapshot", user=user, session=session,
+        )
+    return api.rollback_vm_snapshot(
+        dep_id, "guarded-snapshot", body=api.RollbackBody(start=False),
+        user=user, session=session,
+    )
+
+
+def test_snapshot_mutations_reject_every_active_lifecycle_state_before_proxmox():
+    """All snapshot writes share the queued/running/waiting lifecycle guard."""
+    uid = _mk_user("w36-snapshot-active-guard@example.com")
+    saved_px = api.Proxmox
+    api.Proxmox = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("active lifecycle rejection must precede snapshot Proxmox access")
+    )
+    try:
+        for mutation in ("create", "delete", "rollback"):
+            for active_type in ("deploy", "rebuild", "destroy"):
+                for active_status in ("queued", "running", "waiting"):
+                    dep_id = _mk_lifecycle_deployment(uid)
+                    with session_scope() as s:
+                        dep = s.get(Deployment, dep_id)
+                        s.add(Job(
+                            type=active_type, status=active_status,
+                            deployment_id=dep_id, connection_id=dep.connection_id,
+                            created_by=uid,
+                        ))
+                    with Session(engine) as s:
+                        exc = _expect_http(409, lambda: _call_snapshot_mutation(
+                            mutation, dep_id, s.get(User, uid), s,
+                        ))
+                        assert active_type in str(exc.detail), (
+                            mutation, active_type, active_status, exc.detail,
+                        )
+                    with api._deployment_operation_locks_guard:
+                        assert dep_id not in api._deployment_operation_locks
+    finally:
+        api.Proxmox = saved_px
+    print("test_snapshot_mutations_reject_every_active_lifecycle_state_before_proxmox OK")
+
+
+def test_snapshot_mutations_reject_cleanup_and_authorize_before_locking():
+    owner_id = _mk_user("w36-snapshot-cleanup-owner@example.com")
+    other_id = _mk_user("w36-snapshot-cleanup-other@example.com")
+    saved_px = api.Proxmox
+    api.Proxmox = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("cleanup rejection must precede snapshot Proxmox access")
+    )
+    try:
+        for mutation in ("create", "delete", "rollback"):
+            dep_id = _mk_lifecycle_deployment(owner_id, status="cleanup_pending")
+            with Session(engine) as s:
+                exc = _expect_http(409, lambda: _call_snapshot_mutation(
+                    mutation, dep_id, s.get(User, owner_id), s,
+                ))
+                assert "cleanup" in str(exc.detail).lower()
+            with api._deployment_operation_locks_guard:
+                assert dep_id not in api._deployment_operation_locks
+    finally:
+        api.Proxmox = saved_px
+
+    original_lock = api._deployment_operation_lock
+    api._deployment_operation_lock = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("snapshot authorization must happen before deployment locking")
+    )
+    try:
+        dep_id = _mk_lifecycle_deployment(owner_id)
+        for mutation in ("create", "delete", "rollback"):
+            with Session(engine) as s:
+                _expect_http(403, lambda: _call_snapshot_mutation(
+                    mutation, dep_id, s.get(User, other_id), s,
+                ))
+    finally:
+        api._deployment_operation_lock = original_lock
+    print("test_snapshot_mutations_reject_cleanup_and_authorize_before_locking OK")
+
+
+def test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy():
+    """Each snapshot mutation owns the VM until its Proxmox task and commit finish."""
+    uid = _mk_user("w36-snapshot-before-lifecycle@example.com")
+    for mutation in ("create", "delete", "rollback"):
+        for lifecycle_name in ("rebuild", "destroy"):
+            dep_id = _mk_lifecycle_deployment(uid)
+            snapshot_waiting = threading.Event()
+            release_snapshot = threading.Event()
+            lifecycle_finished = threading.Event()
+            results = {}
+
+            class _Px:
+                def __init__(self, _conn): pass
+                def create_snapshot(self, *_args, **_kwargs): return "UPID:snapshot"
+                def delete_snapshot(self, *_args, **_kwargs): return "UPID:snapshot"
+                def rollback_snapshot(self, *_args, **_kwargs): return "UPID:snapshot"
+                def wait_task(self, upid, node=None, timeout=None):
+                    if upid == "UPID:snapshot":
+                        snapshot_waiting.set()
+                        if not release_snapshot.wait(timeout=3):
+                            raise AssertionError("test did not release snapshot task")
+                def vm_current(self, *_args, **_kwargs): return {"status": "running"}
+
+            def run_snapshot():
+                with Session(engine) as s:
+                    try:
+                        results["snapshot"] = _call_snapshot_mutation(
+                            mutation, dep_id, s.get(User, uid), s,
+                        )
+                    except Exception as exc:
+                        results["snapshot"] = exc
+
+            def run_lifecycle():
+                with Session(engine) as s:
+                    try:
+                        operation = api.vm_rebuild if lifecycle_name == "rebuild" else api.vm_destroy
+                        results["lifecycle"] = operation(
+                            dep_id, user=s.get(User, uid), session=s,
+                        )
+                    except Exception as exc:
+                        results["lifecycle"] = exc
+                    finally:
+                        lifecycle_finished.set()
+
+            saved_px = api.Proxmox
+            api.Proxmox = _Px
+            snapshot = threading.Thread(target=run_snapshot, name=f"snapshot-{mutation}")
+            lifecycle = threading.Thread(target=run_lifecycle, name=lifecycle_name)
+            try:
+                snapshot.start()
+                assert snapshot_waiting.wait(timeout=2), (mutation, lifecycle_name)
+                lifecycle.start()
+                _wait_for_deployment_lock_users(dep_id, 2)
+                assert not lifecycle_finished.is_set(), (mutation, lifecycle_name, results)
+                with session_scope() as s:
+                    assert s.exec(select(Job).where(
+                        Job.deployment_id == dep_id,
+                        Job.type.in_(("rebuild", "destroy")),
+                    )).all() == []
+                release_snapshot.set()
+                snapshot.join(timeout=3)
+                lifecycle.join(timeout=3)
+                assert not snapshot.is_alive() and not lifecycle.is_alive()
+            finally:
+                release_snapshot.set()
+                snapshot.join(timeout=3)
+                if lifecycle.ident is not None:
+                    lifecycle.join(timeout=3)
+                api.Proxmox = saved_px
+
+            assert isinstance(results["snapshot"], dict), (mutation, lifecycle_name, results)
+            assert isinstance(results["lifecycle"], dict), (mutation, lifecycle_name, results)
+            with api._deployment_operation_locks_guard:
+                assert dep_id not in api._deployment_operation_locks
+    print("test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy OK")
+
+
+def test_lifecycle_commit_before_snapshot_rejects_every_snapshot_mutation():
+    """Snapshot writes queued behind admission must observe its committed active job."""
+    uid = _mk_user("w36-lifecycle-before-snapshot@example.com")
+    for lifecycle_name in ("rebuild", "destroy"):
+        for mutation in ("create", "delete", "rollback"):
+            dep_id = _mk_lifecycle_deployment(uid)
+            before_commit = threading.Event()
+            release_commit = threading.Event()
+            proxmox_touched = threading.Event()
+            results = {}
+            saved_audit = api.record_audit
+            saved_px = api.Proxmox
+
+            def blocking_audit(session, user, action, target_type, target_id, detail=""):
+                if action == f"vm.{lifecycle_name}":
+                    before_commit.set()
+                    if not release_commit.wait(timeout=3):
+                        raise AssertionError("test did not release lifecycle commit")
+                return saved_audit(session, user, action, target_type, target_id, detail)
+
+            class _Px:
+                def __init__(self, _conn):
+                    proxmox_touched.set()
+
+            def run_lifecycle():
+                with Session(engine) as s:
+                    try:
+                        operation = api.vm_rebuild if lifecycle_name == "rebuild" else api.vm_destroy
+                        results["lifecycle"] = operation(
+                            dep_id, user=s.get(User, uid), session=s,
+                        )
+                    except Exception as exc:
+                        results["lifecycle"] = exc
+
+            def run_snapshot():
+                with Session(engine) as s:
+                    try:
+                        results["snapshot"] = _call_snapshot_mutation(
+                            mutation, dep_id, s.get(User, uid), s,
+                        )
+                    except Exception as exc:
+                        results["snapshot"] = exc
+
+            api.record_audit = blocking_audit
+            api.Proxmox = _Px
+            lifecycle = threading.Thread(target=run_lifecycle, name=lifecycle_name)
+            snapshot = threading.Thread(target=run_snapshot, name=f"snapshot-{mutation}")
+            try:
+                lifecycle.start()
+                assert before_commit.wait(timeout=2), (lifecycle_name, mutation)
+                snapshot.start()
+                _wait_for_deployment_lock_users(dep_id, 2)
+                assert not proxmox_touched.is_set(), (lifecycle_name, mutation)
+                release_commit.set()
+                lifecycle.join(timeout=3)
+                snapshot.join(timeout=3)
+                assert not lifecycle.is_alive() and not snapshot.is_alive()
+            finally:
+                release_commit.set()
+                lifecycle.join(timeout=3)
+                if snapshot.ident is not None:
+                    snapshot.join(timeout=3)
+                api.record_audit = saved_audit
+                api.Proxmox = saved_px
+
+            assert isinstance(results["lifecycle"], dict), (lifecycle_name, mutation, results)
+            assert isinstance(results["snapshot"], HTTPException), (lifecycle_name, mutation, results)
+            assert results["snapshot"].status_code == 409
+            assert lifecycle_name in str(results["snapshot"].detail)
+            assert not proxmox_touched.is_set()
+            with api._deployment_operation_locks_guard:
+                assert dep_id not in api._deployment_operation_locks
+    print("test_lifecycle_commit_before_snapshot_rejects_every_snapshot_mutation OK")
+
+
+def test_blocked_snapshot_does_not_block_other_deployment_lifecycle_admission():
+    uid = _mk_user("w36-snapshot-independent@example.com")
+    snapshot_dep_id = _mk_lifecycle_deployment(uid)
+    other_dep_id = _mk_lifecycle_deployment(uid)
+    snapshot_waiting = threading.Event()
+    release_snapshot = threading.Event()
+    lifecycle_finished = threading.Event()
+    results = {}
+
+    class _Px:
+        def __init__(self, _conn): pass
+        def create_snapshot(self, *_args, **_kwargs): return "UPID:snapshot"
+        def wait_task(self, *_args, **_kwargs):
+            snapshot_waiting.set()
+            if not release_snapshot.wait(timeout=3):
+                raise AssertionError("test did not release independent snapshot")
+
+    def run_snapshot():
+        with Session(engine) as s:
+            try:
+                results["snapshot"] = _call_snapshot_mutation(
+                    "create", snapshot_dep_id, s.get(User, uid), s,
+                )
+            except Exception as exc:
+                results["snapshot"] = exc
+
+    def run_other_lifecycle():
+        with Session(engine) as s:
+            try:
+                results["lifecycle"] = api.vm_rebuild(
+                    other_dep_id, user=s.get(User, uid), session=s,
+                )
+            except Exception as exc:
+                results["lifecycle"] = exc
+            finally:
+                lifecycle_finished.set()
+
+    saved_px = api.Proxmox
+    api.Proxmox = _Px
+    snapshot = threading.Thread(target=run_snapshot)
+    lifecycle = threading.Thread(target=run_other_lifecycle)
+    try:
+        snapshot.start()
+        assert snapshot_waiting.wait(timeout=2)
+        lifecycle.start()
+        assert lifecycle_finished.wait(timeout=2), \
+            "unrelated lifecycle admission was blocked by snapshot wait"
+        assert isinstance(results["lifecycle"], dict), results
+        release_snapshot.set()
+        snapshot.join(timeout=3)
+        lifecycle.join(timeout=3)
+        assert not snapshot.is_alive() and not lifecycle.is_alive()
+    finally:
+        release_snapshot.set()
+        snapshot.join(timeout=3)
+        if lifecycle.ident is not None:
+            lifecycle.join(timeout=3)
+        api.Proxmox = saved_px
+
+    assert isinstance(results["snapshot"], dict), results
+    with api._deployment_operation_locks_guard:
+        assert snapshot_dep_id not in api._deployment_operation_locks
+        assert other_dep_id not in api._deployment_operation_locks
+    print("test_blocked_snapshot_does_not_block_other_deployment_lifecycle_admission OK")
 
 
 def test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status():
@@ -1401,6 +1704,11 @@ if __name__ == "__main__":
     test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission()
     test_lifecycle_commit_before_power_makes_power_observe_active_job()
     test_power_wait_does_not_block_other_deployment_lifecycle_admission()
+    test_snapshot_mutations_reject_every_active_lifecycle_state_before_proxmox()
+    test_snapshot_mutations_reject_cleanup_and_authorize_before_locking()
+    test_blocked_snapshot_serializes_same_deployment_rebuild_and_destroy()
+    test_lifecycle_commit_before_snapshot_rejects_every_snapshot_mutation()
+    test_blocked_snapshot_does_not_block_other_deployment_lifecycle_admission()
     test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status()
     test_active_lifecycle_jobs_reject_direct_actions_before_proxmox_prerequisites()
     test_cleanup_pending_rejects_every_vm_lifecycle_operation()

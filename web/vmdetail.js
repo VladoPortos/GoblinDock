@@ -193,7 +193,7 @@
         'Snapshots live on the Proxmox node next to the VM disk. Rolling back discards everything written since.'));
   }
 
-  function Snapshots({ depId, running }) {
+  function Snapshots({ depId, running, locked }) {
     const [bump, setBump] = useState(0);
     const [taking, setTaking] = useState(false);
     const [confirm, setConfirm] = useState(null);   // { kind: 'rollback' | 'delete', snap }
@@ -233,7 +233,7 @@
             s.current && h('span', { className: 'badge accent', style: { fontSize: 10 } }, 'current'),
             s.vmstate && h('span', { className: 'badge', style: { fontSize: 10 } }, 'RAM')),
           h('div', { className: 'hint', style: { fontSize: 11 } }, s.created, s.description ? ' · ' + s.description : '')),
-        h(Menu, { items: [
+        !locked && h(Menu, { items: [
           { label: 'Roll back', icon: 'history', onClick: () => { setStartAfter(true); setConfirm({ kind: 'rollback', snap: s }); } },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm({ kind: 'delete', snap: s }) },
@@ -241,10 +241,10 @@
 
     return h(React.Fragment, null,
       Card('Snapshots', body,
-        h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTaking(true),
+        !locked && h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTaking(true),
           disabled: !!(data && data.error) }, h(Icon, { name: 'plus', size: 13 }), 'Take snapshot')),
-      taking && h(SnapModal, { depId, running, onClose: () => setTaking(false), onDone: () => { setTaking(false); reload(); } }),
-      confirm && h(ConfirmModal, {
+      !locked && taking && h(SnapModal, { depId, running, onClose: () => setTaking(false), onDone: () => { setTaking(false); reload(); } }),
+      !locked && confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null),
         tone: 'danger',
         icon: confirm.kind === 'rollback' ? 'history' : 'trash',
@@ -434,7 +434,7 @@
                       h('div', { className: 'copy mono', style: { fontSize: 11.5 } }, (ifc.ips || []).join(', ') || '—')))))
             : Card('Guest agent', h('div', { className: 'hint', style: { fontSize: 12.5, padding: '4px 0' } },
                 running ? 'Waiting for qemu-guest-agent… (installed by GoblinDock on first boot)' : 'Start the VM to read guest info.')),
-          h(Snapshots, { depId, running }),
+          h(Snapshots, { depId, running, locked }),
           Card('Deployment log', h(DeployLog, { jobId: d.jobId }),
             d.jobId && h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => go('job', { jobId: d.jobId }) }, 'Open full log')))),
 

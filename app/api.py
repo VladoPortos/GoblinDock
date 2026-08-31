@@ -1194,6 +1194,22 @@ def _snapshot_px(session: Session, dep: Deployment) -> tuple[Proxmox, str]:
     return px, dep.node or conn.node or px.pick_node()
 
 
+@contextmanager
+def _snapshot_mutation_deployment(
+    session: Session, dep_id: int, user: User,
+):
+    """Authorize, then lock one VM for a snapshot mutation and its audit commit."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep = _owned_deployment(session, dep_id, user)
+        _reject_cleanup_pending(dep)
+        active = _active_lifecycle_job(session, dep.id)
+        if active:
+            raise HTTPException(409, f"{active.type} job already active for this deployment")
+        yield dep
+
+
 @router.get("/vms/{dep_id}/snapshots")
 def list_vm_snapshots(dep_id: int, user: User = Depends(current_user),
                       session: Session = Depends(get_session)):
@@ -1221,71 +1237,71 @@ def list_vm_snapshots(dep_id: int, user: User = Depends(current_user),
 @router.post("/vms/{dep_id}/snapshots")
 def create_vm_snapshot(dep_id: int, body: SnapshotBody, user: User = Depends(current_user),
                        session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    name = (body.name or "").strip() or "snap-" + utcnow().strftime("%Y%m%d-%H%M%S")
-    if not _SNAPNAME_RE.fullmatch(name):
-        raise HTTPException(400, "snapshot name must start with a letter and contain only "
-                                 "letters, digits, '-' or '_' (max 40 chars)")
-    px, node = _snapshot_px(session, dep)
-    try:
-        upid = px.create_snapshot(dep.vmid, name, description=(body.description or "")[:200],
-                                  vmstate=body.includeRam, node=node)
-        px.wait_task(upid, node=node, timeout=300)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, "vm.snapshot.create", "deployment", dep.id,
-                 f"{dep.name} · {name}")
-    session.commit()
-    statebus.bump()
-    return {"ok": True, "name": name}
+    with _snapshot_mutation_deployment(session, dep_id, user) as dep:
+        name = (body.name or "").strip() or "snap-" + utcnow().strftime("%Y%m%d-%H%M%S")
+        if not _SNAPNAME_RE.fullmatch(name):
+            raise HTTPException(400, "snapshot name must start with a letter and contain only "
+                                     "letters, digits, '-' or '_' (max 40 chars)")
+        px, node = _snapshot_px(session, dep)
+        try:
+            upid = px.create_snapshot(dep.vmid, name, description=(body.description or "")[:200],
+                                      vmstate=body.includeRam, node=node)
+            px.wait_task(upid, node=node, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        record_audit(session, user, "vm.snapshot.create", "deployment", dep.id,
+                     f"{dep.name} · {name}")
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "name": name}
 
 
 @router.delete("/vms/{dep_id}/snapshots/{snapname}")
 def delete_vm_snapshot(dep_id: int, snapname: str, user: User = Depends(current_user),
                        session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    if not _SNAPNAME_RE.fullmatch(snapname or ""):
-        raise HTTPException(400, "invalid snapshot name")
-    px, node = _snapshot_px(session, dep)
-    try:
-        upid = px.delete_snapshot(dep.vmid, snapname, node=node)
-        px.wait_task(upid, node=node, timeout=300)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, "vm.snapshot.delete", "deployment", dep.id,
-                 f"{dep.name} · {snapname}")
-    session.commit()
-    statebus.bump()
-    return {"ok": True}
+    with _snapshot_mutation_deployment(session, dep_id, user) as dep:
+        if not _SNAPNAME_RE.fullmatch(snapname or ""):
+            raise HTTPException(400, "invalid snapshot name")
+        px, node = _snapshot_px(session, dep)
+        try:
+            upid = px.delete_snapshot(dep.vmid, snapname, node=node)
+            px.wait_task(upid, node=node, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        record_audit(session, user, "vm.snapshot.delete", "deployment", dep.id,
+                     f"{dep.name} · {snapname}")
+        session.commit()
+        statebus.bump()
+        return {"ok": True}
 
 
 @router.post("/vms/{dep_id}/snapshots/{snapname}/rollback")
 def rollback_vm_snapshot(dep_id: int, snapname: str, body: Optional[RollbackBody] = None,
                          user: User = Depends(current_user),
                          session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    if not _SNAPNAME_RE.fullmatch(snapname or ""):
-        raise HTTPException(400, "invalid snapshot name")
-    start_after = body.start if body is not None else True
-    px, node = _snapshot_px(session, dep)
-    started = False
-    try:
-        upid = px.rollback_snapshot(dep.vmid, snapname, node=node)
-        px.wait_task(upid, node=node, timeout=300)
-        # A disk-only snapshot rollback leaves the VM stopped (Proxmox stops a running
-        # VM to revert its disk); a RAM snapshot resumes running on its own. When the
-        # caller asked to start, bring it back up if it isn't already running so they
-        # land on a running VM at the rollback point.
-        if start_after and px.vm_current(dep.vmid, node).get("status") != "running":
-            px.wait_task(px.start(dep.vmid, node=node), node=node, timeout=120)
-            started = True
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, "vm.snapshot.rollback", "deployment", dep.id,
-                 f"{dep.name} · {snapname}")
-    session.commit()
-    statebus.bump()
-    return {"ok": True, "started": started}
+    with _snapshot_mutation_deployment(session, dep_id, user) as dep:
+        if not _SNAPNAME_RE.fullmatch(snapname or ""):
+            raise HTTPException(400, "invalid snapshot name")
+        start_after = body.start if body is not None else True
+        px, node = _snapshot_px(session, dep)
+        started = False
+        try:
+            upid = px.rollback_snapshot(dep.vmid, snapname, node=node)
+            px.wait_task(upid, node=node, timeout=300)
+            # A disk-only snapshot rollback leaves the VM stopped (Proxmox stops a running
+            # VM to revert its disk); a RAM snapshot resumes running on its own. When the
+            # caller asked to start, bring it back up if it isn't already running so they
+            # land on a running VM at the rollback point.
+            if start_after and px.vm_current(dep.vmid, node).get("status") != "running":
+                px.wait_task(px.start(dep.vmid, node=node), node=node, timeout=120)
+                started = True
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        record_audit(session, user, "vm.snapshot.rollback", "deployment", dep.id,
+                     f"{dep.name} · {snapname}")
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "started": started}
 
 
 def _ws_origin_ok(ws: WebSocket) -> bool:

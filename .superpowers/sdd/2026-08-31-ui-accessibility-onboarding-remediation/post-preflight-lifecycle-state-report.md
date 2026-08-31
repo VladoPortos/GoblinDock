@@ -48,6 +48,51 @@ Reviewer round 1 baseline: `c8b87b7c05726a7ecddc87f733aa6f0133e15ad6`
   application/UI code. The full Wave 39 run also exercised real token-free first-admin
   setup and authenticated non-admin state redaction.
 
+Reviewer round 2 baseline: `3588effa875acb5ee8c10df58349e09b60cfaa2a`
+
+## Reviewer round 2 — snapshot mutation/lifecycle serialization
+
+- Snapshot create, delete, and rollback now perform ownership authorization before
+  locking, end the initial read transaction, then re-read the deployment under the same
+  per-deployment lock used by power and lifecycle admission. Cleanup-pending and every
+  active queued/running/waiting deploy/rebuild/destroy job are rejected before
+  connection, VMID, or Proxmox snapshot work.
+- Each snapshot mutation holds the deployment lock through request submission, all
+  task waits (including rollback auto-start), audit, commit, state notification, and
+  response construction. Exceptions leave the context and reclaim idle registry
+  entries. The read-only snapshot-list endpoint remains outside mutation admission.
+- The detail UI passes the shared `working`/`cleanup_pending` predicate into the
+  snapshot surface. Locked detail still fetches and renders existing snapshot names and
+  metadata, but omits Take snapshot, Roll back, and Delete. Running/stopped detail keeps
+  all three controls.
+- The bounded endpoint audit found no remaining direct VM mutation route beyond power,
+  rebuild/destroy admission, and these three snapshot writers.
+
+### Round 2 strict TDD evidence
+
+- RED: Wave 36 reached the patched Proxmox constructor instead of returning HTTP 409
+  for a queued deploy during snapshot create. Wave 39's rendered working-detail fixture
+  still contained snapshot mutation controls.
+- GREEN: a 27-case snapshot matrix (three mutations × three lifecycle job types ×
+  queued/running/waiting) rejects before Proxmox. All three cleanup cases reject, all
+  three unauthorized cases fail before the deployment lock, and rejected paths reclaim
+  the registry entry.
+- For each snapshot mutation, deterministic registered-waiter tests block both rebuild
+  and destroy until snapshot Proxmox work and commit finish. The reverse ordering holds
+  each lifecycle admission at its commit boundary, registers the snapshot waiter, then
+  proves the snapshot observes the committed job and returns HTTP 409 without Proxmox.
+  All cases assert lock reclamation. A blocked snapshot on one deployment does not
+  prevent lifecycle admission for another deployment.
+- Round 1 rendezvous tests now observe the real registry owner/waiter count before their
+  events fire, removing the pre-registration scheduling gap. Reverse-order power cases
+  now also assert registry reclamation after HTTP 409.
+- Focused Waves 16, 35, 36, 37, and 39 Python passed, covering legacy snapshot
+  create/list/delete/rollback and rollback auto-start as well as lifecycle/detail state.
+  Both rendered UI suites passed.
+- Fresh verification passed `39/39` Python wave scripts, `2/2` UI behavior suites,
+  `20/20` JavaScript syntax checks, Python compilation, diff validation, and the setup
+  and disclosure scans.
+
 ## Scope and outcome
 
 - Direct start, stop, and restart now perform the existing ownership lookup first,
@@ -64,7 +109,8 @@ Reviewer round 1 baseline: `c8b87b7c05726a7ecddc87f733aa6f0133e15ad6`
   active-job map is stale, without a misleading working overlay or job chip.
 - One shared UI predicate defines `working` and `cleanup_pending` as lifecycle-locked.
   VM detail renders `Cleanup pending` and its exact error while omitting VM power and
-  delete controls. Normal running/stopped detail controls remain unchanged.
+  delete controls. It also omits snapshot mutations while retaining snapshot viewing.
+  Normal running/stopped detail controls remain unchanged.
 - Dashboard table rows and cards omit selection and lifecycle actions for locked VMs.
   Select-all, selected count, bulk confirmation copy, and bulk execution use only VMs
   that are currently unlocked; execution re-filters a mixed/stale selection.
@@ -130,3 +176,6 @@ Initial requested commit message: `fix: lock VM actions during lifecycle work`.
 
 Reviewer round 1 requested commit message:
 `fix: serialize VM power and lifecycle admission`.
+
+Reviewer round 2 requested commit message:
+`fix: guard snapshot mutations during lifecycle work`.

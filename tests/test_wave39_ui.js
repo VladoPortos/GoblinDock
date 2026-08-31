@@ -1237,9 +1237,21 @@ function lifecycleDetailHarness(detail) {
     UI: {
       isVmLifecycleLocked: window.UI.isVmLifecycleLocked,
       OSGlyph() {}, ConfirmModal() {}, StatusBadge() {}, FormModal() {}, Field() {},
-      Toggle() {}, Menu() {}, copyToClipboard() {}, readClipboard() {},
+      Toggle() {},
+      Menu(props) {
+        return HarnessReact.createElement('div', { 'data-snapshot-menu': true }, props.children,
+          (props.items || []).filter((item) => !item.sep).map((item) => HarnessReact.createElement(
+            'button', { key: item.label, onClick: item.onClick }, item.label,
+          )));
+      },
+      copyToClipboard() {}, readClipboard() {},
       fmtBytes(value) { return String(value); },
-      useFetched() { return { error: true }; },
+      useFetched() {
+        return { snapshots: [{
+          name: 'visible-snapshot', description: 'safe to view', created: 'now',
+          vmstate: false, current: true,
+        }] };
+      },
     },
   };
   vm.runInNewContext(vmDetailSource, {
@@ -1273,6 +1285,10 @@ for (const [status, label, exactError] of [
     `${status} detail must not render lifecycle controls`);
   assert.equal(buttons.some((button) => button.props['aria-label'] === 'Delete VM'), false,
     `${status} detail must not render Delete VM`);
+  assert.ok(textOf(tree).includes('visible-snapshot'),
+    `${status} detail must keep snapshot viewing available`);
+  assert.equal(buttons.some((button) => ['Take snapshot', 'Roll back', 'Delete'].includes(textOf(button))), false,
+    `${status} detail must not render snapshot mutation controls`);
 }
 
 const runningDetail = lifecycleDetailHarness(detailFixture('running', {
@@ -1287,6 +1303,10 @@ assert.ok(findAll(runningDetail, (node) => node.type === 'button' && textOf(node
 assert.ok(findAll(runningDetail, (node) => node.type === 'button'
   && node.props['aria-label'] === 'Delete VM').length,
   'ordinary running detail must retain Delete VM');
+for (const label of ['Take snapshot', 'Roll back', 'Delete']) {
+  assert.ok(findAll(runningDetail, (node) => node.type === 'button' && textOf(node) === label).length,
+    `ordinary running detail must retain snapshot ${label}`);
+}
 const stoppedDetail = lifecycleDetailHarness(detailFixture('stopped', { status: 'stopped' }));
 assert.ok(findAll(stoppedDetail, (node) => node.type === 'button' && textOf(node) === 'Start').length,
   'ordinary stopped detail must retain Start');
@@ -1297,6 +1317,10 @@ assert.ok(findAll(stoppedDetail, (node) => node.type === 'button' && textOf(node
 assert.ok(findAll(stoppedDetail, (node) => node.type === 'button'
   && node.props['aria-label'] === 'Delete VM').length,
   'ordinary stopped detail must retain Delete VM');
+for (const label of ['Take snapshot', 'Roll back', 'Delete']) {
+  assert.ok(findAll(stoppedDetail, (node) => node.type === 'button' && textOf(node) === label).length,
+    `ordinary stopped detail must retain snapshot ${label}`);
+}
 
 assert.equal(typeof window.UI.isVmLifecycleLocked, 'function',
   'the UI must expose one shared lifecycle-lock predicate');
