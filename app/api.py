@@ -43,7 +43,13 @@ from .models import (
     utcnow,
 )
 from .proxmox import Proxmox, base_disk_filename
-from .recipes import ask_map, compile_playbook, lint_block, load_recipe
+from .recipes import (
+    ask_map,
+    compile_playbook,
+    lint_block,
+    load_recipe,
+    validate_public_sensitive_inputs,
+)
 from . import backup
 from . import statebus
 from .security import (
@@ -697,6 +703,73 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
     return json.dumps(cleaned)
 
 
+def _validate_cross_owner_execution_plan(plan: dict) -> None:
+    """Admit a cross-owner plan using only its immutable block-schema snapshots."""
+    try:
+        template_owner_id = plan["template_owner_id"]
+        deployment_owner_id = plan["deployment_owner_id"]
+    except (KeyError, TypeError):
+        raise HTTPException(409, "template execution plan is invalid")
+    if template_owner_id == deployment_owner_id:
+        return
+    schemas_by_ref = {}
+    try:
+        for ref, snapshot in plan["blocks"].items():
+            schema = json.loads(snapshot["input_schema_json"] or "[]")
+            if not isinstance(schema, list):
+                raise ValueError
+            schemas_by_ref[ref] = schema
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(409, "template execution plan has an unavailable block schema")
+    try:
+        validate_public_sensitive_inputs(
+            plan["recipe"], schemas_by_ref,
+            deploy_inputs=plan["deploy_inputs"], cross_owner=True, reject_unknown=True,
+        )
+    except (KeyError, TypeError):
+        raise HTTPException(409, "template execution plan is invalid")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+
+def _missing_execution_plan_ref(session: Session, template: Template) -> Optional[str]:
+    refs = {
+        placed.get("ref")
+        for section in load_recipe(template.recipe_json)
+        if isinstance(section, dict)
+        for placed in (section.get("blocks") or [])
+        if isinstance(placed, dict) and isinstance(placed.get("ref"), str)
+    }
+    if not refs:
+        return None
+    known = {
+        block.key for block in session.exec(select(Block).where(Block.key.in_(refs))).all()
+    }
+    return sorted(refs - known)[0] if refs - known else None
+
+
+def _build_admitted_execution_plan(
+    session: Session,
+    template: Template,
+    deployment_owner_id: Optional[int],
+    deploy_inputs_json: str,
+) -> str:
+    try:
+        plan = build_execution_plan(
+            session, template, deployment_owner_id, deploy_inputs_json,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        missing = _missing_execution_plan_ref(session, template)
+        detail = (f"block {missing!r} is unavailable" if missing
+                  else "template execution plan is invalid")
+        raise HTTPException(409, detail)
+    _validate_cross_owner_execution_plan(plan)
+    try:
+        return seal_execution_plan(plan)
+    except (TypeError, ValueError):
+        raise HTTPException(409, "template execution plan is invalid")
+
+
 def _auto_name(session: Session, base: str = "gd") -> str:
     n = 1
     existing = {d.name for d in session.exec(select(Deployment)).all()}
@@ -752,6 +825,9 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
         raise HTTPException(400, "template has no location — edit it and pick a Proxmox connection")
 
     deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs)
+    execution_plan_enc = _build_admitted_execution_plan(
+        session, tpl, user.id, deploy_inputs_json,
+    )
 
     # The connection's per-VM ceiling is authoritative; 0 = unlimited for that
     # dimension (CPU, RAM and disk all behave identically). A connection is required
@@ -780,10 +856,6 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
                      deploy_inputs_json=deploy_inputs_json)
     session.add(dep)
     session.flush()
-
-    execution_plan_enc = seal_execution_plan(
-        build_execution_plan(session, tpl, user.id, deploy_inputs_json)
-    )
 
     job = Job(type="deploy", title=f"Deploying {name}", deployment_id=dep.id,
               connection_id=conn.id, created_by=user.id, status="queued",
@@ -851,6 +923,9 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     base = session.get(Image, tpl.base_image_id) if tpl and tpl.base_image_id else None
     if not base or base.kind != "base":
         raise HTTPException(400, "template has no base image — edit it first")
+    execution_plan_enc = _build_admitted_execution_plan(
+        session, tpl, dep.owner_id, dep.deploy_inputs_json,
+    )
     dep.status = "working"
     dep.cleanup_origin = None
     dep.cleanup_last_attempt_at = None
@@ -860,9 +935,6 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     # it looks up the deployment_id and returns the same IP, so no new address is
     # allocated and the VM keeps its reserved static IP after the rebuild.
     net = session.get(Network, dep.network_id) if dep.network_id else None
-    execution_plan_enc = seal_execution_plan(
-        build_execution_plan(session, tpl, dep.owner_id, dep.deploy_inputs_json)
-    )
     job = Job(type="rebuild", title=f"Rebuilding {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
               context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id),
@@ -1459,6 +1531,30 @@ def _validate_recipe(session: Session, recipe: list, user: User) -> None:
                 raise HTTPException(400, f"recipe block {si}.{bi}.inputs must be an object")
 
 
+def _validate_public_recipe_sensitive_inputs(session: Session, recipe: list) -> None:
+    refs = {
+        placed.get("ref")
+        for section in recipe if isinstance(section, dict)
+        for placed in (section.get("blocks") or [])
+        if isinstance(placed, dict) and isinstance(placed.get("ref"), str)
+    }
+    rows = session.exec(select(Block).where(Block.key.in_(refs))).all() if refs else []
+    schemas_by_ref = {}
+    for block in rows:
+        try:
+            schema = json.loads(block.input_schema_json or "[]")
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if isinstance(schema, list):
+            schemas_by_ref[block.key] = schema
+    try:
+        validate_public_sensitive_inputs(
+            recipe, schemas_by_ref, reject_unknown=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:
     """Resolve baseImageId/connectionId/networkId or 400. The network must belong
     to the template's connection — deploys use them together."""
@@ -1486,6 +1582,8 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
 @router.post("/templates")
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     _validate_recipe(session, body.recipe, user)
+    if body.public:
+        _validate_public_recipe_sensitive_inputs(session, body.recipe)
     bid, cid, nid = _validate_template_refs(session, body)
     # Store the authored sizes verbatim. The per-VM ceiling is enforced at deploy
     # time from the connection (0 = unlimited), so a template default is never
@@ -1525,6 +1623,8 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
     if not _template_owned(rc, user):
         raise HTTPException(403, "not yours")
     _validate_recipe(session, body.recipe, user)
+    if body.public:
+        _validate_public_recipe_sensitive_inputs(session, body.recipe)
     rc.name = body.name.strip() or rc.name
     rc.description = body.description
     rc.os_family = body.os_family

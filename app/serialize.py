@@ -287,15 +287,25 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
             if not isinstance(b, dict):
                 continue
             blk = blocks.get(b.get("ref"))
-            if not blk:
-                continue
-            try:
-                schema = json.loads(blk.input_schema_json or "[]")
-            except (json.JSONDecodeError, TypeError):
+            inputs = b.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                inputs = {}
+            schema = None
+            if blk:
+                try:
+                    parsed = json.loads(blk.input_schema_json or "[]")
+                    if isinstance(parsed, list):
+                        schema = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if schema is None:
+                for name, value in inputs.items():
+                    if value:
+                        inputs[name] = "********"
+                b["inputs"] = inputs
                 continue
             pw_fields = {f.get("name") for f in schema
                          if isinstance(f, dict) and f.get("type") in ("password", "secret")}
-            inputs = b.get("inputs") or {}
             for name in pw_fields:
                 if inputs.get(name):
                     inputs[name] = "********"

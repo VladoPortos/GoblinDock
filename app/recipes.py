@@ -19,6 +19,7 @@ from .models import Block
 
 # {{ secrets.NAME }} (encrypted, masked) and {{ variable.NAME }} (plaintext, visible)
 _REF_RE = re.compile(r"\{\{\s*(secrets|variable)\.([A-Za-z0-9_]+)\s*\}\}")
+_DEPLOYER_SECRET_REF_RE = re.compile(r"^\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}$")
 
 
 _PLACEHOLDER_RE = re.compile(r"(?P<indent>[^\S\n]*)\{(?P<key>[A-Za-z0-9_]+)\}")
@@ -122,12 +123,88 @@ def mask_secrets(text: str) -> str:
     return _REF_RE.sub(lambda m: f"<{'secret' if m.group(1) == 'secrets' else 'variable'} {m.group(2)}>", text)
 
 
+def is_deployer_secret_ref(value: object) -> bool:
+    """Return true only for one complete ``{{ secrets.NAME }}`` reference."""
+    return isinstance(value, str) and _DEPLOYER_SECRET_REF_RE.fullmatch(value) is not None
+
+
 def load_recipe(recipe_json: str) -> list[dict]:
     try:
         data = json.loads(recipe_json or "[]")
         return data if isinstance(data, list) else []
     except (json.JSONDecodeError, TypeError):
         return []
+
+
+def validate_public_sensitive_inputs(
+    recipe,
+    schemas_by_ref,
+    *,
+    deploy_inputs=None,
+    cross_owner=False,
+    reject_unknown=False,
+) -> None:
+    """Reject author-supplied literals from public/cross-owner sensitive inputs.
+
+    ``schemas_by_ref`` contains immutable schema lists keyed by block reference. During
+    cross-owner admission, a sensitive ask-on-deploy field must have an answer at its
+    exact placement address; the merged recipe value is then deployer-supplied and may
+    be literal. Non-ask sensitive values may only be blank or a deployer-scoped secret
+    reference. Error messages intentionally contain block/field names only.
+    """
+    schemas_by_ref = schemas_by_ref if isinstance(schemas_by_ref, dict) else {}
+    deploy_inputs = deploy_inputs if isinstance(deploy_inputs, dict) else {}
+    if not isinstance(recipe, list):
+        raise ValueError("recipe is unavailable")
+    for si, section in enumerate(recipe):
+        if not isinstance(section, dict):
+            continue
+        placements = section.get("blocks") or []
+        if not isinstance(placements, list):
+            continue
+        for bi, placed in enumerate(placements):
+            if not isinstance(placed, dict):
+                continue
+            ref = placed.get("ref")
+            schema = schemas_by_ref.get(ref)
+            if not isinstance(ref, str) or not isinstance(schema, list):
+                if reject_unknown:
+                    block_name = ref if isinstance(ref, str) and ref else f"{si}.{bi}"
+                    raise ValueError(f"block {block_name!r} is unavailable")
+                continue
+            sensitive = {
+                field.get("name") for field in schema
+                if isinstance(field, dict)
+                and isinstance(field.get("name"), str)
+                and field.get("type") in ("password", "secret")
+            }
+            if not sensitive:
+                continue
+            inputs = placed.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                inputs = {}
+            asks = {
+                name for name in (placed.get("ask") or [])
+                if isinstance(name, str)
+            }
+            answers = deploy_inputs.get(f"{si}.{bi}") or {}
+            if not isinstance(answers, dict):
+                answers = {}
+            for name in sorted(sensitive):
+                if cross_owner and name in asks:
+                    answer = answers.get(name)
+                    if name not in answers or answer in (None, ""):
+                        raise ValueError(
+                            f"block {ref!r} field {name!r} requires a deploy-time answer"
+                        )
+                    continue
+                value = inputs.get(name)
+                if value in (None, "") or is_deployer_secret_ref(value):
+                    continue
+                raise ValueError(
+                    f"block {ref!r} field {name!r} must use ask-on-deploy "
+                    "or a deployer secret reference"
+                )
 
 
 def _placed_blocks(recipe):

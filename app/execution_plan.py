@@ -20,6 +20,10 @@ _BLOCK_FIELDS = (
     "key", "kind", "name", "description", "category", "icon", "section", "phase",
     "input_schema_json", "ansible_template", "cloudinit_template", "owner_id", "builtin",
 )
+_LEGACY_PLAN_FIELDS = {"version", "owner_id", "recipe", "blocks", "deploy_inputs"}
+_PLAN_FIELDS = _LEGACY_PLAN_FIELDS | {
+    "sensitive_fields", "template_owner_id", "deployment_owner_id",
+}
 
 
 def _invalid() -> None:
@@ -58,14 +62,18 @@ def _recipe_block_refs(recipe: list) -> set[str]:
 
 
 def _validate_plan(plan: object) -> dict:
-    if not isinstance(plan, dict) or set(plan) != {
-        "version", "owner_id", "recipe", "blocks", "deploy_inputs",
-    }:
+    if not isinstance(plan, dict) or set(plan) not in (_LEGACY_PLAN_FIELDS, _PLAN_FIELDS):
         _invalid()
     if plan["version"] != 1 or isinstance(plan["version"], bool):
         _invalid()
     if not _is_owner_id(plan["owner_id"]):
         _invalid()
+    current = set(plan) == _PLAN_FIELDS
+    if current:
+        if (not _is_owner_id(plan["template_owner_id"])
+                or not _is_owner_id(plan["deployment_owner_id"])
+                or plan["owner_id"] != plan["deployment_owner_id"]):
+            _invalid()
     recipe = plan["recipe"]
     blocks = plan["blocks"]
     deploy_inputs = plan["deploy_inputs"]
@@ -74,6 +82,7 @@ def _validate_plan(plan: object) -> dict:
     refs = _recipe_block_refs(recipe)
     if set(blocks) != refs:
         _invalid()
+    derived_sensitive: dict[str, list[str]] = {}
     for key, snapshot in blocks.items():
         if not isinstance(key, str) or not key or not isinstance(snapshot, dict):
             _invalid()
@@ -87,6 +96,11 @@ def _validate_plan(plan: object) -> dict:
             _invalid()
         if not isinstance(schema, list) or not all(isinstance(field, dict) for field in schema):
             _invalid()
+        derived_sensitive[key] = sorted({
+            field.get("name") for field in schema
+            if isinstance(field.get("name"), str)
+            and field.get("type") in ("password", "secret")
+        })
         if not isinstance(snapshot["ansible_template"], str) or not isinstance(snapshot["cloudinit_template"], str):
             _invalid()
         if not _is_owner_id(snapshot["owner_id"]):
@@ -96,6 +110,8 @@ def _validate_plan(plan: object) -> dict:
         for field in ("kind", "name", "description", "category", "icon", "section", "phase"):
             if not isinstance(snapshot[field], str):
                 _invalid()
+    if current and plan["sensitive_fields"] != derived_sensitive:
+        _invalid()
     return plan
 
 
@@ -120,11 +136,23 @@ def build_execution_plan(session: Session, template: Template, deployment_owner_
         block.key: {field: getattr(block, field) for field in _BLOCK_FIELDS}
         for block in rows
     }
+    sensitive_fields = {}
+    for key, snapshot in blocks.items():
+        schema = json.loads(snapshot["input_schema_json"] or "[]")
+        sensitive_fields[key] = sorted({
+            field.get("name") for field in schema
+            if isinstance(field, dict)
+            and isinstance(field.get("name"), str)
+            and field.get("type") in ("password", "secret")
+        })
     return _validate_plan({
         "version": 1,
         "owner_id": deployment_owner_id,
+        "template_owner_id": template.owner_id,
+        "deployment_owner_id": deployment_owner_id,
         "recipe": recipe,
         "blocks": blocks,
+        "sensitive_fields": sensitive_fields,
         "deploy_inputs": deploy_inputs,
     })
 
