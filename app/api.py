@@ -18,7 +18,7 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_, update
 from sqlmodel import Session, select
 
 from .config import settings
@@ -445,6 +445,29 @@ _LOCK_THRESHOLD = 5      # consecutive failures before a temporary lock
 _LOCK_MINUTES = 15
 
 
+def _record_account_login_failure(session: Session, user_id: int, now: datetime) -> None:
+    next_failures = func.coalesce(User.failed_logins, 0) + 1
+    session.exec(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            failed_logins=case(
+                (next_failures >= _LOCK_THRESHOLD, 0),
+                else_=next_failures,
+            ),
+            locked_until=case(
+                (
+                    next_failures >= _LOCK_THRESHOLD,
+                    now + timedelta(minutes=_LOCK_MINUTES),
+                ),
+                else_=User.locked_until,
+            ),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    session.commit()
+
+
 @router.post("/auth/login")
 def login(body: LoginBody, request: Request, session: Session = Depends(get_session)):
     ip = client_ip(request) or "?"
@@ -462,12 +485,7 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     if not user or user.disabled or not verify_password(body.password, user.password_hash):
         _record_attempt(key)
         if user and not user.disabled:
-            user.failed_logins = (user.failed_logins or 0) + 1
-            if user.failed_logins >= _LOCK_THRESHOLD:
-                user.locked_until = utcnow() + timedelta(minutes=_LOCK_MINUTES)
-                user.failed_logins = 0
-            session.add(user)
-            session.commit()
+            _record_account_login_failure(session, user.id, utcnow())
         raise HTTPException(401, "invalid email or password")
     _login_attempts.pop(key, None)
     user.failed_logins = 0

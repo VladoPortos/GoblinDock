@@ -4,6 +4,8 @@ import json
 import os
 import sys
 import tempfile
+import threading
+from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -24,11 +26,84 @@ from app import api, execution_plan, recipes, seed  # noqa: E402
 from app import serialize as S                     # noqa: E402
 from app.models import (                           # noqa: E402
     Block, Connection, Deployment, Image, IpAllocation, Job, Network, Template,
-    User,
+    User, ensure_utc, utcnow,
 )
 from app.security import encrypt, hash_password    # noqa: E402
 
 init_db()
+
+
+def test_first_admin_setup_contract_is_unchanged():
+    request = SimpleNamespace(session={})
+    with Session(engine) as s:
+        out = api.auth_setup(
+            api.SetupBody(
+                email="admin@example.com", name="Admin", password="StrongPass12!",
+            ),
+            request,
+            s,
+        )
+
+    assert out["ok"] and request.session["uid"]
+
+
+def _run_synchronized_wrong_passwords(*, count, distinct_ips):
+    email = f"w38-lockout-{os.urandom(3).hex()}@example.com"
+    user_id = _mk_user(email)
+    barrier = threading.Barrier(count)
+    original_verify_password = api.verify_password
+    outcomes = [None] * count
+
+    def synchronized_wrong_password(_password, _password_hash):
+        barrier.wait(timeout=2)
+        return False
+
+    def attempt(index):
+        ip = f"192.0.2.{index + 1}" if distinct_ips else "192.0.2.1"
+        request = SimpleNamespace(
+            session={}, client=SimpleNamespace(host=ip), headers={},
+        )
+        with Session(engine) as s:
+            try:
+                api.login(
+                    api.LoginBody(email=email, password="WrongPass12!"),
+                    request,
+                    s,
+                )
+            except HTTPException as exc:
+                outcomes[index] = exc.status_code
+            else:
+                outcomes[index] = "authenticated"
+
+    threads = [
+        threading.Thread(target=attempt, args=(index,), daemon=True)
+        for index in range(count)
+    ]
+    api.verify_password = synchronized_wrong_password
+    try:
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join(timeout=5)
+    finally:
+        api.verify_password = original_verify_password
+
+    assert not [thread for thread in threads if thread.is_alive()], \
+        "concurrent login attempts did not finish within five seconds"
+    assert outcomes == [401] * count, outcomes
+    return user_id
+
+
+def test_five_concurrent_failures_lock_account():
+    for _attempt in range(3):
+        user_id = _run_synchronized_wrong_passwords(count=5, distinct_ips=True)
+        with Session(engine) as s:
+            user = s.get(User, user_id)
+            locked_until = ensure_utc(user.locked_until)
+            assert locked_until and locked_until > utcnow(), (
+                f"five concurrent failures left failed_logins={user.failed_logins} "
+                f"and locked_until={user.locked_until!r}"
+            )
 
 
 def _legacy_template(inputs, ask, *, legacy_block=False):
@@ -893,6 +968,8 @@ def test_console_grant_is_a_frozen_snapshot():
 
 
 if __name__ == "__main__":
+    test_first_admin_setup_contract_is_unchanged()
+    test_five_concurrent_failures_lock_account()
     test_seed_migrates_b_ssh_before_pruning()
     test_custom_block_create_and_edit_canonicalize_omitted_type()
     test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan()
