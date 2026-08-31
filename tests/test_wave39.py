@@ -3,6 +3,9 @@ import base64
 import hashlib
 import json
 import os
+import posixpath
+import re
+import shutil
 import sys
 import tempfile
 from html.parser import HTMLParser
@@ -31,49 +34,330 @@ init_db()
 
 
 class _SriResourceParser(HTMLParser):
-    """Collect local resources whose exact response bytes are SRI-protected."""
+    """Preserve resource declarations, including duplicate HTML attributes."""
 
     def __init__(self):
         super().__init__()
-        self.resources = []
+        self.elements = []
 
-    def handle_starttag(self, _tag, attrs):
-        attributes = dict(attrs)
-        integrity = attributes.get("integrity", "")
-        if not integrity.startswith("sha384-"):
-            return
+    def handle_starttag(self, tag, attrs):
+        if any(name in {"src", "href"} for name, _value in attrs):
+            self.elements.append((tag, attrs))
 
-        for attribute in ("src", "href"):
-            reference = attributes.get(attribute)
+
+_SHA384_INTEGRITY = re.compile(r"sha384-[A-Za-z0-9+/]{64}")
+
+
+def _sri_validation_errors(index_html, web_root):
+    """Validate local vendored SRI declarations and exact response bytes."""
+    parser = _SriResourceParser()
+    parser.feed(index_html)
+
+    errors = []
+    web_root = web_root.resolve()
+    vendor_root = (web_root / "vendor").resolve()
+    referenced_vendor_paths = []
+    seen_vendor_paths = set()
+
+    for tag, attrs in parser.elements:
+        attribute_values = {
+            name: [value or "" for attr_name, value in attrs if attr_name == name]
+            for name in ("src", "href", "integrity")
+        }
+        for name, values in attribute_values.items():
+            if len(values) > 1:
+                errors.append(f"<{tag}> has duplicate {name} attribute")
+
+        references = [
+            (name, value or "")
+            for name, value in attrs
+            if name in {"src", "href"}
+        ]
+        for _attribute_name, reference in references:
             if not reference or reference.startswith("//"):
                 continue
+
             parsed = urlsplit(reference)
-            if parsed.scheme or parsed.netloc or not parsed.path:
+            if parsed.scheme.lower() in {"http", "https"}:
                 continue
-            self.resources.append((unquote(parsed.path), integrity))
+
+            decoded_path = unquote(parsed.path)
+            if "\\" in reference or "\\" in decoded_path:
+                errors.append(f"{reference}: local resource path contains a backslash")
+                continue
+            if parsed.scheme or parsed.netloc or not decoded_path:
+                continue
+
+            normalized_path = posixpath.normpath(decoded_path.lstrip("/"))
+            asset_path = (web_root / normalized_path).resolve()
+            try:
+                relative_path = asset_path.relative_to(web_root).as_posix()
+            except ValueError:
+                errors.append(f"{reference}: local resource path escapes web root")
+                continue
+
+            if not (
+                relative_path == "vendor" or relative_path.startswith("vendor/")
+            ):
+                continue
+            try:
+                asset_path.relative_to(vendor_root)
+            except ValueError:
+                errors.append(f"{reference}: vendor resource path escapes vendor root")
+                continue
+
+            referenced_vendor_paths.append(relative_path)
+            if relative_path in seen_vendor_paths:
+                errors.append(
+                    f"{reference}: duplicate protected vendor path {relative_path}"
+                )
+            seen_vendor_paths.add(relative_path)
+
+            integrity_values = attribute_values["integrity"]
+            if not integrity_values:
+                errors.append(
+                    f"{reference}: requires exactly one SHA-384 integrity attribute"
+                )
+                continue
+            if len(integrity_values) != 1:
+                continue
+
+            expected_integrity = integrity_values[0]
+            if _SHA384_INTEGRITY.fullmatch(expected_integrity) is None:
+                errors.append(
+                    f"{reference}: requires one well-formed SHA-384 integrity value"
+                )
+                continue
+
+            try:
+                asset_bytes = asset_path.read_bytes()
+            except OSError as exc:
+                errors.append(f"{reference}: unable to read asset: {exc}")
+                continue
+            actual_integrity = "sha384-" + base64.b64encode(
+                hashlib.sha384(asset_bytes).digest()
+            ).decode("ascii")
+            if actual_integrity != expected_integrity:
+                errors.append(
+                    f"{reference}: expected {expected_integrity}, got {actual_integrity}"
+                )
+
+    actual_vendor_paths = {
+        path.relative_to(web_root).as_posix()
+        for path in vendor_root.rglob("*")
+        if path.is_file()
+    }
+    referenced_vendor_path_set = set(referenced_vendor_paths)
+    if referenced_vendor_path_set != actual_vendor_paths:
+        missing = sorted(actual_vendor_paths - referenced_vendor_path_set)
+        unexpected = sorted(referenced_vendor_path_set - actual_vendor_paths)
+        errors.append(
+            f"vendor coverage mismatch: missing={missing}, unexpected={unexpected}"
+        )
+    return errors
+
+
+def _replace_once(text, old, new):
+    assert text.count(old) == 1, old
+    return text.replace(old, new, 1)
+
+
+def _sha384_integrity(path):
+    return "sha384-" + base64.b64encode(
+        hashlib.sha384(path.read_bytes()).digest()
+    ).decode("ascii")
+
+
+def _assert_sri_rejected(index_html, expected_error):
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    errors = _sri_validation_errors(index_html, web_root)
+    assert any(expected_error in error for error in errors), errors
+
+
+def test_sri_rejects_local_vendor_resource_without_integrity():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    mutated = _replace_once(
+        index_html,
+        "</head>",
+        '  <script src="vendor/future.js"></script>\n</head>',
+    )
+    _assert_sri_rejected(mutated, "exactly one SHA-384 integrity")
+
+
+def test_sri_rejects_local_vendor_resource_with_sha256_only():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    mutated = _replace_once(
+        index_html,
+        "</head>",
+        f'  <script src="vendor/future.js" integrity="sha256-{"A" * 44}"></script>\n</head>',
+    )
+    _assert_sri_rejected(mutated, "well-formed SHA-384 integrity")
+
+
+def test_sri_rejects_duplicate_resource_replacing_distinct_vendor_asset():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    react = (
+        '<script src="vendor/react.production.min.js" '
+        'integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z" '
+        'crossorigin="anonymous"></script>'
+    )
+    react_dom = (
+        '<script src="vendor/react-dom.production.min.js" '
+        'integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" '
+        'crossorigin="anonymous"></script>'
+    )
+    mutated = _replace_once(index_html, react_dom, react)
+    _assert_sri_rejected(mutated, "duplicate protected vendor path")
+
+
+def test_sri_rejects_duplicate_integrity_attribute_bad_first_good_second():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    good = "sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"
+    mutated = _replace_once(
+        index_html,
+        f'integrity="{good}"',
+        f'integrity="sha384-{"A" * 64}" integrity="{good}"',
+    )
+    _assert_sri_rejected(mutated, "duplicate integrity attribute")
+
+
+def test_sri_rejects_duplicate_src_attribute_bad_first_good_second():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    mutated = _replace_once(
+        index_html,
+        'src="vendor/react.production.min.js"',
+        'src="vendor/not-react.js" src="vendor/react.production.min.js"',
+    )
+    _assert_sri_rejected(mutated, "duplicate src attribute")
+
+
+def test_sri_rejects_duplicate_href_attribute_bad_first_good_second():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    mutated = _replace_once(
+        index_html,
+        'href="vendor/xterm/xterm.css"',
+        'href="vendor/not-xterm.css" href="vendor/xterm/xterm.css"',
+    )
+    _assert_sri_rejected(mutated, "duplicate href attribute")
+
+
+def test_sri_rejects_parent_traversal_outside_web_root():
+    repository_root = Path(__file__).resolve().parent.parent
+    web_root = repository_root / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    react_dom = (
+        '<script src="vendor/react-dom.production.min.js" '
+        'integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" '
+        'crossorigin="anonymous"></script>'
+    )
+    traversal = (
+        f'<script src="../README.md" integrity="{_sha384_integrity(repository_root / "README.md")}" '
+        'crossorigin="anonymous"></script>'
+    )
+    mutated = _replace_once(index_html, react_dom, traversal)
+    _assert_sri_rejected(mutated, "escapes web root")
+
+
+def test_sri_rejects_percent_encoded_parent_traversal():
+    repository_root = Path(__file__).resolve().parent.parent
+    web_root = repository_root / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    react_dom = (
+        '<script src="vendor/react-dom.production.min.js" '
+        'integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1" '
+        'crossorigin="anonymous"></script>'
+    )
+    traversal = (
+        f'<script src="%2e%2e/README.md" integrity="{_sha384_integrity(repository_root / "README.md")}" '
+        'crossorigin="anonymous"></script>'
+    )
+    mutated = _replace_once(index_html, react_dom, traversal)
+    _assert_sri_rejected(mutated, "escapes web root")
+
+
+def test_sri_rejects_backslash_vendor_reference():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    mutated = _replace_once(
+        index_html,
+        'src="vendor/react-dom.production.min.js" '
+        'integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"',
+        'src="vendor\\react.production.min.js" '
+        'integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"',
+    )
+    _assert_sri_rejected(mutated, "backslash")
+
+
+def test_sri_rejects_windows_device_unc_style_reference():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    react_path = (web_root / "vendor/react.production.min.js").resolve()
+    device_path = "\\\\?\\" + str(react_path)
+    mutated = _replace_once(
+        index_html,
+        'src="vendor/react-dom.production.min.js" '
+        'integrity="sha384-gTGxhz21lVGYNMcdJOyq01Edg0jhn/c22nsx0kyqP0TxaV5WVdsSH1fSDUf5YJj1"',
+        f'src="{device_path}" '
+        'integrity="sha384-DGyLxAyjq0f9SPpVevD6IgztCFlnMF6oW/XQGmfe+IsZ8TqEiDrcHkMLKI6fiB/Z"',
+    )
+    _assert_sri_rejected(mutated, "backslash")
+
+
+def test_sri_intentionally_skips_external_http_and_protocol_relative_assets():
+    web_root = Path(__file__).resolve().parent.parent / "web"
+    index_html = (web_root / "index.html").read_text(encoding="utf-8")
+    mutated = _replace_once(
+        index_html,
+        "</head>",
+        '  <script src="https://cdn.example/vendor/external.js"></script>\n'
+        '  <link href="//cdn.example/vendor/external.css" rel="stylesheet">\n</head>',
+    )
+    assert _sri_validation_errors(mutated, web_root) == []
+
+
+def test_sri_reports_exact_pre_fix_six_crlf_mismatches():
+    repository_root = Path(__file__).resolve().parent.parent
+    web_root = repository_root / "web"
+    expected = {
+        "vendor/xterm/xterm.css",
+        "vendor/novnc/rfb.js",
+        "vendor/react.production.min.js",
+        "vendor/react-dom.production.min.js",
+        "vendor/xterm/xterm.js",
+        "vendor/xterm/xterm-addon-fit.js",
+    }
+    with tempfile.TemporaryDirectory() as temporary_directory:
+        fixture_web_root = Path(temporary_directory) / "web"
+        shutil.copytree(web_root, fixture_web_root)
+        for relative_path in expected:
+            path = fixture_web_root / relative_path
+            lf_bytes = path.read_bytes().replace(b"\r\n", b"\n")
+            path.write_bytes(lf_bytes.replace(b"\n", b"\r\n"))
+
+        errors = _sri_validation_errors(
+            (fixture_web_root / "index.html").read_text(encoding="utf-8"),
+            fixture_web_root,
+        )
+
+    mismatched_paths = {error.split(":", 1)[0] for error in errors}
+    assert mismatched_paths == expected, errors
 
 
 def test_local_sri_resources_match_exact_working_tree_bytes():
     """Checkout filters must not change bytes protected by browser SRI."""
     repository_root = Path(__file__).resolve().parent.parent
     web_root = repository_root / "web"
-    parser = _SriResourceParser()
-    parser.feed((web_root / "index.html").read_text(encoding="utf-8"))
+    errors = _sri_validation_errors(
+        (web_root / "index.html").read_text(encoding="utf-8"), web_root
+    )
 
-    assert len(parser.resources) == 11, parser.resources
-
-    mismatches = []
-    for reference, expected_integrity in parser.resources:
-        asset_path = web_root / reference.lstrip("/")
-        actual_integrity = "sha384-" + base64.b64encode(
-            hashlib.sha384(asset_path.read_bytes()).digest()
-        ).decode("ascii")
-        if actual_integrity != expected_integrity:
-            mismatches.append(
-                f"{reference}: expected {expected_integrity}, got {actual_integrity}"
-            )
-
-    assert not mismatches, "SRI mismatch for local assets:\n" + "\n".join(mismatches)
+    assert not errors, "SRI validation failed:\n" + "\n".join(errors)
 
 
 def test_connection_admin_round_trip_and_public_redaction():
@@ -139,6 +423,18 @@ def test_connection_admin_round_trip_and_public_redaction():
 
 
 if __name__ == "__main__":
+    test_sri_rejects_local_vendor_resource_without_integrity()
+    test_sri_rejects_local_vendor_resource_with_sha256_only()
+    test_sri_rejects_duplicate_resource_replacing_distinct_vendor_asset()
+    test_sri_rejects_duplicate_integrity_attribute_bad_first_good_second()
+    test_sri_rejects_duplicate_src_attribute_bad_first_good_second()
+    test_sri_rejects_duplicate_href_attribute_bad_first_good_second()
+    test_sri_rejects_parent_traversal_outside_web_root()
+    test_sri_rejects_percent_encoded_parent_traversal()
+    test_sri_rejects_backslash_vendor_reference()
+    test_sri_rejects_windows_device_unc_style_reference()
+    test_sri_intentionally_skips_external_http_and_protocol_relative_assets()
+    test_sri_reports_exact_pre_fix_six_crlf_mismatches()
     test_local_sri_resources_match_exact_working_tree_bytes()
     test_connection_admin_round_trip_and_public_redaction()
     print("\nALL WAVE 39 UNIT TESTS PASSED")
