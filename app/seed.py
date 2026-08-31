@@ -6,7 +6,7 @@ from __future__ import annotations
 import json
 from copy import deepcopy
 
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from .config import settings
 from .db import session_scope
@@ -1312,17 +1312,57 @@ def maybe_seed_proxmox() -> None:
         ))
 
 
+def backfill_starter_template_location(session: Session) -> bool:
+    """Assign a deterministic compatible location to the system starter only.
+
+    The caller owns flush/commit. Existing connection choices are operator state and
+    therefore never repaired here, even when their network is absent or invalid.
+    """
+    with session.no_autoflush:
+        starter = session.exec(select(Template).where(
+            Template.name == "AI Dev Box",
+            Template.owner_id.is_(None),
+        ).order_by(Template.id)).first()
+        if starter is None or starter.connection_id is not None:
+            return False
+
+        if starter.network_id is not None:
+            network = session.get(Network, starter.network_id)
+            if network is None:
+                return False
+            connection = session.get(Connection, network.connection_id)
+            if connection is None:
+                return False
+            starter.connection_id = connection.id
+            return True
+
+        connection = session.exec(select(Connection).order_by(Connection.id)).first()
+        if connection is None:
+            return False
+        network = session.exec(select(Network).where(
+            Network.connection_id == connection.id,
+        ).order_by(Network.id)).first()
+        if network is None:
+            return False
+
+        starter.connection_id = connection.id
+        starter.network_id = network.id
+        return True
+
+
 def seed_templates() -> None:
     """A public starter template so AI dev boxes are one click away. The hostname
     block is ask-on-deploy — the demo shows off deploy-time prompts out of the box.
-    Wired to the seeded Ubuntu base image; deployable the moment a Proxmox connection
-    exists (the dev seed's connection is linked when present)."""
+    Wired to the seeded Ubuntu base image. Location remains null until startup has
+    ensured that a compatible connection/network pair exists."""
     with session_scope() as s:
-        if s.exec(select(Template).where(Template.name == "AI Dev Box")).first():
+        if s.exec(select(Template).where(
+                Template.name == "AI Dev Box",
+                Template.owner_id.is_(None),
+        ).order_by(Template.id)).first():
             return
         base = s.exec(select(Image).where(
             Image.kind == "base", Image.os_family == "ubuntu")).first()
-        conn = s.exec(select(Connection)).first()
         recipe = [
             {"id": "s-os", "name": "OS Setup", "blocks": [
                 {"ref": "b-hostname", "name": "Set Hostname",
@@ -1345,7 +1385,6 @@ def seed_templates() -> None:
             description="Node.js + Claude Code + OpenAI Codex + a global CLAUDE.md — a ready-to-code box.",
             os_family="ubuntu", recipe_json=json.dumps(recipe),
             base_image_id=base.id if base else None,
-            connection_id=conn.id if conn else None,
             default_cpu=1, default_ram=2, default_disk=20, public=True, owner_id=None,
         ))
 
@@ -1366,5 +1405,7 @@ def run_all_seeds() -> None:
     seed_base_image()
     maybe_seed_admin()
     maybe_seed_proxmox()
-    seed_templates()          # after seed_base_image + maybe_seed_proxmox so the template can wire both
+    seed_templates()          # definition only; location is assigned after networks exist
     seed_default_networks()   # after maybe_seed_proxmox so the seeded connection gets one
+    with session_scope() as s:
+        backfill_starter_template_location(s)

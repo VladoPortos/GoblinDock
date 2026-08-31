@@ -54,6 +54,7 @@ from .recipes import (
     normalize_input_schema,
     validate_public_sensitive_inputs,
 )
+from .seed import backfill_starter_template_location
 from . import backup
 from . import statebus
 from .security import (
@@ -2031,6 +2032,8 @@ def add_connection(body: ConnBody, user: User = Depends(require_admin), session:
     session.refresh(c)
     # give it a default DHCP network now (so GET /state never has to write one)
     default_network_for(session, c, user.id)
+    backfill_starter_template_location(session)
+    session.commit()
     return {"ok": True}
 
 

@@ -8,12 +8,16 @@ import re
 import shutil
 import sys
 import tempfile
+from contextlib import contextmanager
 from html.parser import HTMLParser
 from pathlib import Path
+from types import SimpleNamespace
 from urllib.parse import unquote, urlsplit
 
 from fastapi import HTTPException
-from sqlmodel import Session, select
+from sqlalchemy import event
+from sqlalchemy.pool import StaticPool
+from sqlmodel import Session, SQLModel, create_engine, select
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -29,7 +33,7 @@ os.environ.setdefault(
     "GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(), "gd-data-test")
 )
 
-from app import api, serialize as S  # noqa: E402
+from app import api, seed, serialize as S  # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
 from app.models import (  # noqa: E402
     Block,
@@ -38,11 +42,54 @@ from app.models import (  # noqa: E402
     Image,
     Job,
     JobStep,
+    Network,
     Template,
     User,
 )
 
 init_db()
+
+
+def _starter_engine():
+    local_engine = create_engine(
+        "sqlite://",
+        connect_args={"check_same_thread": False},
+        poolclass=StaticPool,
+    )
+    SQLModel.metadata.create_all(local_engine)
+    return local_engine
+
+
+def _starter_connection(name):
+    return Connection(
+        name=name,
+        host="pve.example",
+        token_id="automation@pve!goblindock",
+        node="pve",
+    )
+
+
+@contextmanager
+def _local_session_scope(local_engine):
+    session = Session(local_engine)
+    try:
+        yield session
+        session.commit()
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        session.close()
+
+
+@contextmanager
+def _patched_seed_scope(local_engine):
+    original = seed.session_scope
+    seed.session_scope = lambda: _local_session_scope(local_engine)
+    try:
+        yield
+    finally:
+        seed.session_scope = original
 
 
 class _SriResourceParser(HTMLParser):
@@ -648,6 +695,342 @@ def test_job_serializers_preserve_canceled_and_raw_status_without_regressions():
         assert serialized[raw_status]["detail"]["rawStatus"] == raw_status
 
 
+def test_starter_backfill_selects_first_system_row_and_compatible_ordered_location():
+    """A lower-ID user row/network must not redirect or suppress the system starter."""
+    local_engine = _starter_engine()
+    with Session(local_engine) as session:
+        owner = User(
+            email="wave39-starter-owner@example.com",
+            name="Wave 39 starter owner",
+            password_hash="unused",
+        )
+        first_connection = _starter_connection("wave39-first-connection")
+        other_connection = _starter_connection("wave39-other-connection")
+        session.add(owner)
+        session.add(first_connection)
+        session.add(other_connection)
+        session.flush()
+
+        user_starter = Template(name="AI Dev Box", owner_id=owner.id)
+        first_system_starter = Template(name="AI Dev Box", owner_id=None)
+        later_system_starter = Template(name="AI Dev Box", owner_id=None)
+        session.add(user_starter)
+        session.add(first_system_starter)
+        session.add(later_system_starter)
+        session.flush()
+
+        distracting_network = Network(
+            connection_id=other_connection.id,
+            name="lower-id-other-connection",
+            mode="dhcp",
+        )
+        selected_network = Network(
+            connection_id=first_connection.id,
+            name="first-compatible-network",
+            mode="dhcp",
+        )
+        later_network = Network(
+            connection_id=first_connection.id,
+            name="later-compatible-network",
+            mode="dhcp",
+        )
+        session.add(distracting_network)
+        session.add(selected_network)
+        session.add(later_network)
+        session.commit()
+
+        user_id = user_starter.id
+        selected_id = first_system_starter.id
+        later_id = later_system_starter.id
+        connection_id = first_connection.id
+        network_id = selected_network.id
+        calls = {"flush": 0, "commit": 0}
+
+        def note_flush(*_args):
+            calls["flush"] += 1
+
+        def note_commit(*_args):
+            calls["commit"] += 1
+
+        event.listen(session, "before_flush", note_flush)
+        event.listen(session, "before_commit", note_commit)
+        try:
+            assert seed.backfill_starter_template_location(session) is True
+            assert seed.backfill_starter_template_location(session) is False
+        finally:
+            event.remove(session, "before_flush", note_flush)
+            event.remove(session, "before_commit", note_commit)
+
+        assert calls == {"flush": 0, "commit": 0}, calls
+        assert session.get(Template, selected_id).connection_id == connection_id
+        assert session.get(Template, selected_id).network_id == network_id
+        assert session.get(Template, user_id).connection_id is None
+        assert session.get(Template, user_id).network_id is None
+        assert session.get(Template, later_id).connection_id is None
+        assert session.get(Template, later_id).network_id is None
+        session.rollback()
+
+    with Session(local_engine) as session:
+        rolled_back = session.get(Template, selected_id)
+        assert rolled_back.connection_id is None
+        assert rolled_back.network_id is None
+
+
+def test_starter_backfill_does_not_partially_write_or_skip_connection_without_network():
+    """The first connection wins deterministically, even when a later one has a network."""
+    local_engine = _starter_engine()
+    with Session(local_engine) as session:
+        first_connection = _starter_connection("wave39-no-network-first")
+        later_connection = _starter_connection("wave39-network-later")
+        starter = Template(name="AI Dev Box", owner_id=None)
+        session.add(first_connection)
+        session.add(later_connection)
+        session.add(starter)
+        session.flush()
+        session.add(Network(
+            connection_id=later_connection.id,
+            name="later-only-network",
+            mode="dhcp",
+        ))
+        session.flush()
+
+        assert seed.backfill_starter_template_location(session) is False
+        assert starter.connection_id is None
+        assert starter.network_id is None
+        assert starter not in session.dirty
+
+
+def test_starter_backfill_never_repairs_any_non_null_connection_choice():
+    """Connection is the operator-owned guard, regardless of network validity."""
+    cases = ("null", "compatible", "mismatched", "dangling")
+    for network_case in cases:
+        local_engine = _starter_engine()
+        with Session(local_engine) as session:
+            chosen_connection = _starter_connection(f"wave39-chosen-{network_case}")
+            other_connection = _starter_connection(f"wave39-other-{network_case}")
+            session.add(chosen_connection)
+            session.add(other_connection)
+            session.flush()
+            compatible = Network(
+                connection_id=chosen_connection.id,
+                name=f"wave39-compatible-{network_case}",
+                mode="dhcp",
+            )
+            mismatched = Network(
+                connection_id=other_connection.id,
+                name=f"wave39-mismatched-{network_case}",
+                mode="dhcp",
+            )
+            session.add(compatible)
+            session.add(mismatched)
+            session.flush()
+            network_id = {
+                "null": None,
+                "compatible": compatible.id,
+                "mismatched": mismatched.id,
+                "dangling": 999_999,
+            }[network_case]
+            starter = Template(
+                name="AI Dev Box",
+                owner_id=None,
+                connection_id=chosen_connection.id,
+                network_id=network_id,
+            )
+            session.add(starter)
+            session.flush()
+            before = (starter.connection_id, starter.network_id)
+
+            assert seed.backfill_starter_template_location(session) is False
+            assert (starter.connection_id, starter.network_id) == before
+            assert starter not in session.dirty
+
+
+def test_starter_backfill_infers_only_a_resolvable_existing_network_owner():
+    local_engine = _starter_engine()
+    with Session(local_engine) as session:
+        connection = _starter_connection("wave39-network-owner")
+        session.add(connection)
+        session.flush()
+        network = Network(
+            connection_id=connection.id,
+            name="wave39-preserved-network",
+            mode="dhcp",
+        )
+        starter = Template(name="AI Dev Box", owner_id=None)
+        session.add(network)
+        session.add(starter)
+        session.flush()
+        starter.network_id = network.id
+        session.flush()
+
+        assert seed.backfill_starter_template_location(session) is True
+        assert starter.connection_id == connection.id
+        assert starter.network_id == network.id
+        assert seed.backfill_starter_template_location(session) is False
+
+    for dangling_owner in (False, True):
+        local_engine = _starter_engine()
+        with Session(local_engine) as session:
+            starter = Template(name="AI Dev Box", owner_id=None)
+            session.add(starter)
+            if dangling_owner:
+                network = Network(
+                    connection_id=999_998,
+                    name="wave39-dangling-owner-network",
+                    mode="dhcp",
+                )
+                session.add(network)
+                session.flush()
+                preserved_network_id = network.id
+            else:
+                preserved_network_id = 999_999
+            starter.network_id = preserved_network_id
+            session.flush()
+
+            assert seed.backfill_starter_template_location(session) is False
+            assert starter.connection_id is None
+            assert starter.network_id == preserved_network_id
+            assert starter not in session.dirty
+
+
+def test_seed_templates_creates_only_a_location_null_system_definition():
+    """A user-owned exact-name row cannot suppress or be mutated by system seeding."""
+    local_engine = _starter_engine()
+    with Session(local_engine) as session:
+        owner = User(
+            email="wave39-seed-owner@example.com",
+            name="Wave 39 seed owner",
+            password_hash="unused",
+        )
+        connection = _starter_connection("wave39-seed-existing-connection")
+        image = Image(
+            kind="base",
+            name="Wave 39 Ubuntu",
+            os_family="ubuntu",
+            source_url="https://example.com/ubuntu.img",
+        )
+        session.add(owner)
+        session.add(connection)
+        session.add(image)
+        session.flush()
+        network = Network(
+            connection_id=connection.id,
+            name="wave39-seed-existing-network",
+            mode="dhcp",
+        )
+        user_starter = Template(
+            name="AI Dev Box",
+            owner_id=owner.id,
+            connection_id=None,
+            network_id=None,
+        )
+        session.add(network)
+        session.add(user_starter)
+        session.commit()
+        user_starter_id = user_starter.id
+        image_id = image.id
+
+    with _patched_seed_scope(local_engine):
+        seed.seed_templates()
+
+    with Session(local_engine) as session:
+        system_starters = session.exec(select(Template).where(
+            Template.name == "AI Dev Box",
+            Template.owner_id.is_(None),
+        ).order_by(Template.id)).all()
+        assert len(system_starters) == 1
+        assert system_starters[0].base_image_id == image_id
+        assert system_starters[0].connection_id is None
+        assert system_starters[0].network_id is None
+        user_starter = session.get(Template, user_starter_id)
+        assert user_starter.connection_id is None
+        assert user_starter.network_id is None
+
+
+def test_run_all_seeds_orders_default_network_before_committed_backfill():
+    local_engine = _starter_engine()
+    with Session(local_engine) as session:
+        connection = _starter_connection("wave39-startup-first-connection")
+        session.add(connection)
+        session.commit()
+        connection_id = connection.id
+
+    with _patched_seed_scope(local_engine):
+        seed.run_all_seeds()
+
+    with Session(local_engine) as session:
+        starter = session.exec(select(Template).where(
+            Template.name == "AI Dev Box",
+            Template.owner_id.is_(None),
+        ).order_by(Template.id)).one()
+        network = session.get(Network, starter.network_id)
+        assert starter.connection_id == connection_id
+        assert network is not None
+        assert network.connection_id == connection_id
+
+
+def test_add_connection_persists_default_network_then_starter_backfill():
+    local_engine = _starter_engine()
+    with Session(local_engine) as session:
+        admin = User(
+            email="wave39-add-connection-admin@example.com",
+            name="Wave 39 admin",
+            password_hash="unused",
+            role="admin",
+        )
+        starter = Template(name="AI Dev Box", owner_id=None)
+        session.add(admin)
+        session.add(starter)
+        session.commit()
+        admin_id = admin.id
+        starter_id = starter.id
+
+    with Session(local_engine) as session:
+        result = api.add_connection(
+            api.ConnBody(
+                name="wave39-added-connection",
+                host="pve.example",
+                token_id="automation@pve!goblindock",
+                token_secret="test-only-secret",
+                node="pve",
+                storage="local-zfs",
+            ),
+            user=session.get(User, admin_id),
+            session=session,
+        )
+        assert result["ok"] is True
+
+    with Session(local_engine) as session:
+        connection = session.exec(select(Connection).where(
+            Connection.name == "wave39-added-connection",
+        )).one()
+        networks = session.exec(select(Network).where(
+            Network.connection_id == connection.id,
+        ).order_by(Network.id)).all()
+        starter = session.get(Template, starter_id)
+        assert len(networks) == 1
+        assert starter.connection_id == connection.id
+        assert starter.network_id == networks[0].id
+
+
+def test_task7_keeps_token_free_first_admin_setup_contract():
+    assert set(api.SetupBody.model_fields) == {"email", "name", "password"}
+    local_engine = _starter_engine()
+    request = SimpleNamespace(session={})
+    with Session(local_engine) as session:
+        result = api.auth_setup(
+            api.SetupBody(
+                email="wave39-setup-admin@example.com",
+                name="Wave 39 Setup Admin",
+                password="StrongPass12!",
+            ),
+            request,
+            session,
+        )
+    assert result["ok"] is True
+    assert request.session["uid"]
+
+
 def _expect_checksum_400(value):
     try:
         api._clean_checksum(value)
@@ -797,6 +1180,14 @@ if __name__ == "__main__":
     test_referenced_owned_template_stays_editable_but_cannot_be_deleted()
     test_template_capabilities_fail_safe_without_viewer_and_preserve_payload_data()
     test_job_serializers_preserve_canceled_and_raw_status_without_regressions()
+    test_starter_backfill_selects_first_system_row_and_compatible_ordered_location()
+    test_starter_backfill_does_not_partially_write_or_skip_connection_without_network()
+    test_starter_backfill_never_repairs_any_non_null_connection_choice()
+    test_starter_backfill_infers_only_a_resolvable_existing_network_owner()
+    test_seed_templates_creates_only_a_location_null_system_definition()
+    test_run_all_seeds_orders_default_network_before_committed_backfill()
+    test_add_connection_persists_default_network_then_starter_backfill()
+    test_task7_keeps_token_free_first_admin_setup_contract()
     test_checksum_validation_normalizes_supported_digests_without_legacy_regression()
     test_base_image_create_and_edit_persist_normalized_checksum_atomically()
     print("\nALL WAVE 39 UNIT TESTS PASSED")
