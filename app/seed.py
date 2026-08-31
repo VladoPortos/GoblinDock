@@ -4,6 +4,7 @@ first admin + the test Proxmox connection from environment variables.
 from __future__ import annotations
 
 import json
+from copy import deepcopy
 
 from sqlmodel import select
 
@@ -1122,7 +1123,84 @@ BUILTIN_BLOCKS = [
 _CLOUDINIT_BLOCKS = {"b-os", "b-clean", "b-conpw", "b-swap"}
 
 
+def _migrate_b_ssh_recipe(recipe: list[dict]) -> tuple[list[dict], bool]:
+    """Move legacy ``b-ssh`` placements to the unified ``b-user`` contract.
+
+    Recipes are user-authored JSON, so preserve their complete placement/section
+    envelopes and only rewrite a well-formed placement whose reference is exactly
+    ``b-ssh``.  The returned recipe is always a deep copy, including when no
+    migration is needed.
+    """
+    migrated = deepcopy(recipe)
+    allowed_asks = {
+        "user", "password", "public_key", "groups", "home", "shell",
+        "sudoers", "nopasswd", "ssh_password_login",
+    }
+    changed = False
+    if not isinstance(migrated, list):
+        return migrated, changed
+
+    for section in migrated:
+        if not isinstance(section, dict):
+            continue
+        blocks = section.get("blocks")
+        if not isinstance(blocks, list):
+            continue
+        for placed in blocks:
+            if not isinstance(placed, dict) or placed.get("ref") != "b-ssh":
+                continue
+            inputs = placed.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            asks = placed.get("ask")
+            if "ask" in placed and not isinstance(asks, list):
+                continue
+
+            placed["ref"] = "b-user"
+            placed["inputs"] = {
+                "user": inputs.get("user", ""),
+                "password": inputs.get("password", ""),
+                "public_key": inputs.get("public_key", ""),
+                "ssh_password_login": inputs.get("ssh_password_login", False),
+                "shell": "/bin/bash",
+                "home": "",
+                "groups": ["sudo"],
+                "sudoers": True,
+                "nopasswd": inputs.get("sudo", False),
+            }
+            if "ask" in placed:
+                placed["ask"] = [
+                    "nopasswd" if name == "sudo" else name
+                    for name in asks
+                    if isinstance(name, str)
+                    and (name == "sudo" or name in allowed_asks)
+                ]
+            changed = True
+    return migrated, changed
+
+
 def seed_blocks() -> None:
+    # Migrate persisted recipes before pruning the old b-ssh Block row. This must
+    # not depend on the legacy row still existing in the catalog.
+    with session_scope() as s:
+        migrated_any = False
+        for template in s.exec(select(Template)).all():
+            try:
+                recipe = json.loads(template.recipe_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(recipe, list):
+                continue
+            migrated, changed = _migrate_b_ssh_recipe(recipe)
+            if changed:
+                template.recipe_json = json.dumps(migrated)
+                s.add(template)
+                migrated_any = True
+        if migrated_any:
+            # Commit separately so the repaired recipe is durable before the
+            # subsequent transaction removes obsolete built-in metadata.
+            s.commit()
+
     with session_scope() as s:
         existing = {b.key: b for b in s.exec(select(Block)).all()}
         # Prune built-in blocks that were removed from the catalog (e.g. b-ssh, merged
