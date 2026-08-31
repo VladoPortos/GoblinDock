@@ -810,6 +810,9 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
                 ctx.log(f"[{_ts()}] old VM {old_vmid} already absent; continuing", "l-dim")
         else:
             ctx.log(f"[{_ts()}] old VM {old_vmid} already absent; continuing", "l-dim")
+        presence, detail = _probe_vm_presence(px, old_vmid, node)
+        if presence != VM_ABSENT:
+            raise RuntimeError(f"rebuild aborted: old VM {old_vmid} absence not confirmed: {detail}")
     ctx.log(f"[{_ts()}] keeping identity: name={dep.name} ip={dep.ip or 'dhcp'}", "l-dim")
     ctx.finish_step(st, t)
 

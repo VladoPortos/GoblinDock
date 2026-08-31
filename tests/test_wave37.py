@@ -1003,6 +1003,101 @@ def test_direct_lifecycle_task_failure_and_timeout_return_502():
         api.Proxmox = saved
 
 
+def _run_rebuild_post_destroy_presence_case(inventory_state: str):
+    job_id, original_plan_loader = _mk_worker_job(recipe=[], blocks={}, ssh_key_path="")
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        dep = s.get(Deployment, job.deployment_id)
+        network = Network(connection_id=dep.connection_id, name=f"rebuild-guard-{job_id}")
+        s.add(network)
+        s.flush()
+        vmid = 8800 + (job_id % 100)
+        dep.vmid = vmid
+        dep.network_id = network.id
+        job.type = "rebuild"
+        s.add(dep)
+        s.add(job)
+        s.add(IpAllocation(
+            network_id=network.id, ip=f"10.37.8.{job_id % 200 + 10}",
+            deployment_id=dep.id, state="reserved",
+        ))
+        s.flush()
+        dep_id = dep.id
+
+    create_calls = []
+
+    class _Px:
+        def __init__(self, _conn):
+            self.node = "pve"
+
+        def vm_current(self, _vmid, node=None):
+            return {"status": "stopped"}
+
+        def destroy(self, _vmid, node=None):
+            return "UPID:destroy"
+
+        def wait_task(self, *_args, **_kwargs):
+            return None
+
+        def list_qemu(self, node=None):
+            if inventory_state == "unknown":
+                raise RuntimeError("inventory unavailable after destroy")
+            return [{"vmid": vmid}]
+
+        def storage_has_volume(self, *_args, **_kwargs):
+            return True
+
+        def iso_volume_path(self, filename):
+            return f"local:import/{filename}"
+
+        def create_vm_import(self, *_args, **_kwargs):
+            create_calls.append(vmid)
+            raise RuntimeError("create rejected before UPID")
+
+    try:
+        with _patched_worker(
+            Proxmox=_Px,
+            auto_root_password_enabled=lambda: False,
+            _managed_keypair=lambda: ("managed-private", "ssh-ed25519 managed"),
+            _ssh_pubkey=lambda *_args, **_kwargs: "",
+        ):
+            worker._execute(job_id)
+    finally:
+        worker._load_materialized_job_plan = original_plan_loader
+
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        dep = s.get(Deployment, dep_id)
+        allocations = s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep_id,
+        )).all()
+        return job.status, dep.status, dep.vmid, len(allocations), create_calls, vmid
+
+
+def test_rebuild_requires_confirmed_absence_after_successful_destroy_wait_when_vm_present():
+    """Missing the post-destroy absence gate can recreate over a surviving old VM."""
+    job_status, dep_status, dep_vmid, allocations, create_calls, vmid = (
+        _run_rebuild_post_destroy_presence_case("present")
+    )
+    assert job_status == "failed"
+    assert dep_status == "error"
+    assert dep_vmid == vmid
+    assert allocations == 1
+    assert create_calls == []
+
+
+def test_rebuild_requires_confirmed_absence_after_successful_destroy_wait_when_inventory_unknown():
+    """Missing the post-destroy absence gate can clear ownership during an inventory outage."""
+    job_status, dep_status, dep_vmid, allocations, create_calls, vmid = (
+        _run_rebuild_post_destroy_presence_case("unknown")
+    )
+    assert job_status == "failed"
+    assert dep_status == "error"
+    assert dep_vmid == vmid
+    assert allocations == 1
+    assert create_calls == []
+
+
 def _run_worker_lifecycle_case(job_type: str, vm_status: str, *, stop_error: bool = False):
     _uid, _dep_id, job_id = _mk_lifecycle_task_fixture(job_type=job_type)
     calls = []
@@ -1118,6 +1213,8 @@ if __name__ == "__main__":
     test_waiting_blocks_connection_deletion_and_deduplicates_sync()
     test_direct_lifecycle_actions_wait_for_their_submitted_upids()
     test_direct_lifecycle_task_failure_and_timeout_return_502()
+    test_rebuild_requires_confirmed_absence_after_successful_destroy_wait_when_vm_present()
+    test_rebuild_requires_confirmed_absence_after_successful_destroy_wait_when_inventory_unknown()
     test_worker_rebuild_and_destroy_await_stop_without_fixed_sleep()
     test_worker_rebuild_and_destroy_skip_stop_when_vm_is_stopped()
     test_worker_stop_task_failure_aborts_before_destroy()
