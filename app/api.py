@@ -49,6 +49,7 @@ from .recipes import (
     input_schema_problems,
     lint_block,
     load_recipe,
+    normalize_input_schema,
     validate_public_sensitive_inputs,
 )
 from . import backup
@@ -2773,7 +2774,7 @@ def create_block(body: BlockBody, user: User = Depends(current_user),
               name=body.name.strip() or "Custom block", category=body.category, icon=body.icon,
               section=body.section, phase="cloudinit" if body.phase == "cloudinit" else "ansible",
               description=body.description,
-              input_schema_json=json.dumps(body.input_schema or []),
+              input_schema_json=json.dumps(normalize_input_schema(body.input_schema or [])),
               ansible_template=body.ansible_template, cloudinit_template=body.cloudinit_template,
               owner_id=user.id)
     session.add(b)
@@ -2822,7 +2823,7 @@ def edit_block(key: str, body: BlockBody, user: User = Depends(current_user),
     b.section = body.section
     b.phase = "cloudinit" if body.phase == "cloudinit" else "ansible"
     b.description = body.description
-    b.input_schema_json = json.dumps(body.input_schema or [])
+    b.input_schema_json = json.dumps(normalize_input_schema(body.input_schema or []))
     b.ansible_template = body.ansible_template
     b.cloudinit_template = body.cloudinit_template
     session.add(b)

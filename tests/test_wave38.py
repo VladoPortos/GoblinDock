@@ -19,13 +19,13 @@ os.environ.setdefault("GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(),
 from fastapi import HTTPException                 # noqa: E402
 from sqlmodel import Session, select              # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
-from app import api, recipes, seed                 # noqa: E402
+from app import api, execution_plan, recipes, seed  # noqa: E402
 from app import serialize as S                     # noqa: E402
 from app.models import (                           # noqa: E402
     Block, Connection, Deployment, Image, IpAllocation, Job, Network, Template,
     User,
 )
-from app.security import hash_password             # noqa: E402
+from app.security import encrypt, hash_password    # noqa: E402
 
 init_db()
 
@@ -234,6 +234,99 @@ def _row_counts(session):
     ))
 
 
+def test_custom_block_create_and_edit_canonicalize_omitted_type():
+    user_id = _mk_user(f"w38-block-author-{os.urandom(3).hex()}@example.com")
+    with Session(engine) as s:
+        created = api.create_block(
+            api.BlockBody(
+                name="Implicit text input", phase="cloudinit",
+                input_schema=[{"name": "message", "default": "hello"}],
+                cloudinit_template="echo {message}",
+            ),
+            user=s.get(User, user_id), session=s,
+        )
+        block = s.exec(select(Block).where(Block.key == created["key"])).one()
+        assert json.loads(block.input_schema_json) == [
+            {"name": "message", "default": "hello", "type": "text"},
+        ]
+
+        assert api.edit_block(
+            block.key,
+            api.BlockBody(
+                name="Updated implicit text input", phase="cloudinit",
+                input_schema=[{"name": "updated", "default": "bye"}],
+                cloudinit_template="echo {updated}",
+            ),
+            user=s.get(User, user_id), session=s,
+        )["ok"]
+        block = s.exec(select(Block).where(Block.key == created["key"])).one()
+        assert json.loads(block.input_schema_json) == [
+            {"name": "updated", "default": "bye", "type": "text"},
+        ]
+
+
+def test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan():
+    fixture = _sensitive_fixture()
+    with session_scope() as s:
+        block = s.exec(select(Block).where(Block.key == fixture["block"])).one()
+        block.input_schema_json = json.dumps([
+            {"name": "message", "default": "hello"},
+        ])
+        block.cloudinit_template = "echo {message}"
+        s.add(block)
+    template_id = _insert_template(
+        fixture,
+        [{"blocks": [{
+            "ref": fixture["block"], "inputs": {"message": "hello"},
+        }]}],
+        public=False,
+    )
+
+    with Session(engine) as s:
+        result = api.deploy(
+            api.DeployBody(templateId=template_id, name="w38-legacy-schema"),
+            user=s.get(User, fixture["author"]), session=s,
+        )
+        job = s.get(Job, result["jobId"])
+        plan = execution_plan.open_execution_plan(job.execution_plan_enc)
+        assert json.loads(plan["blocks"][fixture["block"]]["input_schema_json"]) == [
+            {"name": "message", "default": "hello", "type": "text"},
+        ]
+        recipe, blocks = execution_plan.materialize_execution_plan(plan)
+        assert "echo hello" in recipes.compile_cloudinit(
+            recipe, blocks, lambda _owner_id, _secret_name: "",
+        )
+
+
+def test_authenticated_imported_plan_with_missing_type_is_rejected():
+    fixture = _sensitive_fixture()
+    template_id = _insert_template(
+        fixture, _recipe(fixture["block"], password="private"), public=False,
+    )
+    with Session(engine) as s:
+        plan = execution_plan.build_execution_plan(
+            s, s.get(Template, template_id), fixture["author"], "{}",
+        )
+    schema = json.loads(plan["blocks"][fixture["block"]]["input_schema_json"])
+    del schema[0]["type"]
+    plan["blocks"][fixture["block"]]["input_schema_json"] = json.dumps(schema)
+
+    try:
+        execution_plan.seal_execution_plan(plan)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("missing-type execution plan was sealed")
+
+    authenticated = encrypt(json.dumps(plan))
+    try:
+        execution_plan.open_execution_plan(authenticated)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("authenticated missing-type execution plan was opened")
+
+
 def test_public_literal_is_rejected_without_echo():
     fixture = _sensitive_fixture()
     for field, value in (("password", "DO-NOT-ECHO"), ("token", "TOKEN-NOT-ECHO")):
@@ -403,7 +496,6 @@ def test_cross_owner_malformed_snapshot_schemas_fail_before_persistence():
         [{"name": "credential", "type": "secrett"}],
         [{"type": "secret"}],
         [{"name": "bad-name", "type": "secret"}],
-        [{"name": "credential"}],
         [{"name": "credential", "type": ["secret"]}],
     )
     for schema in malformed_schemas:
@@ -503,6 +595,9 @@ def test_unknown_ref_less_block_masks_all_nonempty_inputs():
 
 if __name__ == "__main__":
     test_seed_migrates_b_ssh_before_pruning()
+    test_custom_block_create_and_edit_canonicalize_omitted_type()
+    test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan()
+    test_authenticated_imported_plan_with_missing_type_is_rejected()
     test_public_literal_is_rejected_without_echo()
     test_public_ask_and_exact_deployer_secret_references_are_allowed()
     test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit()

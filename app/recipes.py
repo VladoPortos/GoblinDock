@@ -425,6 +425,22 @@ _ALLOWED_INPUT_TYPES = {
 _INPUT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def normalize_input_schema(schema):
+    """Copy an accepted authoring/legacy schema with implicit text types made explicit."""
+    if not isinstance(schema, list):
+        return schema
+    normalized = []
+    for field in schema:
+        if not isinstance(field, dict):
+            normalized.append(field)
+            continue
+        normalized_field = dict(field)
+        if normalized_field.get("type") is None:
+            normalized_field["type"] = "text"
+        normalized.append(normalized_field)
+    return normalized
+
+
 def input_schema_problems(schema, *, require_type=False) -> list[str]:
     """Return authoritative structural/name/type problems for one input schema."""
     if not isinstance(schema, list):

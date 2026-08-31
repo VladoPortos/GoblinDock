@@ -12,7 +12,12 @@ from typing import Optional
 from sqlmodel import Session, select
 
 from .models import Block, Template
-from .recipes import input_schema_problems, load_recipe, merge_deploy_inputs
+from .recipes import (
+    input_schema_problems,
+    load_recipe,
+    merge_deploy_inputs,
+    normalize_input_schema,
+)
 from .security import decrypt, encrypt
 
 
@@ -138,7 +143,10 @@ def build_execution_plan(session: Session, template: Template, deployment_owner_
     }
     sensitive_fields = {}
     for key, snapshot in blocks.items():
-        schema = json.loads(snapshot["input_schema_json"] or "[]")
+        schema = normalize_input_schema(
+            json.loads(snapshot["input_schema_json"] or "[]"),
+        )
+        snapshot["input_schema_json"] = json.dumps(schema)
         sensitive_fields[key] = sorted({
             field.get("name") for field in schema
             if isinstance(field, dict)

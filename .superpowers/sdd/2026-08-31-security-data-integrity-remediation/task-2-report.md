@@ -223,13 +223,13 @@ and deployer-answer tests stayed in the wave to guard allowed behavior.
 
 ### GREEN and compatibility evidence
 
-Focused commands (same WSL worktree/runtime prefix as above):
+Focused commands:
 
 ```text
-... -c 'from tests import test_wave38 as t; t.test_unknown_ref_less_block_masks_all_nonempty_inputs()'
-... -c 'from tests import test_wave38 as t; t.test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit()'
-... -c 'from tests import test_wave38 as t; t.test_cross_owner_blank_sensitive_without_ask_is_rejected_before_persistence()'
-... -c 'from tests import test_wave38 as t; t.test_cross_owner_malformed_snapshot_schemas_fail_before_persistence()'
+GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_unknown_ref_less_block_masks_all_nonempty_inputs()'
+GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit()'
+GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_cross_owner_blank_sensitive_without_ask_is_rejected_before_persistence()'
+GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_cross_owner_malformed_snapshot_schemas_fail_before_persistence()'
 GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave38.py
 ```
 
@@ -291,5 +291,126 @@ warnings); the production sentinel scan returned no matches.
 - `app/serialize.py`
 - `tests/test_wave10.py`
 - `tests/test_wave37.py`
+- `tests/test_wave38.py`
+- `.superpowers/sdd/2026-08-31-security-data-integrity-remediation/task-2-report.md`
+
+## Fix Round 2
+
+### Compatibility correction
+
+- Added one shared `normalize_input_schema()` helper. It copies a list schema and turns
+  the authoring-compatible omitted/null type into explicit `type: "text"`; it does not
+  rewrite malformed field objects or explicit invalid types.
+- Custom-block create and edit now normalize only after the authoritative linter accepts
+  the schema, then persist the canonical schema.
+- `build_execution_plan()` normalizes legacy stored schemas while constructing the
+  detached block snapshot and before deriving sensitivity metadata and strictly
+  validating the plan. The stored legacy `Block` row is not mutated.
+- `seal_execution_plan()`, `open_execution_plan()`, and `_validate_plan()` remain strict.
+  A directly supplied or authenticated snapshot that omits a type is still invalid.
+- The cross-owner malformed-row matrix no longer treats a legacy stored omitted type as
+  malformed. Missing/invalid names, misspelled types, and non-string types remain
+  fail-closed cases with pre-persistence row-count assertions.
+
+### Regressions
+
+- `test_custom_block_create_and_edit_canonicalize_omitted_type` exercises the real API
+  create and edit functions and asserts exact persisted schemas containing explicit
+  text types.
+- `test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan` directly
+  inserts a legacy schema, deploys a same-owner private template, opens the sealed job
+  snapshot, asserts the canonical schema, materializes it, and compiles `echo hello`.
+- `test_authenticated_imported_plan_with_missing_type_is_rejected` proves both ordinary
+  sealing and strict opening of independently authenticated ciphertext reject the
+  missing-type snapshot.
+- The existing malformed-schema admission test continues to assert unchanged
+  Deployment/Job/IP counts for every remaining invalid schema.
+
+### RED evidence
+
+Exact commands run before production edits:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_custom_block_create_and_edit_canonicalize_omitted_type()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_authenticated_imported_plan_with_missing_type_is_rejected()'"
+```
+
+Exact results:
+
+- create/edit exited 1 at the first persisted-schema equality assertion because the
+  stored field had no `type` key;
+- legacy deployment exited 1 with `HTTPException: 409: template execution plan is
+  invalid`, originating in strict `_validate_plan()`;
+- authenticated-import rejection exited 0, preserving the pre-existing fail-closed
+  decoder behavior as a characterization control.
+
+### Focused GREEN evidence
+
+Exact complete commands (no abbreviated prefixes):
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_custom_block_create_and_edit_canonicalize_omitted_type()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_authenticated_imported_plan_with_missing_type_is_rejected()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_cross_owner_malformed_snapshot_schemas_fail_before_persistence()'"
+```
+
+Result: every command exited 0 with no output.
+
+### Required waves and static checks
+
+Exact wave commands:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave6.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave9.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave10.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave26.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave34.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave36.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave37.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave38.py"
+```
+
+Exact results: all exited 0. Wave 6 printed `All 16 wave-6 tests passed.`; waves
+9, 10, 26, 34, 36, 37, and 38 printed their `ALL WAVE ... UNIT TESTS PASSED`
+sentinels. Wave 37 also printed its two expected, internally caught rebuild-abort
+tracebacks before the pass sentinel.
+
+Exact static commands:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && PYTHONPYCACHEPREFIX=/tmp/gd-task2-fix2-pycache /mnt/e/goblindock/.venv/bin/python -m compileall -q app tests"
+git diff --check
+rg -n "MALFORMED-SCHEMA-MUST-NOT-RUN|DO-NOT-ECHO|TOKEN-NOT-ECHO|AUTHOR-FALLBACK|IMPORTED-AUTHOR|UNKNOWN-BLOCK|DEPLOYER-PROVIDED|PRIVATE-AUTHOR|DEPLOY_PASSWORD|DEPLOY_TOKEN" app
+```
+
+Results: compileall exited 0 with no output; diff check exited 0 with only Git's
+informational LF/CRLF warnings; production sentinel scan returned no matches (expected
+`rg` exit 1).
+
+### Non-disclosure, rollback, and self-review
+
+- No new error includes a schema default, field value, deploy input, or secret. Strict
+  imported-plan failures remain the fixed `invalid execution plan`/sanitized 409 path.
+- The compatibility normalization operates on schema metadata only and never reads or
+  copies a placed input value into an error.
+- Missing-type authenticated plans are rejected before materialization. Explicit invalid
+  types are not normalized, so misspellings and non-string types remain fail closed.
+- The malformed cross-owner cases retain same-session before/after counts for
+  Deployment, Job, and IpAllocation; wave 38 confirms all remain unchanged on rejection.
+- The helper returns copied field dictionaries, avoiding mutation of API request objects
+  or stored legacy rows. Only new API writes and sealed snapshots become canonical.
+- The established linter remains the authority for accepted input names and types; no
+  second type allowlist was introduced.
+- Public-sensitive exact refs, deployer ask answers, unknown-block masking, and private
+  author values remain covered and GREEN in wave 38. Easy first-admin setup is untouched.
+
+### Fix Round 2 files
+
+- `app/recipes.py`
+- `app/api.py`
+- `app/execution_plan.py`
 - `tests/test_wave38.py`
 - `.superpowers/sdd/2026-08-31-security-data-integrity-remediation/task-2-report.md`
