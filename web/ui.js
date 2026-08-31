@@ -129,27 +129,32 @@
 
   // ---- reusable form fields ----
   function Field({ label, value, onChange, mono, type, placeholder, hint }) {
+    const inputId = React.useId();
     return h('div', null,
-      label && h('label', { className: 'field-label' }, label),
+      label && h('label', { className: 'field-label', htmlFor: inputId }, label),
       h('input', {
+        id: inputId,
         className: 'input' + (mono ? ' mono' : ''), type: type || 'text', value: value == null ? '' : value,
         placeholder: placeholder || '', onChange: (e) => onChange && onChange(e.target.value),
       }),
       hint && h('div', { className: 'hint', style: { fontSize: 11, marginTop: 4 } }, hint));
   }
   function TextArea({ label, value, onChange, rows, mono }) {
+    const inputId = React.useId();
     return h('div', null,
-      label && h('label', { className: 'field-label' }, label),
+      label && h('label', { className: 'field-label', htmlFor: inputId }, label),
       h('textarea', {
+        id: inputId,
         className: 'input' + (mono ? ' mono' : ''), value: value == null ? '' : value,
         style: { height: (rows || 4) * 22, padding: 10, resize: 'vertical', lineHeight: 1.5 },
         onChange: (e) => onChange && onChange(e.target.value),
       }));
   }
   function SelectField({ label, value, onChange, options }) {
+    const inputId = React.useId();
     return h('div', null,
-      label && h('label', { className: 'field-label' }, label),
-      h('select', { className: 'select', value: value, onChange: (e) => onChange && onChange(e.target.value) },
+      label && h('label', { className: 'field-label', htmlFor: inputId }, label),
+      h('select', { id: inputId, className: 'select', value: value, onChange: (e) => onChange && onChange(e.target.value) },
         options.map((o) => {
           const val = typeof o === 'object' ? o.value : o;
           const lbl = typeof o === 'object' ? o.label : o;

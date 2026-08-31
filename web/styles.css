@@ -369,10 +369,10 @@ body {
 .overlay { position: fixed; inset: 0; background: oklch(0.08 0.005 80 / 0.6); backdrop-filter: blur(3px); z-index: 60; display: grid; place-items: center; animation: fade .15s ease; }
 @keyframes fade { from { opacity: 0; } }
 @keyframes slideUp { from { opacity: 0; transform: translateY(12px); } }
-.modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-lg); width: min(460px, 92vw); animation: slideUp .2s ease; overflow: hidden; }
-.modal-head { padding: 18px 20px; border-bottom: 1px solid var(--border-soft); display: flex; align-items: center; gap: 12px; }
-.modal-body { padding: 20px; }
-.modal-foot { padding: 16px 20px; border-top: 1px solid var(--border-soft); display: flex; gap: 10px; justify-content: flex-end; }
+.modal { background: var(--surface); border: 1px solid var(--border); border-radius: 16px; box-shadow: var(--shadow-lg); width: min(460px, 92vw); max-height: calc(100vh - 32px); max-height: calc(100dvh - 32px); display: flex; flex-direction: column; animation: slideUp .2s ease; overflow: hidden; }
+.modal-head { padding: 18px 20px; border-bottom: 1px solid var(--border-soft); display: flex; align-items: center; gap: 12px; flex-shrink: 0; }
+.modal-body { padding: 20px; min-height: 0; overflow-y: auto; }
+.modal-foot { padding: 16px 20px; border-top: 1px solid var(--border-soft); display: flex; gap: 10px; justify-content: flex-end; flex-shrink: 0; }
 
 /* drawer */
 .drawer { position: fixed; top: 0; right: 0; bottom: 0; width: min(420px, 94vw); background: var(--surface); border-left: 1px solid var(--border); box-shadow: var(--shadow-lg); z-index: 55; display: flex; flex-direction: column; animation: slideIn .22s cubic-bezier(.4,0,.2,1); }
