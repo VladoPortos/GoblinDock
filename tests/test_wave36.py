@@ -547,6 +547,56 @@ def test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_abs
             IpAllocation.deployment_id == dep_id)).all() == []
 
 
+def test_cleanup_retry_stamps_each_target_immediately_before_external_work():
+    """A slow first cleanup must not make a later target immediately eligible again."""
+    t0 = datetime(2026, 8, 31, 13, 0, tzinfo=timezone.utc)
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        conn = Connection(name=f"cleanup-order-{suffix}", host="pve",
+                          token_id="u@pve!token", node="pve")
+        s.add(conn); s.flush()
+        first = Deployment(name=f"cleanup-first-{suffix}", connection_id=conn.id,
+                           node="pve", vmid=8361, status="cleanup_pending",
+                           cleanup_origin="destroy")
+        second = Deployment(name=f"cleanup-second-{suffix}", connection_id=conn.id,
+                            node="pve", vmid=8362, status="cleanup_pending",
+                            cleanup_origin="destroy")
+        s.add(first); s.add(second); s.flush()
+        s.add(Job(type="destroy", status="canceled", deployment_id=first.id,
+                  connection_id=conn.id))
+        s.add(Job(type="destroy", status="canceled", deployment_id=second.id,
+                  connection_id=conn.id))
+        first_id, second_id = first.id, second.id
+
+    calls = []
+
+    class _Px:
+        node = "pve"
+        def __init__(self, conn): pass
+        def list_qemu(self, node=None):
+            calls.append(node)
+            raise RuntimeError("inventory unavailable")
+
+    clock = iter((t0, t0 + timedelta(seconds=61)))
+    saved_px, saved_utcnow = worker.Proxmox, worker.utcnow
+    worker.Proxmox = _Px
+    worker.utcnow = lambda: next(clock)
+    try:
+        worker._retry_cleanup_pending()
+        with session_scope() as s:
+            first_stamp = s.get(Deployment, first_id).cleanup_last_attempt_at
+            second_stamp = s.get(Deployment, second_id).cleanup_last_attempt_at
+        assert first_stamp.replace(tzinfo=timezone.utc) == t0
+        assert second_stamp.replace(tzinfo=timezone.utc) == t0 + timedelta(seconds=61)
+
+        calls.clear()
+        worker._retry_cleanup_pending(now=t0 + timedelta(seconds=70))
+    finally:
+        worker.Proxmox, worker.utcnow = saved_px, saved_utcnow
+
+    assert calls == ["pve"], "only the first target is old enough for another attempt"
+
+
 def test_rebuild_admission_uses_deploy_allocation_lock():
     uid = _mk_user("w36-rebuild-lock@example.com")
     template_id, network_id = _mk_deployable_template(uid, static=True)
@@ -827,6 +877,7 @@ if __name__ == "__main__":
     test_concurrent_deploy_admission_cannot_exceed_quota()
     test_orphan_recovery_keeps_allocations_until_absence_is_confirmed()
     test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_absence()
+    test_cleanup_retry_stamps_each_target_immediately_before_external_work()
     test_rebuild_admission_uses_deploy_allocation_lock()
     test_template_write_rejects_malformed_recipe_shape()
     test_template_write_rejects_private_block_from_another_user()

@@ -120,6 +120,7 @@ def _migrate() -> None:
             ("root_password_enc", "TEXT NOT NULL DEFAULT ''"),
             ("cred_user", "TEXT NOT NULL DEFAULT ''"),
             ("cleanup_last_attempt_at", "TIMESTAMP"),
+            ("cleanup_origin", "TEXT"),
         ],
         "jobs": [
             ("dismissed", "INTEGER NOT NULL DEFAULT 0"),

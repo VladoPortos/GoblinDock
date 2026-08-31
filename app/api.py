@@ -830,6 +830,8 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     if not base or base.kind != "base":
         raise HTTPException(400, "template has no base image — edit it first")
     dep.status = "working"
+    dep.cleanup_origin = None
+    dep.cleanup_last_attempt_at = None
     session.add(dep)
     # Preserve the VM's network identity (static IP / VLAN) across the rebuild.
     # The existing IpAllocation row is reused by allocate_ip() inside _network_ctx —
@@ -855,6 +857,8 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
 def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
     dep = _owned_deployment(session, dep_id, user)
     dep.status = "working"
+    dep.cleanup_origin = None
+    dep.cleanup_last_attempt_at = None
     session.add(dep)
     job = Job(type="destroy", title=f"Destroying {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",

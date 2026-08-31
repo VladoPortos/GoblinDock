@@ -147,6 +147,16 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
                     "phase": active.phase or "", "pct": active.pct or 0}
         status = "working"
 
+    display_ip = dep.ip
+    if dep.status == "cleanup_pending" and not display_ip:
+        allocation = session.exec(
+            select(IpAllocation).where(
+                IpAllocation.deployment_id == dep.id,
+                IpAllocation.state == "reserved",
+            ).order_by(IpAllocation.id)
+        ).first()
+        display_ip = allocation.ip if allocation else ""
+
     owner = users.get(dep.owner_id)
     return {
         "id": f"vm-{dep.id}",
@@ -154,7 +164,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         "vmid": dep.vmid,
         "name": dep.name,
         "status": status,
-        "ip": dep.ip or "—",
+        "ip": display_ip or "—",
         "owner": "you" if dep.owner_id == me.id else "other",
         "ownerName": owner.name if owner else "—",
         "conn": conn.name if conn else "—",

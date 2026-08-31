@@ -151,6 +151,7 @@ def test_failed_cancellation_keeps_ambiguous_vm_identity():
     with session_scope() as s:
         dep = s.get(Deployment, did)
         assert dep.status == "cleanup_pending"
+        assert dep.cleanup_origin == "deploy"
         assert dep.vmid == 8102
     assert len(_allocs(did)) == 1
 
@@ -178,6 +179,7 @@ def test_canceled_destroy_with_unknown_inventory_becomes_cleanup_pending():
     with session_scope() as s:
         dep = s.get(Deployment, did)
         assert dep.status == "cleanup_pending"
+        assert dep.cleanup_origin == "destroy"
         assert dep.vmid == 8103
     assert len(_allocs(did)) == 1
 

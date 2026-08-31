@@ -7,6 +7,7 @@ import os
 import sys
 import tempfile
 from contextlib import contextmanager
+from datetime import timedelta
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -22,9 +23,12 @@ os.environ.setdefault("GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(),
 
 from sqlmodel import Session, select  # noqa: E402
 
-from app import api, execution_plan, worker  # noqa: E402
-from app.db import engine, init_db, session_scope  # noqa: E402
-from app.models import Block, Connection, Deployment, Image, Job, Network, Template, User  # noqa: E402
+from app import api, appsettings, execution_plan, worker  # noqa: E402
+from app.db import _migrate, engine, init_db, session_scope  # noqa: E402
+from app.models import (  # noqa: E402
+    Block, Connection, Deployment, Image, IpAllocation, Job, Network, Template,
+    User, utcnow,
+)
 from app.security import hash_password  # noqa: E402
 from app import serialize as S  # noqa: E402
 from app.proxmox import Proxmox, ProxmoxError  # noqa: E402
@@ -150,6 +154,106 @@ def test_cleanup_pending_serialization_preserves_owned_identity_and_error():
     assert out["vmid"] == 8370
     assert out["ip"] == "10.37.0.70"
     assert out["err"] == "cleanup not confirmed"
+
+
+def test_cleanup_pending_serialization_uses_owned_static_allocation_when_ip_is_empty():
+    """Canceled deploy ownership must expose its reserved IP before post-boot sets Deployment.ip."""
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        user = User(email=f"cleanup-ip-{suffix}@example.com", name="cleanup-ip",
+                    password_hash=hash_password("StrongPass12!"))
+        conn = Connection(name=f"cleanup-ip-{suffix}", host="pve",
+                          token_id="u@pve!token", node="pve")
+        s.add(user); s.add(conn); s.flush()
+        network = Network(connection_id=conn.id, name=f"cleanup-ip-{suffix}", mode="static")
+        s.add(network); s.flush()
+        dep = Deployment(name=f"cleanup-ip-{suffix}", owner_id=user.id,
+                         connection_id=conn.id, network_id=network.id, node="pve",
+                         vmid=8373, ip="", status="cleanup_pending",
+                         cleanup_origin="deploy", error="cleanup not confirmed")
+        s.add(dep); s.flush()
+        s.add(IpAllocation(network_id=network.id, ip="10.37.0.73",
+                           deployment_id=dep.id, state="reserved"))
+        s.flush()
+        out = S.vm_dict(s, dep, user, {}, {user.id: user}, {conn.id: conn}, active_jobs={})
+
+    assert out["ip"] == "10.37.0.73"
+
+
+def test_cleanup_origin_migration_is_additive_and_idempotent():
+    """An upgraded deployments table gains nullable cleanup provenance exactly once."""
+    with engine.begin() as conn:
+        columns = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(deployments)")}
+        if "cleanup_origin" in columns:
+            conn.exec_driver_sql("ALTER TABLE deployments DROP COLUMN cleanup_origin")
+    _migrate()
+    _migrate()
+    with engine.begin() as conn:
+        rows = {row[1]: row for row in conn.exec_driver_sql("PRAGMA table_info(deployments)")}
+    assert "cleanup_origin" in rows
+    assert rows["cleanup_origin"][2].upper() == "TEXT"
+    assert rows["cleanup_origin"][3] == 0, "cleanup_origin must remain nullable"
+
+
+def test_cleanup_retry_uses_persisted_origin_after_job_retention_prunes_history():
+    """Cleanup behavior must survive permanent deletion of the canceled source job."""
+    suffix = os.urandom(3).hex()
+    old = utcnow() - timedelta(days=10)
+    with session_scope() as s:
+        conn = Connection(name=f"cleanup-origin-{suffix}", host="pve",
+                          token_id="u@pve!token", node="pve")
+        s.add(conn); s.flush()
+        deploy_dep = Deployment(name=f"origin-deploy-{suffix}", connection_id=conn.id,
+                                node="pve", vmid=8371, status="cleanup_pending",
+                                cleanup_origin="deploy")
+        destroy_dep = Deployment(name=f"origin-destroy-{suffix}", connection_id=conn.id,
+                                 node="pve", vmid=8372, status="cleanup_pending",
+                                 cleanup_origin="destroy")
+        s.add(deploy_dep); s.add(destroy_dep); s.flush()
+        deploy_job = Job(type="deploy", status="canceled", deployment_id=deploy_dep.id,
+                         connection_id=conn.id, finished_at=old)
+        destroy_job = Job(type="destroy", status="canceled", deployment_id=destroy_dep.id,
+                          connection_id=conn.id, finished_at=old)
+        s.add(deploy_job); s.add(destroy_job); s.flush()
+        deploy_dep_id, destroy_dep_id = deploy_dep.id, destroy_dep.id
+        deploy_job_id, destroy_job_id = deploy_job.id, destroy_job.id
+
+    saved_retention = appsettings.get_job_retention_days
+    appsettings.get_job_retention_days = lambda: 1
+    try:
+        assert api.prune_old_jobs() >= 2
+    finally:
+        appsettings.get_job_retention_days = saved_retention
+    with session_scope() as s:
+        assert s.get(Job, deploy_job_id) is None
+        assert s.get(Job, destroy_job_id) is None
+
+    destroys = []
+
+    class _Px:
+        node = "pve"
+        def __init__(self, conn): pass
+        def destroy(self, vmid, node=None):
+            destroys.append(vmid)
+            return "UPID:destroy"
+        def wait_task(self, *args, **kwargs): return None
+        def list_qemu(self, node=None): return [{"vmid": 8371}, {"vmid": 8372}]
+
+    saved_px = worker.Proxmox
+    worker.Proxmox = _Px
+    try:
+        worker._retry_cleanup_pending(now=utcnow())
+    finally:
+        worker.Proxmox = saved_px
+
+    assert destroys == [8371]
+    with session_scope() as s:
+        deploy_dep = s.get(Deployment, deploy_dep_id)
+        destroy_dep = s.get(Deployment, destroy_dep_id)
+        assert deploy_dep.status == "cleanup_pending"
+        assert deploy_dep.cleanup_origin == "deploy"
+        assert destroy_dep.status == "stopped"
+        assert destroy_dep.cleanup_origin is None
 
 
 def test_legacy_queued_job_persists_execution_plan_once():
@@ -441,6 +545,9 @@ if __name__ == "__main__":
     test_execution_plan_rejects_malformed_ciphertext()
     test_job_detail_does_not_disclose_execution_plan_or_captured_command()
     test_cleanup_pending_serialization_preserves_owned_identity_and_error()
+    test_cleanup_pending_serialization_uses_owned_static_allocation_when_ip_is_empty()
+    test_cleanup_origin_migration_is_additive_and_idempotent()
+    test_cleanup_retry_uses_persisted_origin_after_job_retention_prunes_history()
     test_legacy_queued_job_persists_execution_plan_once()
     test_recipe_without_ssh_key_fails_before_vm_creation()
     test_recipe_free_deployment_uses_native_ciuser_without_snippet()

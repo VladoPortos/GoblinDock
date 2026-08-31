@@ -699,6 +699,8 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         d.disk = _effective_disk_gb(resize_ok, disk_gb, _scsi0_size_gb(px, new_vmid, node))
         d.status = "running"
         d.error = ""
+        d.cleanup_origin = None
+        d.cleanup_last_attempt_at = None
         s.add(d)
 
     ctx.progress(100, "Complete")
@@ -991,11 +993,23 @@ def _drop_deployment_if_matches(
 
 
 def _set_dep_status(
-    dep_id: int, status: str, error: str, expected_vmid: Optional[int]
+    dep_id: int,
+    status: str,
+    error: str,
+    expected_vmid: Optional[int],
+    cleanup_origin: Optional[str] = None,
 ) -> None:
     with session_scope() as s:
         d = s.get(Deployment, dep_id)
         if d and d.vmid == expected_vmid:
+            if status == "cleanup_pending":
+                if cleanup_origin in ("deploy", "destroy"):
+                    if d.status != "cleanup_pending" or d.cleanup_origin != cleanup_origin:
+                        d.cleanup_last_attempt_at = None
+                    d.cleanup_origin = cleanup_origin
+            else:
+                d.cleanup_origin = None
+                d.cleanup_last_attempt_at = None
             d.status = status
             d.error = error[:300] if error else ""
             s.add(d)
@@ -1099,6 +1113,7 @@ def _reconcile_canceled_job(job_id: Optional[int]) -> None:
             "cleanup_pending",
             f"canceled {job_type} cleanup not confirmed: {detail}",
             expected_vmid=vmid,
+            cleanup_origin=job_type,
         )
     else:
         _set_dep_status(
@@ -1136,6 +1151,8 @@ def _reconcile_failed_job(job_id: int) -> None:
             return
         dep.status = "error"
         dep.error = job_error[:300]
+        dep.cleanup_origin = None
+        dep.cleanup_last_attempt_at = None
         s.add(dep)
         if job_type == "deploy" and presence == VM_ABSENT:
             for allocation in s.exec(
@@ -1146,29 +1163,28 @@ def _reconcile_failed_job(job_id: int) -> None:
 
 def _retry_cleanup_pending(now: Optional[datetime] = None) -> None:
     """Retry ambiguous cleanup at most once per minute, outside DB transactions."""
-    attempt_at = ensure_utc(now) or utcnow()
-    cutoff = attempt_at - timedelta(seconds=60)
-    targets = []
     with session_scope() as s:
-        deployments = s.exec(
-            select(Deployment).where(Deployment.status == "cleanup_pending")
-        ).all()
-        for dep in deployments:
+        dep_ids = [dep.id for dep in s.exec(
+            select(Deployment).where(
+                Deployment.status == "cleanup_pending"
+            ).order_by(Deployment.id)
+        ).all()]
+
+    for dep_id in dep_ids:
+        attempt_at = ensure_utc(now) or utcnow()
+        cutoff = attempt_at - timedelta(seconds=60)
+        with session_scope() as s:
+            dep = s.get(Deployment, dep_id)
+            if not dep or dep.status != "cleanup_pending":
+                continue
             last_attempt = ensure_utc(dep.cleanup_last_attempt_at)
             if last_attempt is not None and last_attempt > cutoff:
                 continue
-            latest_job = s.exec(
-                select(Job).where(
-                    Job.deployment_id == dep.id, Job.status == "canceled"
-                ).order_by(Job.id.desc())
-            ).first()
             dep.cleanup_last_attempt_at = attempt_at
             s.add(dep)
-            targets.append(
-                (dep.id, dep.connection_id, dep.vmid, dep.node, latest_job.type if latest_job else "")
-            )
+            target = (dep.id, dep.connection_id, dep.vmid, dep.node, dep.cleanup_origin or "")
 
-    for dep_id, conn_id, vmid, node, job_type in targets:
+        dep_id, conn_id, vmid, node, job_type = target
         if job_type == "deploy" and vmid is not None:
             _best_effort_destroy(conn_id, vmid, node)
         px = _px_for_conn(conn_id) if vmid is not None else None

@@ -175,7 +175,7 @@ class Deployment(SQLModel, table=True):
     disk: int = 20        # GB
     ip: str = ""
     mac: str = ""
-    status: str = "working"  # running | stopped | working | error (live "unknown" serializes as stopped)
+    status: str = "working"  # running | stopped | working | error | cleanup_pending
     tags: str = ""
     notes: str = ""
     error: str = ""
@@ -184,6 +184,7 @@ class Deployment(SQLModel, table=True):
     # OS user the password is for: 'root' (snippet path) | 'goblin' (native cloud-init fallback).
     cred_user: str = ""
     cleanup_last_attempt_at: Optional[datetime] = None
+    cleanup_origin: Optional[str] = None  # deploy | destroy; only while cleanup_pending
     created_at: datetime = Field(default_factory=utcnow)
 
 
