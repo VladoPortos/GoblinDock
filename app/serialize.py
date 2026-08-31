@@ -315,6 +315,7 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
 
 def template_dict(session: Session, t: Template, viewer: Optional["User"] = None) -> dict:
     used = session.exec(select(Deployment).where(Deployment.template_id == t.id)).all()
+    can_edit = viewer is not None and (viewer.role == "admin" or t.owner_id == viewer.id)
     recipe = json.loads(t.recipe_json or "[]")
     # Mask literal password-field values for anyone who isn't the owner or an admin —
     # public templates are visible to every authenticated user via /api/state.
@@ -334,6 +335,8 @@ def template_dict(session: Session, t: Template, viewer: Optional["User"] = None
         "mem": t.default_ram,
         "disk": t.default_disk,
         "used": len(used),
+        "canEdit": can_edit,
+        "canDelete": can_edit and not used,
         "public": t.public,
         "blocks": recipe_block_chips(recipe),
         "recipe": recipe,

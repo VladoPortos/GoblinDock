@@ -151,8 +151,17 @@
   }
 
   /* ============ TEMPLATES LIST ============ */
+  function templateActionFlags(template) {
+    const canEdit = template?.canEdit === true;
+    return {
+      canEdit,
+      canDelete: canEdit && template?.canDelete === true,
+    };
+  }
+
   function TemplateCard({ r, go, onDelete, onDeploy }) {
     const deployable = !!r.deployable;
+    const actions = templateActionFlags(r);
     return h('div', { className: 'card', style: { overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
       h('div', { className: 'card-pad', style: { display: 'flex', flexDirection: 'column', gap: 12, flex: 1 } },
         h('div', { className: 'row', style: { gap: 10 } },
@@ -180,10 +189,10 @@
           h('span', null, r.used, ' deploys'))),
       h('div', { style: { display: 'flex', borderTop: '1px solid var(--border-soft)' } },
         h('button', { className: 'card-act', disabled: !deployable, title: deployable ? 'One-click deploy from this template' : 'Pick a base image + location first (Edit)', onClick: () => onDeploy(r) }, h(Icon, { name: 'play', size: 14 }), 'Deploy'),
-        h('button', { className: 'card-act', onClick: () => go('newtemplate', { templateId: r.templateId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
-        h(Menu, { align: 'right', items: [
+        actions.canEdit && h('button', { className: 'card-act', onClick: () => go('newtemplate', { templateId: r.templateId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
+        actions.canDelete && h(Menu, { align: 'right', items: [
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onDelete(r) },
-        ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' } }, h(Icon, { name: 'more', size: 16 })))));
+        ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' }, 'aria-label': 'Template actions' }, h(Icon, { name: 'more', size: 16 })))));
   }
 
   function TemplatesList({ go }) {
@@ -221,4 +230,5 @@
 
   window.Profile = Profile;
   window.TemplatesList = TemplatesList;
+  window.TemplateUI = { templateActionFlags };
 })();

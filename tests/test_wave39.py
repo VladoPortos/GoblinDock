@@ -31,7 +31,7 @@ os.environ.setdefault(
 
 from app import api, serialize as S  # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
-from app.models import Connection, Image, User  # noqa: E402
+from app.models import Block, Connection, Deployment, Image, Template, User  # noqa: E402
 
 init_db()
 
@@ -425,6 +425,178 @@ def test_connection_admin_round_trip_and_public_redaction():
     assert token_secret_sentinel not in json.dumps(public)
 
 
+def _template_capability_fixture():
+    """Create complete templates so capability checks exercise the real serializer."""
+    suffix = os.urandom(4).hex()
+    with session_scope() as session:
+        owner = User(
+            email=f"wave39-template-owner-{suffix}@example.com",
+            name="Wave 39 template owner",
+            password_hash="unused",
+        )
+        viewer = User(
+            email=f"wave39-template-viewer-{suffix}@example.com",
+            name="Wave 39 template viewer",
+            password_hash="unused",
+        )
+        admin = User(
+            email=f"wave39-template-admin-{suffix}@example.com",
+            name="Wave 39 template admin",
+            password_hash="unused",
+            role="admin",
+        )
+        block = Block(
+            key=f"c-wave39-template-{suffix}",
+            kind="custom",
+            builtin=False,
+            name="Wave 39 password block",
+            input_schema_json=json.dumps([
+                {"name": "password", "type": "password"},
+            ]),
+        )
+        image = Image(
+            kind="base",
+            name=f"wave39-template-image-{suffix}",
+            source_url="https://example.com/wave39-template.img",
+            build_status="ready",
+        )
+        connection = Connection(
+            name=f"wave39-template-connection-{suffix}",
+            host="pve.example",
+            token_id="automation@pve!goblindock",
+            node="pve-a",
+        )
+        session.add(owner)
+        session.add(viewer)
+        session.add(admin)
+        session.add(block)
+        session.add(image)
+        session.add(connection)
+        session.flush()
+
+        recipe = [{"blocks": [{
+            "ref": block.key,
+            "inputs": {"password": "WAVE39-TEMPLATE-SECRET", "note": "public"},
+        }]}]
+        owned = Template(
+            name=f"wave39-owned-template-{suffix}",
+            description="Capability fixture",
+            owner_id=owner.id,
+            public=True,
+            recipe_json=json.dumps(recipe),
+            base_image_id=image.id,
+            connection_id=connection.id,
+        )
+        referenced = Template(
+            name=f"wave39-referenced-template-{suffix}",
+            owner_id=owner.id,
+            public=True,
+            recipe_json=json.dumps(recipe),
+            base_image_id=image.id,
+            connection_id=connection.id,
+        )
+        system = Template(
+            name=f"wave39-system-template-{suffix}",
+            owner_id=None,
+            public=True,
+            recipe_json="[]",
+            base_image_id=image.id,
+            connection_id=connection.id,
+        )
+        session.add(owned)
+        session.add(referenced)
+        session.add(system)
+        session.flush()
+        session.add(Deployment(
+            name=f"wave39-template-deployment-{suffix}",
+            owner_id=owner.id,
+            template_id=referenced.id,
+            image_id=image.id,
+            connection_id=connection.id,
+        ))
+        session.flush()
+        return {
+            "owner": owner.id,
+            "viewer": viewer.id,
+            "admin": admin.id,
+            "owned": owned.id,
+            "referenced": referenced.id,
+            "system": system.id,
+            "block": block.key,
+            "image": image.name,
+            "connection": connection.name,
+        }
+
+
+def test_template_capabilities_follow_owner_and_admin_edit_authority():
+    fixture = _template_capability_fixture()
+    with session_scope() as session:
+        template = session.get(Template, fixture["owned"])
+        owner = S.template_dict(session, template, viewer=session.get(User, fixture["owner"]))
+        admin = S.template_dict(session, template, viewer=session.get(User, fixture["admin"]))
+        viewer = S.template_dict(session, template, viewer=session.get(User, fixture["viewer"]))
+        system_admin = S.template_dict(
+            session,
+            session.get(Template, fixture["system"]),
+            viewer=session.get(User, fixture["admin"]),
+        )
+        system_viewer = S.template_dict(
+            session,
+            session.get(Template, fixture["system"]),
+            viewer=session.get(User, fixture["viewer"]),
+        )
+
+    assert (owner["canEdit"], owner["canDelete"]) == (True, True)
+    assert (admin["canEdit"], admin["canDelete"]) == (True, True)
+    assert (viewer["canEdit"], viewer["canDelete"]) == (False, False)
+    assert (system_admin["canEdit"], system_admin["canDelete"]) == (True, True)
+    assert (system_viewer["canEdit"], system_viewer["canDelete"]) == (False, False)
+
+
+def test_referenced_owned_template_stays_editable_but_cannot_be_deleted():
+    fixture = _template_capability_fixture()
+    with session_scope() as session:
+        template = session.get(Template, fixture["referenced"])
+        owner = S.template_dict(session, template, viewer=session.get(User, fixture["owner"]))
+        admin = S.template_dict(session, template, viewer=session.get(User, fixture["admin"]))
+
+    assert owner["used"] == 1
+    assert (owner["canEdit"], owner["canDelete"]) == (True, False)
+    assert (admin["canEdit"], admin["canDelete"]) == (True, False)
+
+
+def test_template_capabilities_fail_safe_without_viewer_and_preserve_payload_data():
+    fixture = _template_capability_fixture()
+    with session_scope() as session:
+        template = session.get(Template, fixture["owned"])
+        no_viewer = S.template_dict(session, template, viewer=None)
+        owner = S.template_dict(session, template, viewer=session.get(User, fixture["owner"]))
+        viewer = S.template_dict(session, template, viewer=session.get(User, fixture["viewer"]))
+
+    assert (no_viewer["canEdit"], no_viewer["canDelete"]) == (False, False)
+    assert {
+        "public": owner["public"],
+        "deployable": owner["deployable"],
+        "base": owner["base"],
+        "location": owner["location"],
+        "blocks": owner["blocks"],
+    } == {
+        "public": True,
+        "deployable": True,
+        "base": fixture["image"],
+        "location": fixture["connection"] + " · pve-a",
+        "blocks": [fixture["block"]],
+    }
+    assert owner["recipe"][0]["blocks"][0]["inputs"] == {
+        "password": "WAVE39-TEMPLATE-SECRET",
+        "note": "public",
+    }
+    assert viewer["recipe"][0]["blocks"][0]["inputs"] == {
+        "password": "********",
+        "note": "public",
+    }
+
+
 def _expect_checksum_400(value):
     try:
         api._clean_checksum(value)
@@ -570,6 +742,9 @@ if __name__ == "__main__":
     test_sri_reports_exact_pre_fix_six_crlf_mismatches()
     test_local_sri_resources_match_exact_working_tree_bytes()
     test_connection_admin_round_trip_and_public_redaction()
+    test_template_capabilities_follow_owner_and_admin_edit_authority()
+    test_referenced_owned_template_stays_editable_but_cannot_be_deleted()
+    test_template_capabilities_fail_safe_without_viewer_and_preserve_payload_data()
     test_checksum_validation_normalizes_supported_digests_without_legacy_regression()
     test_base_image_create_and_edit_persist_normalized_checksum_atomically()
     print("\nALL WAVE 39 UNIT TESTS PASSED")

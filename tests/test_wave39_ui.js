@@ -7,6 +7,7 @@ const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'web', 'manage.js'), 'utf8');
 const imagesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'images.js'), 'utf8');
+const templatesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'extra.js'), 'utf8');
 const uiSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'ui.js'), 'utf8');
 const stylesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'styles.css'), 'utf8');
 let nextId = 0;
@@ -75,6 +76,136 @@ function cssRule(selector) {
   const match = stylesSource.match(new RegExp(`(?:^|\\n)\\s*${escaped}\\s*\\{([^}]*)\\}`, 'm'));
   assert.ok(match, `missing ${selector} CSS rule`);
   return match[1];
+}
+
+function templateListHarness(templates) {
+  const HarnessReact = {
+    createElement: React.createElement,
+    useState(initial) {
+      return [typeof initial === 'function' ? initial() : initial, () => {}];
+    },
+  };
+  const harnessWindow = {
+    React: HarnessReact,
+    Icon(props) {
+      return HarnessReact.createElement('span', { 'data-icon': props.name });
+    },
+    GD: { TEMPLATES: templates, me: {} },
+    GDStore: { signOut() {} },
+    API: {},
+    UI: {
+      Menu(props) {
+        return HarnessReact.createElement('div', { 'data-template-menu': true },
+          props.children,
+          (props.items || []).map((item) => HarnessReact.createElement(
+            'button', { key: item.label, onClick: item.onClick }, item.label,
+          )),
+        );
+      },
+      ConfirmModal() {}, Field() {}, CopyField() {},
+      OSGlyph(props) {
+        return HarnessReact.createElement('span', { 'data-os': props.os });
+      },
+      copyToClipboard() {},
+    },
+  };
+  vm.runInNewContext(templatesSource, { React: HarnessReact, window: harnessWindow }, {
+    filename: 'web/extra.js',
+  });
+  const tree = resolveTree(harnessWindow.TemplatesList({ go() {} }));
+  return { window: harnessWindow, tree };
+}
+
+const templateFixtures = [
+  {
+    id: 't-owner', templateId: 3911, name: 'Owner allowed', os: 'ubuntu', desc: '',
+    cpu: 2, mem: 4, disk: 20, used: 0, public: false, blocks: [], base: 'Ubuntu',
+    location: 'pve-a', deployable: true, canEdit: true, canDelete: true,
+  },
+  {
+    id: 't-admin', templateId: 3912, name: 'Admin allowed', os: 'ubuntu', desc: '',
+    cpu: 2, mem: 4, disk: 20, used: 0, public: true, blocks: [], base: 'Ubuntu',
+    location: 'pve-a', deployable: true, canEdit: true, canDelete: true,
+  },
+  {
+    id: 't-viewer', templateId: 3913, name: 'Public viewer', os: 'ubuntu', desc: '',
+    cpu: 2, mem: 4, disk: 20, used: 0, public: true, blocks: [], base: 'Ubuntu',
+    location: 'pve-a', deployable: true, canEdit: false, canDelete: false,
+  },
+  {
+    id: 't-referenced', templateId: 3914, name: 'Referenced owner', os: 'ubuntu', desc: '',
+    cpu: 2, mem: 4, disk: 20, used: 1, public: false, blocks: [], base: 'Ubuntu',
+    location: 'pve-a', deployable: false, canEdit: true, canDelete: false,
+  },
+];
+const templateHarness = templateListHarness(templateFixtures);
+function templateCard(name) {
+  const cards = findAll(templateHarness.tree, (node) => node.props.className === 'card'
+    && textOf(node).includes(name));
+  assert.equal(cards.length, 1, `missing rendered ${name} template card`);
+  return cards[0];
+}
+
+function templateActionState(name) {
+  const card = templateCard(name);
+  const buttons = findAll(card, (node) => node.type === 'button');
+  const buttonLabels = buttons.map(textOf);
+  return {
+    card,
+    buttonLabels,
+    deploy: buttons.find((button) => textOf(button) === 'Deploy'),
+    menus: findAll(card, (node) => node.props['data-template-menu'] === true),
+  };
+}
+
+const allowedTemplateStates = [];
+for (const name of ['Owner allowed', 'Admin allowed']) {
+  const state = templateActionState(name);
+  allowedTemplateStates.push({ name, state });
+  assert.ok(state.deploy, `${name} must retain Deploy`);
+  assert.equal(state.deploy.props.disabled, false);
+  assert.ok(state.buttonLabels.includes('Edit'), `${name} must show Edit`);
+  assert.ok(state.buttonLabels.includes('Delete'), `${name} must show Delete`);
+  assert.equal(state.menus.length, 1, `${name} must show the actions menu`);
+}
+
+const viewerActions = templateActionState('Public viewer');
+assert.ok(viewerActions.deploy, 'a non-owner public template must retain Deploy');
+assert.equal(viewerActions.deploy.props.disabled, false);
+assert.equal(viewerActions.buttonLabels.includes('Edit'), false);
+assert.equal(viewerActions.buttonLabels.includes('Delete'), false);
+assert.equal(viewerActions.menus.length, 0, 'an empty actions menu must be omitted');
+
+const referencedActions = templateActionState('Referenced owner');
+assert.ok(referencedActions.deploy, 'a referenced owned template must retain Deploy');
+assert.equal(referencedActions.deploy.props.disabled, true,
+  'Deploy disabled state must remain controlled only by deployable');
+assert.ok(referencedActions.buttonLabels.includes('Edit'));
+assert.equal(referencedActions.buttonLabels.includes('Delete'), false);
+assert.equal(referencedActions.menus.length, 0, 'a non-deletable template has no menu');
+assert.equal(findAll(templateHarness.tree, (node) => textOf(node) === 'Fork').length, 0,
+  'template cards must not add a Fork action');
+
+for (const { state } of allowedTemplateStates) {
+  const menuTrigger = findAll(state.menus[0], (node) => node.type === 'button'
+    && textOf(node) === '')[0];
+  assert.equal(menuTrigger.props['aria-label'], 'Template actions',
+    'the icon-only template menu trigger needs an accessible name');
+}
+
+assert.ok(templateHarness.window.TemplateUI,
+  'extra.js must export window.TemplateUI');
+assert.equal(typeof templateHarness.window.TemplateUI.templateActionFlags, 'function');
+const { templateActionFlags } = templateHarness.window.TemplateUI;
+assert.deepEqual(JSON.parse(JSON.stringify(templateActionFlags({
+  canEdit: true, canDelete: true,
+}))), { canEdit: true, canDelete: true });
+for (const unsafe of [
+  {}, null, { canEdit: 1, canDelete: 'yes' }, { canEdit: false, canDelete: true },
+]) {
+  assert.deepEqual(JSON.parse(JSON.stringify(templateActionFlags(unsafe))), {
+    canEdit: false, canDelete: false,
+  }, 'template capabilities must fail closed and remain strict booleans');
 }
 
 const renderedFields = [
