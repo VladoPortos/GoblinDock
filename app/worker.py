@@ -1362,21 +1362,27 @@ def _finish_waiting_error(job_id: int, exc: Exception) -> None:
 def _timeout_waiting_job(job_id: int) -> None:
     """Fail an expired IP wait without releasing its VM or reserved IP ownership."""
     error = "guest IP was not reported within 30 minutes"
+    cancel_requested = False
     with session_scope() as s:
         job = s.get(Job, job_id)
         if not job or job.status != "waiting":
             return
-        job.status = "failed"
-        job.error = error
-        job.finished_at = utcnow()
-        s.add(job)
-        dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
-        if dep:
-            dep.status = "error"
-            dep.error = error
-            dep.cleanup_origin = None
-            dep.cleanup_last_attempt_at = None
-            s.add(dep)
+        cancel_requested = job.cancel_requested
+        if not cancel_requested:
+            job.status = "failed"
+            job.error = error
+            job.finished_at = utcnow()
+            s.add(job)
+            dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
+            if dep:
+                dep.status = "error"
+                dep.error = error
+                dep.cleanup_origin = None
+                dep.cleanup_last_attempt_at = None
+                s.add(dep)
+    if cancel_requested:
+        _finish_waiting_error(job_id, JobCancelled())
+        return
     JobCtx(job_id).log(f"[{_ts()}] ✗ {error}", "l-err")
     statebus.bump()
 

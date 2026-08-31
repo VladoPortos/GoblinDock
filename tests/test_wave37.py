@@ -708,6 +708,44 @@ def test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership():
         assert len(allocations) == 1
 
 
+def test_timeout_rechecks_committed_cancellation_before_failing():
+    """A cancel committed after poll selection must win over the timeout transition."""
+    job_id, dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=31), reserve_ip=True,
+    )
+    destroyed: list[int] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def destroy(self, vmid, **_kwargs):
+            destroyed.append(vmid)
+            return "UPID:destroy"
+        def wait_task(self, *_args, **_kwargs): return None
+        def list_qemu(self, _node=None, **_kwargs): return []
+
+    original_timeout = worker._timeout_waiting_job
+
+    def _cancel_then_timeout(selected_job_id: int) -> None:
+        with session_scope() as s:
+            job = s.get(Job, selected_job_id)
+            job.cancel_requested = True
+            s.add(job)
+        original_timeout(selected_job_id)
+
+    with _patched_worker(Proxmox=_Px, _timeout_waiting_job=_cancel_then_timeout):
+        assert worker._poll_waiting_jobs() is True
+
+    assert destroyed, "the cancellation reconciliation path must destroy the deploy VM"
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        assert job.status == "canceled"
+        assert job.error == "canceled"
+        assert s.get(Deployment, dep_id) is None
+        assert s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep_id,
+        )).all() == []
+
+
 def test_waiting_cancellation_uses_deployment_reconciliation():
     """A canceled wait must take the same absence-confirmed cleanup path as running work."""
     job_id, dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
@@ -872,6 +910,7 @@ if __name__ == "__main__":
     test_missing_guest_ip_defers_required_ansible_without_false_success()
     test_waiting_job_resumes_only_captured_ansible_plan_when_ip_appears()
     test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership()
+    test_timeout_rechecks_committed_cancellation_before_failing()
     test_waiting_cancellation_uses_deployment_reconciliation()
     test_waiting_poll_yields_to_queued_work()
     test_restart_recovery_leaves_durable_wait_untouched()

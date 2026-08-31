@@ -7,6 +7,11 @@
 
   const STEP_ICON = { done: 'check', running: 'clock', pending: 'box', failed: 'x', skipped: 'skip' };
   const STEP_TONE = { done: 'var(--ok)', running: 'var(--warn)', pending: 'var(--text-faint)', failed: 'var(--err)', skipped: 'var(--text-faint)' };
+  const LIVE_JOB_STATUSES = new Set(['queued', 'running', 'waiting']);
+
+  function isLiveJobStatus(rawStatus) {
+    return LIVE_JOB_STATUSES.has(rawStatus);
+  }
 
   function ChecklistTreatment({ steps }) {
     if (!steps.length) {
@@ -121,7 +126,7 @@
     const done = steps.filter(s => s.state === 'done' || s.state === 'skipped').length;
     const total = steps.length || 1;
     const pct = job.pct;
-    const live = job.rawStatus === 'running' || job.rawStatus === 'queued';
+    const live = isLiveJobStatus(job.rawStatus);
     const statusBadge = job.status; // working | done | error
     const pIdx = phaseIndex(job);
 
