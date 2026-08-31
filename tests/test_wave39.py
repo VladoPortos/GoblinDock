@@ -1,8 +1,13 @@
 """Wave 39 — UI, accessibility, and onboarding regressions."""
+import base64
+import hashlib
 import json
 import os
 import sys
 import tempfile
+from html.parser import HTMLParser
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -23,6 +28,52 @@ from app.db import init_db, session_scope  # noqa: E402
 from app.models import Connection  # noqa: E402
 
 init_db()
+
+
+class _SriResourceParser(HTMLParser):
+    """Collect local resources whose exact response bytes are SRI-protected."""
+
+    def __init__(self):
+        super().__init__()
+        self.resources = []
+
+    def handle_starttag(self, _tag, attrs):
+        attributes = dict(attrs)
+        integrity = attributes.get("integrity", "")
+        if not integrity.startswith("sha384-"):
+            return
+
+        for attribute in ("src", "href"):
+            reference = attributes.get(attribute)
+            if not reference or reference.startswith("//"):
+                continue
+            parsed = urlsplit(reference)
+            if parsed.scheme or parsed.netloc or not parsed.path:
+                continue
+            self.resources.append((unquote(parsed.path), integrity))
+
+
+def test_local_sri_resources_match_exact_working_tree_bytes():
+    """Checkout filters must not change bytes protected by browser SRI."""
+    repository_root = Path(__file__).resolve().parent.parent
+    web_root = repository_root / "web"
+    parser = _SriResourceParser()
+    parser.feed((web_root / "index.html").read_text(encoding="utf-8"))
+
+    assert len(parser.resources) == 11, parser.resources
+
+    mismatches = []
+    for reference, expected_integrity in parser.resources:
+        asset_path = web_root / reference.lstrip("/")
+        actual_integrity = "sha384-" + base64.b64encode(
+            hashlib.sha384(asset_path.read_bytes()).digest()
+        ).decode("ascii")
+        if actual_integrity != expected_integrity:
+            mismatches.append(
+                f"{reference}: expected {expected_integrity}, got {actual_integrity}"
+            )
+
+    assert not mismatches, "SRI mismatch for local assets:\n" + "\n".join(mismatches)
 
 
 def test_connection_admin_round_trip_and_public_redaction():
@@ -88,5 +139,6 @@ def test_connection_admin_round_trip_and_public_redaction():
 
 
 if __name__ == "__main__":
+    test_local_sri_resources_match_exact_working_tree_bytes()
     test_connection_admin_round_trip_and_public_redaction()
     print("\nALL WAVE 39 UNIT TESTS PASSED")
