@@ -258,7 +258,7 @@ it falls back to native cloud-init.
 | `GOBLINDOCK_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | — | optional first-run admin bootstrap (skips the setup screen) |
 | `GOBLINDOCK_CORS` | — | comma-separated extra allowed origins (CORS **and** the console WebSocket origin allow-list) |
 | `GOBLINDOCK_COOKIE_SECURE` | on (off in dev) | override the session cookie `Secure` flag |
-| `GOBLINDOCK_SSH_STRICT` / `GOBLINDOCK_SSH_KNOWN_HOSTS` | `false` / — | SSH host-key verification for snippet upload: strict rejects unknown hosts; point `_KNOWN_HOSTS` at a pinned `known_hosts` file |
+| `GOBLINDOCK_SSH_STRICT` / `GOBLINDOCK_SSH_KNOWN_HOSTS` | `false` / — | SSH host-key verification for snippet upload: the default pins first-seen keys in `<data>/ssh_known_hosts`; strict rejects unknown hosts; `_KNOWN_HOSTS` adds explicit pins |
 | `GOBLINDOCK_SEED_PROXMOX` | `false` | auto-create the connection from `PROXMOX_*` |
 | `PROXMOX_TOKEN_ID` / `PROXMOX_TOKEN` | — | Proxmox API token (keep in gitignored `.secrets/`; `PROXMOX_TOKEN_FILE` works for Docker secrets) |
 | `PROXMOX_HOST` / `_NODE` / `_STORAGE` / `_BRIDGE` | — | connection defaults |
@@ -290,11 +290,12 @@ it falls back to native cloud-init.
   gateway / DNS — just enough to pick one). Templates and blocks honour visibility — a
   private one can't be deployed, compiled, or forked by guessing its id. Optional
   per-user VM **quota** (`GOBLINDOCK_MAX_VMS_PER_USER`).
-- **Host-key / TLS verification** — Proxmox API TLS (`verify_tls`, per connection) and
-  SSH host-key checking (`GOBLINDOCK_SSH_STRICT` + `known_hosts`) default to trust-on-
-  first-use for a homelab LAN; **enable both** when the control plane is reachable from
-  an untrusted network. (The post-boot Ansible leg over SSH is TOFU by design for
-  ephemeral VMs.)
+- **Host-key / TLS verification** — Proxmox API TLS (`verify_tls`, per connection) is
+  enabled by default. Snippet-upload SSH uses persistent trust-on-first-use at
+  `<data>/ssh_known_hosts`; a changed node key is rejected. Set
+  `GOBLINDOCK_SSH_STRICT=1` with an explicit `GOBLINDOCK_SSH_KNOWN_HOSTS` file when
+  first contact also needs a pre-provisioned pin. (The post-boot Ansible leg over SSH
+  is TOFU by design for ephemeral VMs.)
 - **Encryption at rest** — secrets and Proxmox tokens are Fernet-encrypted (HKDF-derived
   from `GOBLINDOCK_SECRET_KEY`) and masked in logs/previews.
 - **Guard rails** — a hard VMID-window check in the Proxmox client (GoblinDock can never

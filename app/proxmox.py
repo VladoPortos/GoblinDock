@@ -14,7 +14,9 @@ import logging
 import os
 import re
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from proxmoxer import ProxmoxAPI
 from proxmoxer.core import ResourceException
@@ -34,6 +36,15 @@ _warned_insecure_tls: set = set()
 _DOCKER_BRIDGE_NET = ipaddress.ip_network("172.17.0.0/16")
 
 
+def _proxmox_port(value) -> int:
+    """Normalize legacy database values before constructing network endpoints."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 8006
+    return port if 1 <= port <= 65535 else 8006
+
+
 class ProxmoxError(RuntimeError):
     pass
 
@@ -48,14 +59,25 @@ class JobCancelled(Exception):
     pass
 
 
-def base_disk_filename(src_url: str) -> str:
-    """Cached per-URL qcow2 name on node storage. 'import' content needs a
-    recognised extension (cloud .img files are qcow2), and the name flows into
-    the comma-delimited import-from config — strict allowlist, URL-hash namespaced."""
-    raw_name = (src_url.rsplit("/", 1)[-1] if src_url else "image") or "image"
+def base_disk_filename(
+    src_url: str, checksum: str = "", checksum_algorithm: str = "",
+) -> str:
+    """Safe cache identity for one source and, when declared, one digest.
+
+    Checksum-less images retain the historical URL-only identity.  A declared
+    checksum becomes part of the identity so adding or changing verification can
+    never reuse bytes cached under a different integrity contract.  Only the URL
+    path contributes human-readable text; credentials and query tokens never do.
+    """
+    raw_name = ((urlsplit(src_url or "").path.rsplit("/", 1)[-1]) or "image")
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).lstrip(".-") or "image"
     stem = safe.rsplit(".", 1)[0] or "image"
-    url_tag = hashlib.sha256((src_url or "").encode()).hexdigest()[:8]
+    digest = (checksum or "").strip().lower()
+    algorithm = (checksum_algorithm or "").strip().lower()
+    identity = src_url or ""
+    if digest:
+        identity = f"{identity}\0{algorithm}\0{digest}"
+    url_tag = hashlib.sha256(identity.encode()).hexdigest()[:8]
     filename = f"{stem}-{url_tag}.qcow2"
     if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
         raise RuntimeError(f"unsafe image filename derived from URL: {raw_name!r}")
@@ -119,7 +141,7 @@ class Proxmox:
             token_value=decrypt(conn.token_secret_enc),
             verify_ssl=conn.verify_tls,
             service="PVE",
-            port=conn.port or 8006,
+            port=_proxmox_port(conn.port),
             timeout=30,
         )
 
@@ -463,7 +485,7 @@ class Proxmox:
 
     def console_ws_url(self, vmid: int, node: str, port, ticket: str) -> str:
         from urllib.parse import quote
-        host, pp = self.conn.host, self.conn.port or 8006
+        host, pp = self.conn.host, _proxmox_port(self.conn.port)
         return (f"wss://{host}:{pp}/api2/json/nodes/{node}/qemu/{vmid}"
                 f"/vncwebsocket?port={port}&vncticket={quote(str(ticket))}")
 
@@ -493,9 +515,23 @@ def _ssh_client(conn: Connection, key, timeout: int):
         pass
     if settings.ssh_known_hosts and os.path.exists(settings.ssh_known_hosts):
         try:
-            client.load_host_keys(settings.ssh_known_hosts)
+            # Explicit pins are read-only and checked before the writable TOFU set.
+            client.load_system_host_keys(settings.ssh_known_hosts)
         except Exception:  # noqa: BLE001
             pass
+    if not settings.ssh_strict:
+        tofu_path = Path(settings.data_dir) / "ssh_known_hosts"
+        tofu_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(tofu_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
+        # Existing installations may have created the file under a permissive umask.
+        # Tighten it before loading; AutoAddPolicy preserves the mode when truncating.
+        os.chmod(tofu_path, 0o600)
+        client.load_host_keys(str(tofu_path))
     client.set_missing_host_key_policy(
         paramiko.RejectPolicy() if settings.ssh_strict else paramiko.AutoAddPolicy()
     )
@@ -532,14 +568,26 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
         # Pure SFTP — no shell exec, so nothing user-influenced reaches a shell.
         sftp = client.open_sftp()
         try:
-            sftp.stat(base)
-        except IOError:
             try:
-                sftp.mkdir(base)
+                sftp.stat(base)
             except IOError:
-                pass  # parent may be missing; putfo below will surface a clear error
-        sftp.putfo(io.BytesIO(content.encode("utf-8")), remote)
-        sftp.close()
+                try:
+                    sftp.mkdir(base)
+                except IOError:
+                    pass  # parent may be missing; putfo below will surface a clear error
+            sftp.putfo(io.BytesIO(content.encode("utf-8")), remote)
+            # The cloud-config may contain resolved password/secret inputs.  Fail
+            # closed unless the node-side copy is readable only by its SSH owner.
+            try:
+                sftp.chmod(remote, 0o600)
+            except Exception:
+                try:
+                    sftp.remove(remote)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+        finally:
+            sftp.close()
     finally:
         client.close()
 

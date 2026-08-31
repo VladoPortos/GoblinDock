@@ -1039,6 +1039,11 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
             raise
         except Exception as e:  # noqa: BLE001
             raise HTTPException(502, f"proxmox: {e}")
+        dep.status = "stopped" if body.action == "stop" else "running"
+        dep.error = ""
+        dep.cleanup_origin = None
+        dep.cleanup_last_attempt_at = None
+        session.add(dep)
         record_audit(session, user, f"vm.{body.action}", "deployment", dep.id, dep.name)
         session.commit()
         statebus.bump()
@@ -1742,7 +1747,9 @@ def cached_images(connectionId: int, user: User = Depends(current_user),
     for img in bases:
         if not (img.source_url or "").strip():
             continue  # nothing to download — UI shows unknown
-        cached[str(img.id)] = px.iso_volume_path(base_disk_filename(img.source_url)) in vols
+        cached[str(img.id)] = px.iso_volume_path(base_disk_filename(
+            img.source_url, img.checksum or "", _checksum_algo(img.checksum or ""),
+        )) in vols
     result = {"online": True, "cached": cached}
     _CACHED_IMAGES_CACHE[connectionId] = (now, result)
     return result

@@ -392,12 +392,18 @@ def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str],
     script = [c for c in recipe_cmds if c.strip() and c.strip() != "set -e"]
     if script:
         lines += ["write_files:", "  - path: /opt/goblindock-recipe.sh",
-                  "    permissions: '0755'", "    content: |",
-                  "      #!/bin/bash", "      set -e"]
+                  "    permissions: '0700'", "    content: |",
+                  "      #!/bin/bash", "      set -e",
+                  "      trap 'rm -f -- \"$0\"' EXIT"]
         lines += ["      " + ln for ln in script]
     lines += ["runcmd:", "  - [systemctl, enable, --now, qemu-guest-agent]"]
     if script:
-        lines += ["  - [/bin/bash, /opt/goblindock-recipe.sh]"]
+        # The fixed outer shell removes the secret-bearing child even when the
+        # child has a parse error, exits non-zero, replaces itself, or changes traps.
+        lines += [
+            "  - [/bin/bash, -c, \"trap 'rm -f -- /opt/goblindock-recipe.sh' "
+            "EXIT; /bin/bash /opt/goblindock-recipe.sh\"]"
+        ]
     lines += ["  - touch /run/goblindock-ready"]
     return "\n".join(lines) + "\n"
 
@@ -412,15 +418,17 @@ def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
     src_url = cfg.get("src_url")
     if not src_url:
         raise RuntimeError("no base image source URL")
-    filename = base_disk_filename(src_url)
+    checksum = cfg.get("checksum", "")
+    checksum_algorithm = cfg.get("checksum_algorithm", "")
+    filename = base_disk_filename(src_url, checksum, checksum_algorithm)
     if px.storage_has_volume(filename, node=node):
         ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
         return filename
     try:
         ctx.log(f"[{_ts()}] downloading {filename} — large images can take several minutes", "l-acc")
         upid = px.download_url(filename, src_url, node=node,
-                               checksum=cfg.get("checksum", ""),
-                               checksum_algorithm=cfg.get("checksum_algorithm", ""))
+                               checksum=checksum,
+                               checksum_algorithm=checksum_algorithm)
         _last = {"line": None, "tick": 0}
 
         def _progress(_st):
@@ -445,11 +453,12 @@ def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
 
         px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=3600, on_poll=_progress)
         ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
+    except JobCancelled:
+        raise
     except Exception as e:  # noqa: BLE001
-        if px.storage_has_volume(filename, node=node):
-            ctx.log(f"[{_ts()}] download reported '{e}' but {filename} is present — continuing", "l-warn")
-        else:
-            raise RuntimeError(f"image download/verification failed: {e}") from e
+        # A target appearing after a failed task may be partial or checksum-invalid.
+        # Only a successful Proxmox task is evidence that the cache entry is usable.
+        raise RuntimeError(f"image download/verification failed: {e}") from e
     return filename
 
 
@@ -1007,6 +1016,19 @@ def _vm_exists(px: Proxmox, vmid: int, node: Optional[str]) -> bool:
     return state != VM_ABSENT
 
 
+def _probe_vm_runtime_status(
+    px: Proxmox, vmid: int, node: Optional[str],
+) -> tuple[Optional[str], str]:
+    """Read a present VM's actionable power state without inventing a default."""
+    try:
+        status = str((px.vm_current(vmid, node) or {}).get("status") or "").lower()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"VM runtime status probe failed: {exc}"
+    if status in ("running", "stopped"):
+        return status, f"VM {vmid} reports {status}"
+    return None, f"VM runtime status was unavailable ({status or 'empty response'})"
+
+
 def _px_for_conn(conn_id: Optional[int]) -> Optional[Proxmox]:
     """Build a Proxmox client for `conn_id`, or None if the connection is gone or the
     client can't be constructed. Used by the cancel/cleanup paths."""
@@ -1158,7 +1180,16 @@ def _reconcile_canceled_job(job_id: Optional[int]) -> None:
         return
 
     if presence == VM_PRESENT and job_type in ("rebuild", "destroy"):
-        _set_dep_status(dep_id, "stopped", "", expected_vmid=vmid)
+        runtime_status, runtime_detail = _probe_vm_runtime_status(px, vmid, node)
+        if runtime_status:
+            _set_dep_status(dep_id, runtime_status, "", expected_vmid=vmid)
+        else:
+            _set_dep_status(
+                dep_id,
+                "error",
+                f"canceled {job_type} VM status not confirmed: {runtime_detail}",
+                expected_vmid=vmid,
+            )
         return
 
     if job_type in ("deploy", "destroy"):
