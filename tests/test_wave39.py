@@ -136,6 +136,25 @@ def test_ci_runs_ui_behavior_suites_and_fail_closed_syntax_checks_all_20_scripts
     assert not missing, f"CI workflow is missing: {', '.join(missing)}"
 
 
+def test_beta_build_branch_publishes_without_changing_release_tag_rules():
+    """The isolated beta branch must publish its branch-named image via GHCR."""
+    workflow = (
+        Path(__file__).resolve().parents[1]
+        / ".github" / "workflows" / "docker-publish.yml"
+    ).read_text(encoding="utf-8")
+
+    required_contracts = {
+        "the main and isolated beta-build branch trigger": "branches: [main, beta-build]",
+        "branch-name image metadata": "type=ref,event=branch",
+        "release-only latest image rule": (
+            "type=raw,value=latest,enable=${{ startsWith(github.ref, 'refs/tags/v') }}"
+        ),
+        "multi-architecture beta image": "platforms: linux/amd64,linux/arm64",
+    }
+    missing = [name for name, source in required_contracts.items() if source not in workflow]
+    assert not missing, f"Image publisher is missing: {', '.join(missing)}"
+
+
 def _starter_engine():
     local_engine = create_engine(
         "sqlite://",
@@ -1521,6 +1540,7 @@ def test_base_image_create_and_edit_persist_normalized_checksum_atomically():
 
 if __name__ == "__main__":
     test_ci_runs_ui_behavior_suites_and_fail_closed_syntax_checks_all_20_scripts()
+    test_beta_build_branch_publishes_without_changing_release_tag_rules()
     test_sri_rejects_local_vendor_resource_without_integrity()
     test_sri_rejects_local_vendor_resource_with_sha256_only()
     test_sri_rejects_duplicate_resource_replacing_distinct_vendor_asset()
