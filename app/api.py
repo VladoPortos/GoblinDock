@@ -241,14 +241,40 @@ def allocate_ip(session: Session, net: Network, deployment_id: int) -> Optional[
         existing = session.exec(select(IpAllocation).where(
             IpAllocation.network_id == net.id, IpAllocation.deployment_id == deployment_id)).first()
         if existing:
-            return existing.ip
-        taken = {a.ip for a in session.exec(select(IpAllocation).where(
-            IpAllocation.network_id == net.id, IpAllocation.state == "reserved")).all()}
+            try:
+                existing_address = ipaddress.ip_address(existing.ip)
+            except ValueError:
+                existing_address = None
+            if existing.state == "reserved" and existing_address is not None and \
+                    existing_address.version == pool.network.version and \
+                    pool.start <= existing_address <= pool.end and \
+                    not pool.is_reserved(existing_address):
+                return existing.ip
+
+        allocations = session.exec(select(IpAllocation).where(
+            IpAllocation.network_id == net.id)).all()
+        taken = set()
+        for allocation in allocations:
+            if existing is not None and allocation.id == existing.id:
+                continue
+            try:
+                address = ipaddress.ip_address(allocation.ip)
+            except ValueError:
+                continue
+            if address.version == pool.network.version:
+                taken.add(address)
         for address in pool.iter_usable():
-            ip = str(address)
-            if ip not in taken:
-                session.add(IpAllocation(network_id=net.id, ip=ip,
-                                         deployment_id=deployment_id, state="reserved"))
+            if address not in taken:
+                ip = str(address)
+                if existing is None:
+                    session.add(IpAllocation(
+                        network_id=net.id, ip=ip,
+                        deployment_id=deployment_id, state="reserved",
+                    ))
+                else:
+                    existing.ip = ip
+                    existing.state = "reserved"
+                    session.add(existing)
                 # Join the caller's transaction. Deployment admission holds
                 # `_lifecycle_admission_lock` until its final commit, so the next
                 # waiter cannot read past this uncommitted reservation in the

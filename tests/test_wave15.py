@@ -125,6 +125,96 @@ def test_ipv6_last_address_is_usable_and_static_reservation_is_reused():
     print("test_ipv6_last_address_is_usable_and_static_reservation_is_reused OK")
 
 
+def test_existing_static_reservations_are_reused_only_when_usable():
+    """Upgrade rows are repaired in place; only an already-usable row is reused."""
+    cid = _mk_conn()
+    cases = (
+        ("network", "10.77.0.0", "reserved", "10.77.0.2"),
+        ("gateway", "10.77.1.1", "reserved", "10.77.1.2"),
+        ("broadcast", "10.77.2.7", "reserved", "10.77.2.2"),
+        ("outside", "10.77.3.8", "reserved", "10.77.3.2"),
+        ("malformed", "not-an-ip", "reserved", "10.77.4.2"),
+        ("wrong-family", "2001:db8:15::2", "reserved", "10.77.5.2"),
+        ("wrong-state", "10.77.6.3", "released", "10.77.6.2"),
+        ("valid", "10.77.7.4", "reserved", "10.77.7.4"),
+    )
+    failures = []
+    with session_scope() as s:
+        for index, (label, legacy_ip, state, expected) in enumerate(cases):
+            net = Network(
+                connection_id=cid, name=f"legacy-existing-{label}", mode="static",
+                subnet_cidr=f"10.77.{index}.0/29", gateway=f"10.77.{index}.1",
+                range_start=f"10.77.{index}.0", range_end=f"10.77.{index}.7",
+            )
+            dep = Deployment(name=f"legacy-existing-{label}", connection_id=cid)
+            s.add(net)
+            s.add(dep)
+            s.flush()
+            allocation = IpAllocation(
+                network_id=net.id, ip=legacy_ip,
+                deployment_id=dep.id, state=state,
+            )
+            s.add(allocation)
+            s.flush()
+            allocation_id = allocation.id
+
+            ctx = api._network_ctx(s, net, dep.id)
+            rows = s.exec(select(IpAllocation).where(
+                IpAllocation.deployment_id == dep.id,
+            )).all()
+            actual = (
+                ctx.get("static_ip"), ctx.get("ipconfig0"),
+                [(row.id, row.ip, row.state) for row in rows],
+            )
+            wanted = (
+                expected, f"ip={expected}/29,gw=10.77.{index}.1",
+                [(allocation_id, expected, "reserved")],
+            )
+            if actual != wanted:
+                failures.append(f"{label}: wanted {wanted!r}, got {actual!r}")
+
+    assert not failures, "invalid existing reservation reuse:\n" + "\n".join(failures)
+    print("test_existing_static_reservations_are_reused_only_when_usable OK")
+
+
+def test_invalid_existing_reservation_is_not_mutated_when_pool_is_exhausted():
+    cid = _mk_conn()
+    with session_scope() as s:
+        net = Network(
+            connection_id=cid, name="legacy-existing-exhausted", mode="static",
+            subnet_cidr="10.78.0.0/24", gateway="10.78.0.1",
+            range_start="10.78.0.0", range_end="10.78.0.2",
+        )
+        legacy_dep = Deployment(name="legacy-invalid-exhausted", connection_id=cid)
+        taken_dep = Deployment(name="legacy-valid-taken", connection_id=cid)
+        s.add(net)
+        s.add(legacy_dep)
+        s.add(taken_dep)
+        s.flush()
+        legacy = IpAllocation(
+            network_id=net.id, ip="10.78.0.0",
+            deployment_id=legacy_dep.id, state="reserved",
+        )
+        s.add(legacy)
+        s.add(IpAllocation(
+            network_id=net.id, ip="10.78.0.2",
+            deployment_id=taken_dep.id, state="reserved",
+        ))
+        s.flush()
+        legacy_id = legacy.id
+
+        exc = _expect_http(409, lambda: api.allocate_ip(s, net, legacy_dep.id))
+        assert "exhausted" in str(exc.detail)
+        s.refresh(legacy)
+        assert (legacy.id, legacy.ip, legacy.state) == (
+            legacy_id, "10.78.0.0", "reserved",
+        )
+        assert len(s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == legacy_dep.id,
+        )).all()) == 1
+    print("test_invalid_existing_reservation_is_not_mutated_when_pool_is_exhausted OK")
+
+
 def _net_body(**kw):
     from app import api
     base = dict(connectionId=1, name="n", mode="dhcp", bridge="vmbr0", vlan=None,
@@ -652,6 +742,8 @@ def test_widget_summary_excludes_other_users_private_templates():
 if __name__ == "__main__":
     test_legacy_static_allocator_skips_reserved_ipv4_addresses()
     test_ipv6_last_address_is_usable_and_static_reservation_is_reused()
+    test_existing_static_reservations_are_reused_only_when_usable()
+    test_invalid_existing_reservation_is_not_mutated_when_pool_is_exhausted()
     test_probe_vm_presence_distinguishes_present_absent_and_unknown()
     test_failed_cancellation_keeps_ambiguous_vm_identity()
     test_canceled_destroy_with_unknown_inventory_becomes_cleanup_pending()

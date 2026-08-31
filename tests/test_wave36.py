@@ -690,6 +690,50 @@ def test_rebuild_admission_uses_lifecycle_admission_lock():
     print("test_rebuild_admission_uses_lifecycle_admission_lock OK")
 
 
+def test_rebuild_replaces_invalid_legacy_reservation_in_job_context():
+    uid = _mk_user("w36-rebuild-invalid-reservation@example.com")
+    template_id, network_id = _mk_deployable_template(uid, static=True)
+    with session_scope() as s:
+        template = s.get(Template, template_id)
+        network = s.get(Network, network_id)
+        network.subnet_cidr = "10.36.8.0/24"
+        network.gateway = "10.36.8.1"
+        network.range_start = "10.36.8.0"
+        network.range_end = "10.36.8.3"
+        dep = Deployment(
+            name="legacy-invalid-rebuild", owner_id=uid,
+            connection_id=template.connection_id, image_id=template.base_image_id,
+            template_id=template.id, network_id=network.id, vmid=8036,
+            status="running",
+        )
+        s.add(network)
+        s.add(dep)
+        s.flush()
+        allocation = IpAllocation(
+            network_id=network.id, ip="10.36.8.1",
+            deployment_id=dep.id, state="reserved",
+        )
+        s.add(allocation)
+        s.flush()
+        dep_id, allocation_id = dep.id, allocation.id
+
+    with Session(engine) as s:
+        result = api.vm_rebuild(dep_id, user=s.get(User, uid), session=s)
+
+    with session_scope() as s:
+        job = s.get(Job, result["jobId"])
+        ctx = json.loads(job.context_json)
+        rows = s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep_id,
+        )).all()
+        assert ctx["static_ip"] == "10.36.8.2"
+        assert ctx["ipconfig0"] == "ip=10.36.8.2/24,gw=10.36.8.1"
+        assert [(row.id, row.ip, row.state) for row in rows] == [
+            (allocation_id, "10.36.8.2", "reserved"),
+        ]
+    print("test_rebuild_replaces_invalid_legacy_reservation_in_job_context OK")
+
+
 def _mk_lifecycle_deployment(uid: int, *, status: str = "running") -> int:
     template_id, network_id = _mk_deployable_template(uid)
     with session_scope() as s:
@@ -1057,6 +1101,7 @@ if __name__ == "__main__":
     test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_absence()
     test_cleanup_retry_stamps_each_target_immediately_before_external_work()
     test_rebuild_admission_uses_lifecycle_admission_lock()
+    test_rebuild_replaces_invalid_legacy_reservation_in_job_context()
     test_sequential_duplicate_destroy_returns_one_active_job()
     test_concurrent_duplicate_destroy_returns_one_active_job()
     test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status()
