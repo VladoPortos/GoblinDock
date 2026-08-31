@@ -489,6 +489,9 @@ a { color: var(--accent); text-decoration: none; }
 .placed-block { display: flex; align-items: center; gap: 10px; padding: 11px 12px; border-radius: 11px; cursor: pointer;
   background: var(--surface); border: 1px solid var(--border-soft); box-shadow: var(--shadow-sm); transition: border-color .12s, box-shadow .12s; }
 .placed-block:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+.vm-nav-surface:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.activity-nav-surface:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
+.history-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .placed-block:hover { border-color: var(--border-strong); }
 .placed-block.sel { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent), var(--shadow); }
 .placed-block.warn { border-color: var(--warn-ghost); }

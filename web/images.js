@@ -59,7 +59,10 @@
         isAdmin && h(Menu, { align: 'right', items: [
           { label: 'Edit', icon: 'edit', onClick: () => onEdit(img) },
           { sep: true },
-          { label: 'Delete', icon: 'trash', danger: true, onClick: () => onDelete(img) },
+          { label: 'Delete', icon: 'trash', danger: true,
+            disabled: img.canDelete !== true,
+            title: img.canDelete === true ? 'Delete base image' : 'This image is referenced by a template or deployed VM',
+            onClick: () => onDelete(img) },
         ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' } }, h(Icon, { name: 'more', size: 16 })))));
   }
 
@@ -180,13 +183,7 @@
       modal === 'add' && h(IsoModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Base image added', 'ok'); refresh(); } }),
       modal && modal.img && h(IsoModal, { img: modal.img, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Base image updated', 'ok'); refresh(); } }),
       confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Remove ' + confirm.name + '?',
-        body: 'Removes the base image entry. Downloaded files on the node are not deleted.'
-          + (function () {
-            const refs = ((window.GD.TEMPLATES) || []).filter((t) => t.baseImageId === confirm.imgId).length;
-            return refs ? ' ' + refs + ' template' + (refs === 1 ? ' references' : 's reference') + ' this image — '
-              + (refs === 1 ? 'it keeps' : 'they keep') + ' working but ' + (refs === 1 ? 'loses' : 'lose')
-              + ' deploy until re-pointed.' : '';
-          })(),
+        body: 'Removes the base image entry. No template or deployed VM references it. Downloaded files on the node are not deleted.',
         confirmLabel: 'Remove', onConfirm: () => del(confirm) }));
   }
 

@@ -26,6 +26,18 @@
     if (event.key === 'Escape') closeMobileNav(true);
   }
 
+  function activateNavigationSurface(event, open) {
+    if (event.target !== event.currentTarget && event.target && event.target.closest) {
+      const nested = event.target.closest('button, a, input, select, textarea');
+      if (nested && (!event.currentTarget.contains || event.currentTarget.contains(nested))) return;
+    }
+    const click = event.type === 'click';
+    const key = event.type === 'keydown' ? event.key : '';
+    if (!click && key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return;
+    if ((key === ' ' || key === 'Spacebar') && event.preventDefault) event.preventDefault();
+    open();
+  }
+
   function Sidebar({ route, go, collapsed, setCollapsed, mobileOpen = false }) {
     const presentationCollapsed = collapsed && !mobileOpen;
     return h('aside', {
@@ -118,12 +130,13 @@
         h('div', { style: { width: 1, height: 22, background: 'var(--border)' } }),
         h(Menu, {
           items: [
-            { label: ((GD.me && GD.me.name) || 'Account') + ' · ' + ((GD.me && GD.me.role) || ''), icon: 'user' },
+            { label: ((GD.me && GD.me.name) || 'Account') + ' · ' + ((GD.me && GD.me.role) || ''), icon: 'user', header: true },
             { sep: true },
             { label: 'Profile', icon: 'user', onClick: () => go('profile') },
             { label: 'Sign out', icon: 'logout', onClick: () => window.GDStore.signOut(go) },
           ]
-        }, h('div', { className: 'avatar', title: (GD.me && GD.me.name) || '' }, (GD.me && GD.me.initials) || '··'))
+        }, h('button', { type: 'button', className: 'avatar', title: (GD.me && GD.me.name) || '',
+          'aria-label': 'Account menu', 'aria-haspopup': 'menu' }, (GD.me && GD.me.initials) || '··'))
       )
     );
   }
@@ -161,8 +174,11 @@
             : jobs.map(j => {
                 const presentation = window.UI.jobPresentation(j.rawStatus);
                 return h('div', {
-                  key: j.id, className: 'card', style: { padding: 13, cursor: 'pointer', position: 'relative' },
-                  onClick: () => { onClose(); go('job', { jobId: j.jobId }); },
+                  key: j.id, className: 'card activity-nav-surface', role: 'link', tabIndex: 0,
+                  'aria-label': 'Open ' + j.title,
+                  style: { padding: 13, cursor: 'pointer', position: 'relative' },
+                  onClick: (event) => activateNavigationSurface(event, () => { onClose(); go('job', { jobId: j.jobId }); }),
+                  onKeyDown: (event) => activateNavigationSurface(event, () => { onClose(); go('job', { jobId: j.jobId }); }),
                 },
                   h('div', { className: 'row', style: { marginBottom: 9 } },
                     h('span', { className: 'dot ' + presentation.dotClass }),

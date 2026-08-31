@@ -254,6 +254,7 @@
       h(React.Fragment, null,
         h('div', { style: { position: 'fixed', inset: 0, zIndex: 200 }, onMouseDown: (e) => { e.stopPropagation(); setOpen(false); } }),
         h('div', {
+          role: 'menu',
           onMouseDown: (e) => e.stopPropagation(),
           style: {
             position: 'fixed', top: pos.top, zIndex: 201,
@@ -262,9 +263,19 @@
             background: 'var(--surface)', border: '1px solid var(--border)', boxShadow: 'var(--shadow-lg)',
           },
         }, items.map((it, i) => it.sep
-          ? h('div', { key: i, className: 'divider', style: { margin: '5px 4px' } })
+          ? h('div', { key: i, role: 'separator', className: 'divider', style: { margin: '5px 4px' } })
+          : it.header
+            ? h('div', {
+                key: i, role: 'presentation', className: 'menu-item',
+                style: {
+                  display: 'flex', alignItems: 'center', gap: 9, width: '100%',
+                  padding: '8px 9px', color: 'var(--text-faint)',
+                  fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5,
+                },
+              }, it.icon && h(Icon, { name: it.icon, size: 15 }), it.label)
           : h('button', {
               key: i, className: 'menu-item' + (it.danger ? ' danger' : ''),
+              type: 'button', role: 'menuitem',
               disabled: !!it.disabled,
               title: it.title || null,
               onClick: (e) => { e.stopPropagation(); if (it.disabled) return; setOpen(false); it.onClick && it.onClick(); },
@@ -291,9 +302,14 @@
     (tpl.recipe || []).forEach((sec, si) => (sec.blocks || []).forEach((b, bi) => {
       (Array.isArray(b.ask) ? b.ask : []).forEach((n) => {
         const pal = (GDx.PALETTE || []).find((p) => p.id === b.ref) || {};
-        const field = (pal.schema || []).find((x) => x.name === n);
+        const carried = Array.isArray(b.askSchema) ? b.askSchema : [];
+        const field = carried.find((x) => x && x.name === n)
+          || (pal.schema || []).find((x) => x.name === n);
         if (!field) return;  // ask references an input the block no longer has — no prompt
-        asks.push({ addr: si + '.' + bi, blockName: b.name || pal.name || b.ref, field, def: (b.inputs || {})[n] });
+        const rawDefault = (b.inputs || {})[n];
+        const sensitive = field.type === 'password' || field.type === 'secret';
+        const def = sensitive || rawDefault === '********' ? '' : rawDefault;
+        asks.push({ addr: si + '.' + bi, blockName: b.name || pal.name || b.ref, field, def });
       });
     }));
     return asks;
@@ -302,7 +318,9 @@
     const out = {};
     asks.forEach((a) => {
       out[a.addr] = out[a.addr] || {};
-      out[a.addr][a.field.name] = a.def != null && a.def !== '' ? a.def
+      const sensitive = a.field.type === 'password' || a.field.type === 'secret';
+      const usableDefault = sensitive || a.def === '********' ? '' : a.def;
+      out[a.addr][a.field.name] = usableDefault != null && usableDefault !== '' ? usableDefault
         : a.field.type === 'bool' ? false : (a.field.type === 'tags' || a.field.type === 'list') ? [] : '';
     });
     return out;

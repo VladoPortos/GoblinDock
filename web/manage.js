@@ -63,9 +63,15 @@
               ? h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => fork(b) }, h(Icon, { name: 'duplicate', size: 14 }), 'Fork')
               : h('div', { className: 'row', style: { marginLeft: 'auto', gap: 4 } },
                   h('button', { className: 'btn ghost sm', onClick: () => setEditor({ initial: b }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
-                  h('button', { className: 'icon-btn danger', onClick: () => setConfirm(b) }, h(Icon, { name: 'trash', size: 15 }))))))),
+                  h('button', {
+                    type: 'button', className: 'icon-btn danger',
+                    disabled: b.canDelete !== true,
+                    title: b.canDelete === true ? 'Delete block' : 'This block is referenced by a template',
+                    'aria-label': 'Delete ' + b.name,
+                    onClick: () => setConfirm(b),
+                  }, h(Icon, { name: 'trash', size: 15 }))))))),
       editor && h(window.BlockEditorModal, { initial: editor.initial, onClose: () => setEditor(null), onSaved: () => { setEditor(null); toast('Block saved', 'ok'); refresh(); } }),
-      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'This removes your custom block. Templates already using it keep their copy of the inputs.', confirmLabel: 'Delete block', onConfirm: () => del(confirm) }));
+      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'This permanently removes your custom block. It is not referenced by any template.', confirmLabel: 'Delete block', onConfirm: () => del(confirm) }));
   }
 
   /* ============ SECRETS ============ */

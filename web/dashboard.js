@@ -18,6 +18,18 @@
   function loadViews() { try { return JSON.parse(localStorage.getItem(VIEWS_KEY)) || []; } catch (e) { return []; } }
   function saveViews(v) { try { localStorage.setItem(VIEWS_KEY, JSON.stringify(v)); } catch (e) { /* quota/denied */ } }
 
+  function activateVmSurface(event, open) {
+    if (event.target !== event.currentTarget && event.target && event.target.closest) {
+      const nested = event.target.closest('button, a, input, select, textarea');
+      if (nested && (!event.currentTarget.contains || event.currentTarget.contains(nested))) return;
+    }
+    const click = event.type === 'click';
+    const key = event.type === 'keydown' ? event.key : '';
+    if (!click && key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return;
+    if ((key === ' ' || key === 'Spacebar') && event.preventDefault) event.preventDefault();
+    open();
+  }
+
   function VmEditModal({ vm, onClose, onDone }) {
     const [name, setName] = useState(vm.name);
     const [tags, setTags] = useState(vm.tags || '');
@@ -99,7 +111,13 @@
             ['', 'Name', 'IP', 'Lineage', 'Connection', 'CPU', 'RAM', 'Uptime', ''].map((hh, i) =>
               h('th', { key: i, style: i === 0 ? { width: 36 } : null }, hh)))),
           h('tbody', null, vms.map(vm =>
-            h('tr', { key: vm.id, style: { cursor: 'pointer' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
+            h('tr', {
+              key: vm.id, className: 'vm-nav-surface', role: 'link', tabIndex: 0,
+              'aria-label': 'Open ' + vm.name,
+              style: { cursor: 'pointer' },
+              onClick: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+              onKeyDown: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+            },
               h('td', { onClick: (e) => e.stopPropagation() }, vmActionable(vm)
                 && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
               h('td', null, h('span', { className: 'dot ' + vm.status, title: vm.status })),
@@ -141,7 +159,13 @@
 
   function CardView({ vms, go, onAct, sel, toggleSel }) {
     return h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(310px, 1fr))', gap: 14 } },
-      vms.map(vm => h('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: vmActionable(vm) && sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
+      vms.map(vm => h('div', {
+        key: vm.id, className: 'card card-pad vm-nav-surface', role: 'link', tabIndex: 0,
+        'aria-label': 'Open ' + vm.name,
+        style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: vmActionable(vm) && sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' },
+        onClick: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+        onKeyDown: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+      },
         h('div', { className: 'row' },
           vmActionable(vm) && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
           h('span', { className: 'dot ' + vm.status }),

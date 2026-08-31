@@ -298,6 +298,10 @@
   }
 
   // ---------- Custom block editor ----------
+  const selectOptionsText = (field) => Array.isArray(field.options) ? field.options.join(', ') : '';
+  const parseSelectOptions = (value) => String(value || '').split(',')
+    .map((option) => option.trim()).filter(Boolean);
+
   function BlockEditorModal({ initial, onClose, onSaved }) {
     const editing = initial && !initial.builtin && initial.key;
     const [f, setF] = useState(() => ({
@@ -306,16 +310,37 @@
       section: (initial && initial.section) || 'Scripts', phase: (initial && initial.phase) || 'ansible',
       description: (initial && initial.desc) || '',
       cloudinit: (initial && initial.cloudinit) || 'echo hello', ansible: (initial && initial.ansible) || '- name: my task\n  ansible.builtin.debug: { msg: hi }',
-      schema: (initial && initial.schema) ? JSON.parse(JSON.stringify(initial.schema)) : [],
+      schema: (initial && initial.schema)
+        ? JSON.parse(JSON.stringify(initial.schema)).map((field) => ({
+            ...field,
+            ...(field.type === 'select' ? { _optionsText: selectOptionsText(field) } : {}),
+          }))
+        : [],
     }));
     const [busy, setBusy] = useState(false);
     const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
-    const setField = (i, k, v) => setF((p) => ({ ...p, schema: p.schema.map((x, j) => j === i ? { ...x, [k]: v } : x) }));
+    const setField = (i, k, v) => setF((p) => ({
+      ...p,
+      schema: p.schema.map((x, j) => {
+        if (j !== i) return x;
+        const next = { ...x, [k]: v };
+        if (k === 'type' && v === 'select' && next._optionsText == null) {
+          next._optionsText = selectOptionsText(next);
+        }
+        return next;
+      }),
+    }));
     const addField = () => set('schema', [...f.schema, { name: 'var' + (f.schema.length + 1), type: 'text', default: '' }]);
     const submit = async () => {
       setBusy(true);
       try {
-        const payload = { name: f.name, category: f.category, icon: f.icon, section: f.section, phase: f.phase, description: f.description, cloudinit_template: f.cloudinit, ansible_template: f.ansible, input_schema: f.schema };
+        const inputSchema = f.schema.map((field) => {
+          const { _optionsText, ...clean } = field;
+          if (clean.type === 'select') clean.options = parseSelectOptions(_optionsText);
+          else delete clean.options;
+          return clean;
+        });
+        const payload = { name: f.name, category: f.category, icon: f.icon, section: f.section, phase: f.phase, description: f.description, cloudinit_template: f.cloudinit, ansible_template: f.ansible, input_schema: inputSchema };
         if (editing) await window.API.editBlock(initial.key, payload);
         else await window.API.createBlock(payload);
         onSaved();
@@ -335,14 +360,22 @@
         h('div', { className: 'row', style: { marginBottom: 6 } },
           h('label', { className: 'field-label', style: { margin: 0 } }, 'Inputs'),
           h('button', { type: 'button', className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: addField }, h(Icon, { name: 'plus', size: 13 }), 'Add input')),
-        f.schema.map((fld, i) => h('div', { key: i, className: 'row', style: { gap: 6, marginBottom: 6 } },
-          h('input', { className: 'input mono', style: { flex: 1 }, value: fld.name, placeholder: 'name', onChange: (e) => setField(i, 'name', e.target.value) }),
-          h('select', { className: 'select', style: { width: 100 }, value: fld.type, onChange: (e) => setField(i, 'type', e.target.value) },
-            ['text', 'tags', 'bool', 'select', 'code', 'secret', 'password'].map((t) => h('option', { key: t, value: t }, t))),
-          h('input', { className: 'input mono', style: { flex: 1 }, value: fld.default == null ? '' : fld.default, placeholder: 'default', onChange: (e) => setField(i, 'default', e.target.value) }),
-          h('button', { type: 'button', className: 'icon-btn danger',
-            'aria-label': 'Remove ' + (fld.name || 'input') + ' input',
-            onClick: () => set('schema', f.schema.filter((_, j) => j !== i)) }, h(Icon, { name: 'trash', size: 14 })))),
+        f.schema.map((fld, i) => h('div', { key: i, style: { marginBottom: 8 } },
+          h('div', { className: 'row', style: { gap: 6 } },
+            h('input', { className: 'input mono', style: { flex: 1 }, value: fld.name, placeholder: 'name', 'aria-label': 'Input name', onChange: (e) => setField(i, 'name', e.target.value) }),
+            h('select', { className: 'select', style: { width: 100 }, value: fld.type, 'aria-label': 'Type for ' + (fld.name || 'input'), onChange: (e) => setField(i, 'type', e.target.value) },
+              ['text', 'tags', 'bool', 'select', 'code', 'secret', 'password'].map((t) => h('option', { key: t, value: t }, t))),
+            h('input', { className: 'input mono', style: { flex: 1 }, value: fld.default == null ? '' : fld.default, placeholder: 'default', 'aria-label': 'Default for ' + (fld.name || 'input'), onChange: (e) => setField(i, 'default', e.target.value) }),
+            h('button', { type: 'button', className: 'icon-btn danger',
+              'aria-label': 'Remove ' + (fld.name || 'input') + ' input',
+              onClick: () => set('schema', f.schema.filter((_, j) => j !== i)) }, h(Icon, { name: 'trash', size: 14 }))),
+          fld.type === 'select' && h('input', {
+            className: 'input mono', style: { marginTop: 6 },
+            value: fld._optionsText == null ? selectOptionsText(fld) : fld._optionsText,
+            placeholder: 'safe, fast, debug',
+            'aria-label': 'Options for ' + (fld.name || 'input'),
+            onChange: (e) => setField(i, '_optionsText', e.target.value),
+          }))),
         f.schema.length === 0 && h('div', { className: 'hint', style: { fontSize: 11.5 } }, 'No inputs — the block runs as-is.')));
   }
 
@@ -510,7 +543,7 @@
   }
 
   window.Builder = Builder;
-  window.BuilderUI = { activatePlacedBlock };
+  window.BuilderUI = { activatePlacedBlock, parseSelectOptions };
   window.BlockEditorModal = BlockEditorModal;
   window.SchemaField = SchemaField;
 })();

@@ -301,7 +301,8 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
     }
 
 
-def base_image_dict(img: Image, include_source_url: bool = False) -> dict:
+def base_image_dict(img: Image, *, include_source_url: bool = False,
+                    can_delete: bool = False) -> dict:
     out = {
         "id": f"img-{img.id}",
         "imgId": img.id,
@@ -309,6 +310,7 @@ def base_image_dict(img: Image, include_source_url: bool = False) -> dict:
         "os": img.os_family,
         "size": img.size or "—",
         "checksum": img.checksum or "",
+        "canDelete": can_delete is True,
     }
     if include_source_url:
         out["source_url"] = img.source_url
@@ -332,6 +334,9 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
         for b in (sec.get("blocks") or []) if isinstance(sec, dict) else []:
             if not isinstance(b, dict):
                 continue
+            # Never trust presentation metadata embedded in recipe_json. For a public
+            # cross-owner view it is rebuilt from the authoritative Block schema below.
+            b.pop("askSchema", None)
             blk = blocks.get(b.get("ref"))
             inputs = b.get("inputs") or {}
             if not isinstance(inputs, dict):
@@ -350,10 +355,37 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
                         inputs[name] = "********"
                 b["inputs"] = inputs
                 continue
+            asks = {
+                name for name in (b.get("ask") or [])
+                if isinstance(name, str)
+            }
+            ask_schema = []
+            for field in schema:
+                if not isinstance(field, dict) or field.get("name") not in asks:
+                    continue
+                descriptor = {
+                    "name": field["name"],
+                    "type": field.get("type") or "text",
+                }
+                if isinstance(field.get("label"), str):
+                    descriptor["label"] = field["label"]
+                if isinstance(field.get("optional"), bool):
+                    descriptor["optional"] = field["optional"]
+                if (descriptor["type"] == "select"
+                        and isinstance(field.get("options"), list)
+                        and all(isinstance(option, str) for option in field["options"])):
+                    descriptor["options"] = list(field["options"])
+                ask_schema.append(descriptor)
+            if ask_schema:
+                b["askSchema"] = ask_schema
             pw_fields = {f.get("name") for f in schema
                          if isinstance(f, dict) and f.get("type") in ("password", "secret")}
             for name in pw_fields:
-                if inputs.get(name):
+                if name in asks:
+                    # A display mask is not a credential and must never be posted back
+                    # as one. Cross-owner sensitive asks always start blank.
+                    inputs[name] = ""
+                elif inputs.get(name):
                     inputs[name] = "********"
             b["inputs"] = inputs
     return masked
@@ -399,7 +431,7 @@ def template_dict(session: Session, t: Template, viewer: Optional["User"] = None
     }
 
 
-def block_dict(b: Block) -> dict:
+def block_dict(b: Block, *, can_delete: bool = False) -> dict:
     return {
         "id": b.key,
         "key": b.key,
@@ -413,6 +445,7 @@ def block_dict(b: Block) -> dict:
         "ansible": b.ansible_template,
         "cloudinit": b.cloudinit_template,
         "schema": json.loads(b.input_schema_json or "[]"),
+        "canDelete": can_delete is True,
     }
 
 

@@ -470,6 +470,17 @@ def input_schema_problems(schema, *, require_type=False) -> list[str]:
             problems.append(f"input {name!r} has an invalid type")
         elif field_type is not None and field_type not in _ALLOWED_INPUT_TYPES:
             problems.append(f"input {name!r} has unknown type {field_type!r}")
+        if field_type == "select":
+            options = field.get("options")
+            if not isinstance(options, list) or not options:
+                problems.append(f"select input {name!r} needs at least one option")
+            elif any(not isinstance(option, str) or not option.strip()
+                     for option in options):
+                problems.append(f"select input {name!r} options must be non-empty strings")
+            elif len(set(options)) != len(options):
+                problems.append(f"select input {name!r} has duplicate options")
+            elif field.get("default") not in (None, "") and field.get("default") not in options:
+                problems.append(f"select input {name!r} default must be one of its options")
     return problems
 
 

@@ -1190,7 +1190,7 @@ findAll(lifecycleTable, (node) => node.type === 'button' && textOf(node) === 'Ca
 const lifecycleCards = lifecycleDashboard.render();
 for (const name of ['Working locked', 'Cleanup locked']) {
   const card = findAll(lifecycleCards, (node) => node.type === 'div'
-    && node.props.className === 'card card-pad' && textOf(node).includes(name))[0];
+    && String(node.props.className || '').includes('card card-pad') && textOf(node).includes(name))[0];
   assert.ok(card, `missing ${name} card`);
   assert.equal(findAll(card, (node) => node.type === 'input' && node.props.type === 'checkbox').length, 0,
     `${name} card must not be selectable`);
@@ -1461,7 +1461,7 @@ const activityTree = activityHarness.render(
   () => activityHarness.window.Shell.ActivityDrawer({ onClose() {}, go() {} }),
 );
 function activityCard(title) {
-  return findAll(activityTree, (node) => node.props.className === 'card'
+  return findAll(activityTree, (node) => String(node.props.className || '').includes('card')
     && textOf(node).includes(title))[0];
 }
 const canceledActivity = activityCard('Canceled activity job');
@@ -1505,6 +1505,316 @@ assert.match(canceledBadgeCss, /background\s*:\s*var\(--surface-2\)\s*;/);
 assert.match(canceledBadgeCss, /color\s*:\s*var\(--text-faint\)\s*;/);
 assert.equal(/--err|--warn|gradient|animation/.test(canceledBadgeCss), false,
   'the canceled badge must remain subdued and static');
+
+function statefulReact(seed = []) {
+  const state = seed.slice();
+  let cursor = 0;
+  return {
+    state,
+    begin() { cursor = 0; },
+    createElement: React.createElement,
+    Fragment: 'fragment',
+    useState(initial) {
+      const index = cursor++;
+      if (!Object.hasOwn(state, index)) {
+        state[index] = typeof initial === 'function' ? initial() : initial;
+      }
+      return [state[index], (value) => {
+        state[index] = typeof value === 'function' ? value(state[index]) : value;
+      }];
+    },
+    useId() { return `:wave46-${cursor++}:`; },
+    useRef(initial) { return { current: initial }; },
+    useEffect() {},
+  };
+}
+
+function wave46Icon(props) {
+  return React.createElement('span', { 'data-icon': props.name });
+}
+
+async function testWave46Contracts() {
+  const originalPalette = window.GD.PALETTE;
+  window.GD.PALETTE = [];
+  const foreignTemplate = {
+    recipe: [{ blocks: [{
+      ref: 'c-author-private', name: 'Author private block',
+      inputs: { hostname: 'author-host', api_token: '********' },
+      ask: ['hostname', 'api_token'],
+      askSchema: [
+        { name: 'hostname', type: 'text', label: 'Host name' },
+        { name: 'api_token', type: 'secret', label: 'API token' },
+      ],
+    }] }],
+  };
+  const foreignAsks = window.UI.collectAsks(foreignTemplate);
+  assert.deepEqual(JSON.parse(JSON.stringify(foreignAsks.map((ask) => ({
+    addr: ask.addr, name: ask.field.name, type: ask.field.type, def: ask.def,
+  })))), [
+    { addr: '0.0', name: 'hostname', type: 'text', def: 'author-host' },
+    { addr: '0.0', name: 'api_token', type: 'secret', def: '' },
+  ], 'a public template must carry prompts for a custom block absent from the viewer palette');
+  assert.deepEqual(JSON.parse(JSON.stringify(window.UI.initAskAnswers(foreignAsks))), {
+    '0.0': { hostname: 'author-host', api_token: '' },
+  }, 'display masks and sensitive defaults must never become deploy answers');
+  window.GD.PALETTE = originalPalette;
+
+  const editorReact = statefulReact();
+  const editorCalls = [];
+  function EditorFormModal() {}
+  const editorWindow = {
+    React: editorReact,
+    Icon: wave46Icon,
+    GD: { PALETTE: [], SECRETS: [] },
+    GDStore: { toast() {} },
+    API: {
+      editBlock(key, payload) { editorCalls.push({ key, payload }); return Promise.resolve(); },
+      createBlock(payload) { editorCalls.push({ key: null, payload }); return Promise.resolve(); },
+    },
+    UI: {
+      Modal() {}, OSGlyph() {}, Field() {}, TextArea() {}, SelectField() {}, Toggle() {},
+      TagInput() {}, FormModal: EditorFormModal,
+    },
+  };
+  vm.runInNewContext(builderSource, { React: editorReact, window: editorWindow, setTimeout() {} }, {
+    filename: 'web/builder.js',
+  });
+  const initialBlock = {
+    key: 'c-edit-select', builtin: false, name: 'Selectable', cat: 'Custom', icon: 'spark',
+    section: 'Scripts', phase: 'cloudinit', desc: '', cloudinit: 'echo {mode}', ansible: '',
+    schema: [{ name: 'mode', type: 'select', default: 'safe', options: ['safe', 'fast'] }],
+  };
+  editorReact.begin();
+  let editorTree = editorWindow.BlockEditorModal({ initial: initialBlock, onClose() {}, onSaved() {} });
+  let optionsEditor = findAll(editorTree, (node) => node.type === 'input'
+    && node.props['aria-label'] === 'Options for mode')[0];
+  assert.ok(optionsEditor, 'select inputs need an options editor');
+  assert.equal(optionsEditor.props.value, 'safe, fast');
+  optionsEditor.props.onChange({ target: { value: 'safe, fast, debug' } });
+  editorReact.begin();
+  editorTree = editorWindow.BlockEditorModal({ initial: initialBlock, onClose() {}, onSaved() {} });
+  optionsEditor = findAll(editorTree, (node) => node.type === 'input'
+    && node.props['aria-label'] === 'Options for mode')[0];
+  assert.equal(optionsEditor.props.value, 'safe, fast, debug');
+  const editorForm = findAll(editorTree, (node) => node.type === EditorFormModal)[0];
+  await editorForm.props.onSubmit();
+  assert.deepEqual(JSON.parse(JSON.stringify(editorCalls[0].payload.input_schema)), [{
+    name: 'mode', type: 'select', default: 'safe', options: ['safe', 'fast', 'debug'],
+  }], 'the options editor must submit a clean select schema');
+
+  const manageReact = statefulReact();
+  const manageWindow = {
+    React: manageReact,
+    Icon: wave46Icon,
+    GD: { PALETTE: [
+      { id: 'c-ref', key: 'c-ref', name: 'Referenced block', cat: 'Custom', desc: '', builtin: false, schema: [], canDelete: false },
+      { id: 'c-free', key: 'c-free', name: 'Free block', cat: 'Custom', desc: '', builtin: false, schema: [], canDelete: true },
+    ] },
+    GDStore: { refresh() { return Promise.resolve(); }, toast() {} }, API: {},
+    UI: {
+      Menu() {}, ConfirmModal() {}, FormModal() {}, Field() {}, TextArea() {}, SelectField() {},
+      Toggle() {}, fmtBytes() {}, useFetched() {},
+    },
+  };
+  vm.runInNewContext(source, { React: manageReact, window: manageWindow }, { filename: 'web/manage.js' });
+  manageReact.begin();
+  const blocksTree = manageWindow.BlocksLib();
+  const referencedDelete = findAll(blocksTree, (node) => node.type === 'button'
+    && node.props['aria-label'] === 'Delete Referenced block')[0];
+  const freeDelete = findAll(blocksTree, (node) => node.type === 'button'
+    && node.props['aria-label'] === 'Delete Free block')[0];
+  assert.ok(referencedDelete && freeDelete, 'custom block delete controls need accessible names');
+  assert.equal(referencedDelete.props.disabled, true);
+  assert.match(referencedDelete.props.title, /referenced by a template/i);
+  assert.equal(freeDelete.props.disabled, false);
+
+  const imageReact = statefulReact();
+  function ImageMenu(props) {
+    return imageReact.createElement('div', { 'data-menu': true }, props.children,
+      (props.items || []).filter((item) => !item.sep).map((item) => imageReact.createElement(
+        'button', { key: item.label, disabled: !!item.disabled, title: item.title }, item.label,
+      )));
+  }
+  const imageWindow = {
+    React: imageReact,
+    Icon: wave46Icon,
+    GD: {
+      me: { isAdmin: true }, CONNECTIONS: [], JOBS: [], TEMPLATES: [],
+      BASE_IMAGES: [
+        { id: 'img-ref', imgId: 461, name: 'Referenced image', os: 'ubuntu', size: '1G', canDelete: false },
+        { id: 'img-free', imgId: 462, name: 'Free image', os: 'ubuntu', size: '1G', canDelete: true },
+      ],
+    },
+    GDStore: { refresh() { return Promise.resolve(); }, toast() {} }, API: {},
+    UI: {
+      OSGlyph() {}, Menu: ImageMenu, ConfirmModal() {}, FormModal() {}, Field() {}, SelectField() {},
+      useFetched() { return { online: false, cached: {} }; },
+    },
+  };
+  vm.runInNewContext(imagesSource, { React: imageReact, window: imageWindow }, { filename: 'web/images.js' });
+  imageReact.begin();
+  const imagesTree = resolveTree(imageWindow.Isos({ go() {} }));
+  function imageCard(name) {
+    return findAll(imagesTree, (node) => node.props.className === 'card'
+      && textOf(node).includes(name))[0];
+  }
+  const referencedImageDelete = findAll(imageCard('Referenced image'),
+    (node) => node.type === 'button' && textOf(node) === 'Delete')[0];
+  const freeImageDelete = findAll(imageCard('Free image'),
+    (node) => node.type === 'button' && textOf(node) === 'Delete')[0];
+  assert.equal(referencedImageDelete.props.disabled, true);
+  assert.match(referencedImageDelete.props.title, /referenced by a template|deployed VM/i);
+  assert.equal(freeImageDelete.props.disabled, false);
+
+  const navigationReact = statefulReact();
+  const navigationCalls = [];
+  function NavigationMenu(props) { return navigationReact.createElement('div', null, props.children); }
+  const navigationWindow = {
+    React: navigationReact,
+    Icon: wave46Icon,
+    GD: { me: { name: 'Keyboard User', role: 'User', initials: 'KU' }, JOBS: [], VMS: [{
+      id: 'vm-46', depId: 46, name: 'Keyboard VM', status: 'running', owner: 'you',
+      ownerName: 'Keyboard User', ip: '10.46.0.46', image: 'Ubuntu', template: 'Base',
+      templateId: 46, conn: 'pve', os: 'ubuntu', cpu: 1, ram: 2, uptime: '1h', tags: '', notes: '',
+    }] },
+    GDStore: { vmHistory() { return []; }, refresh() { return Promise.resolve(); }, toast() {}, vmAction() { return Promise.resolve(); } },
+    API: {},
+    UI: {
+      Menu: NavigationMenu, ConfirmModal() {}, FormModal() {}, Field() {}, OSGlyph() {},
+      StatusBadge() {}, CopyField() {}, Meter() {}, Sparkline() {},
+      isVmLifecycleLocked(vmRow) { return ['working', 'cleanup_pending'].includes(vmRow && vmRow.status); },
+    },
+  };
+  vm.runInNewContext(dashboardSource, {
+    React: navigationReact, window: navigationWindow,
+    localStorage: { getItem() { return null; }, setItem() {} }, setTimeout() {},
+  }, { filename: 'web/dashboard.js' });
+  navigationReact.begin();
+  let dashboardTree = resolveTree(navigationWindow.Dashboard({
+    go(route, nav) { navigationCalls.push({ route, nav }); },
+  }));
+  const vmRow = findAll(dashboardTree, (node) => node.type === 'tr'
+    && textOf(node).includes('Keyboard VM'))[0];
+  assert.equal(vmRow.props.role, 'link');
+  assert.equal(vmRow.props.tabIndex, 0);
+  vmRow.props.onKeyDown({
+    type: 'keydown', key: 'Enter', target: vmRow, currentTarget: vmRow,
+    preventDefault() {},
+  });
+  assert.equal(navigationCalls.length, 1, 'Enter must open a VM table row');
+  const cardsButton = findAll(dashboardTree, (node) => node.type === 'button'
+    && textOf(node) === 'Cards')[0];
+  cardsButton.props.onClick();
+  navigationReact.begin();
+  dashboardTree = resolveTree(navigationWindow.Dashboard({
+    go(route, nav) { navigationCalls.push({ route, nav }); },
+  }));
+  const vmCard = findAll(dashboardTree, (node) => String(node.props.className || '').includes('card card-pad')
+    && textOf(node).includes('Keyboard VM'))[0];
+  assert.equal(vmCard.props.role, 'link');
+  assert.equal(vmCard.props.tabIndex, 0);
+  let prevented = false;
+  vmCard.props.onKeyDown({
+    type: 'keydown', key: ' ', target: vmCard, currentTarget: vmCard,
+    preventDefault() { prevented = true; },
+  });
+  assert.equal(prevented, true);
+  assert.equal(navigationCalls.length, 2, 'Space must open a VM card');
+
+  const shellReact = statefulReact();
+  const shellGo = [];
+  const shellWindow = {
+    React: shellReact, Icon: wave46Icon,
+    GD: { me: { name: 'Keyboard User', role: 'User', initials: 'KU' }, JOBS: [{
+      id: 'j-46', jobId: 46, title: 'Keyboard activity', status: 'working', rawStatus: 'running',
+      pct: 10, phase: 'Run', elapsed: '1s', step: 1, total: 2,
+    }], VMS: [] },
+    GDStore: { signOut() {}, refresh() { return Promise.resolve(); }, toast() {} }, API: {},
+    UI: {
+      Menu: NavigationMenu,
+      jobPresentation() { return { label: 'Working', badgeClass: 'working', dotClass: 'working', failure: false }; },
+    },
+  };
+  vm.runInNewContext(shellSource, { React: shellReact, window: shellWindow }, { filename: 'web/shell.js' });
+  shellReact.begin();
+  const topbar = shellWindow.Shell.TopBar({
+    route: 'dashboard', go() {}, theme: 'dark', setTheme() {}, openDrawer() {}, openMobileNav() {},
+  });
+  const accountMenu = findAll(topbar, (node) => node.type === NavigationMenu)[0];
+  const accountTrigger = accountMenu.children[0];
+  assert.equal(accountTrigger.type, 'button', 'the account menu trigger must be a native button');
+  assert.equal(accountTrigger.props['aria-label'], 'Account menu');
+  const activityTree46 = shellWindow.Shell.ActivityDrawer({
+    onClose() {}, go(route, nav) { shellGo.push({ route, nav }); },
+  });
+  const activityCard46 = findAll(activityTree46, (node) => String(node.props.className || '').includes('card')
+    && textOf(node).includes('Keyboard activity'))[0];
+  assert.equal(activityCard46.props.role, 'link');
+  assert.equal(activityCard46.props.tabIndex, 0);
+  activityCard46.props.onKeyDown({
+    type: 'keydown', key: 'Enter', target: activityCard46, currentTarget: activityCard46,
+    preventDefault() {},
+  });
+  assert.equal(shellGo.length, 1, 'Enter must open an activity row');
+
+  const historyReact = statefulReact([[
+    { id: 'j-history-46', jobId: 460, title: 'Keyboard history', type: 'deploy',
+      rawStatus: 'succeeded', status: 'done', pct: 100, phase: 'Done', elapsed: '1m' },
+  ]]);
+  const historyCalls = [];
+  const historyWindow = {
+    React: historyReact, Icon: wave46Icon,
+    GD: { me: { isAdmin: false } }, GDStore: { toast() {} },
+    API: {
+      jobsHistory() { return Promise.resolve([]); },
+      job(id) { historyCalls.push(id); return Promise.resolve({ log: [] }); },
+    },
+    UI: {
+      ConfirmModal() {},
+      jobPresentation() { return { label: 'Done', badgeClass: 'running', dotClass: 'running', failure: false }; },
+    },
+  };
+  vm.runInNewContext(historySource, { React: historyReact, window: historyWindow }, {
+    filename: 'web/history.js',
+  });
+  historyReact.begin();
+  const historyTree46 = historyWindow.History();
+  const historyHeader46 = findAll(historyTree46, (node) => String(node.props.className || '').includes('history-toggle')
+    && textOf(node).includes('Keyboard history'))[0];
+  assert.equal(historyHeader46.props.role, 'button');
+  assert.equal(historyHeader46.props.tabIndex, 0);
+  assert.equal(historyHeader46.props['aria-expanded'], false);
+  historyHeader46.props.onKeyDown({
+    type: 'keydown', key: 'Enter', target: historyHeader46, currentTarget: historyHeader46,
+    preventDefault() {},
+  });
+  assert.deepEqual(historyCalls, [460], 'Enter must expand a history row');
+
+  const menuReact = statefulReact([true, { top: 10, left: 10, right: 10 }]);
+  menuReact.useRef = () => ({ current: { getBoundingClientRect() { return { top: 0, bottom: 0, left: 0, right: 0 }; } } });
+  const menuWindow = { React: menuReact, Icon: wave46Icon, UI: {} };
+  vm.runInNewContext(uiSource, {
+    React: menuReact,
+    ReactDOM: { createPortal(node) { return node; } },
+    window: menuWindow,
+    navigator: {},
+    document: { body: {}, addEventListener() {}, removeEventListener() {} },
+  }, { filename: 'web/ui.js' });
+  menuReact.begin();
+  const menuTree = menuWindow.UI.Menu({
+    items: [{ label: 'Profile', onClick() {} }, { label: 'Sign out', onClick() {} }],
+    children: menuReact.createElement('button', { type: 'button' }, 'Account'),
+  });
+  const popupMenu = findAll(menuTree, (node) => node.props.role === 'menu')[0];
+  assert.ok(popupMenu, 'the dropdown needs menu semantics');
+  const menuItems = findAll(popupMenu, (node) => node.type === 'button');
+  assert.equal(menuItems.length, 2);
+  assert.ok(menuItems.every((item) => item.props.role === 'menuitem'));
+
+  for (const selector of ['.vm-nav-surface:focus-visible', '.activity-nav-surface:focus-visible', '.history-toggle:focus-visible']) {
+    assert.match(cssRule(selector), /outline\s*:/, `${selector} needs a visible keyboard focus indicator`);
+  }
+}
 
 async function testIsoModalChecksumSubmission() {
   const validHarness = imageModalHarness(null);
@@ -1554,7 +1864,7 @@ async function testIsoModalChecksumSubmission() {
     'known-invalid checksum must return before calling the API');
 }
 
-testIsoModalChecksumSubmission().then(() => {
+testWave46Contracts().then(testIsoModalChecksumSubmission).then(() => {
   console.log('ALL WAVE 39 UI TESTS PASSED');
 }).catch((error) => {
   console.error(error);

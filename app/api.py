@@ -605,19 +605,46 @@ def state(request: Request, user: User = Depends(current_user), session: Session
 
     vms = [S.vm_dict(session, d, user, px_cache, users, conns, active_by_dep) for d in deps]
 
+    all_tpls = session.exec(select(Template).order_by(Template.id)).all()
+    template_image_refs = {t.base_image_id for t in all_tpls if t.base_image_id is not None}
+    template_block_refs = {
+        placed.get("ref")
+        for template in all_tpls
+        for section in load_recipe(template.recipe_json)
+        if isinstance(section, dict)
+        for placed in (section.get("blocks") or [])
+        if isinstance(placed, dict) and isinstance(placed.get("ref"), str)
+    }
+    deployed_image_refs = {
+        image_id for image_id in session.exec(
+            select(Deployment.image_id).where(Deployment.image_id.is_not(None))
+        ).all()
+        if image_id is not None
+    }
     is_admin = user.role == "admin"
     base = [
-        S.base_image_dict(i, include_source_url=is_admin)
-        for i in session.exec(select(Image).where(Image.kind == "base")).all()
+        S.base_image_dict(
+            image,
+            include_source_url=is_admin,
+            can_delete=(is_admin and image.id not in template_image_refs
+                        and image.id not in deployed_image_refs),
+        )
+        for image in session.exec(select(Image).where(Image.kind == "base")).all()
     ]
-    tpls = session.exec(select(Template).order_by(Template.id)).all()
+    tpls = all_tpls
     if user.role != "admin":
         tpls = [t for t in tpls if t.public or t.owner_id == user.id]
     templates = [S.template_dict(session, t, viewer=user) for t in tpls]
     blocks_all = session.exec(select(Block).order_by(Block.id)).all()
     if user.role != "admin":
         blocks_all = [b for b in blocks_all if b.builtin or b.owner_id == user.id]
-    blocks = [S.block_dict(b) for b in blocks_all]
+    blocks = [
+        S.block_dict(
+            block,
+            can_delete=(not block.builtin and block.key not in template_block_refs),
+        )
+        for block in blocks_all
+    ]
 
     secrets_q = session.exec(select(Secret)).all()
     if user.role != "admin":
