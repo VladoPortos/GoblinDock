@@ -504,6 +504,106 @@ def test_custom_block_create_and_edit_canonicalize_omitted_type():
         ]
 
 
+def _assert_public_legacy_implicit_text_schema(schema, label):
+    fixture = _sensitive_fixture()
+    with session_scope() as s:
+        block = s.exec(select(Block).where(Block.key == fixture["block"])).one()
+        block.input_schema_json = json.dumps(schema)
+        block.cloudinit_template = "echo {message}"
+        s.add(block)
+
+    template_name = f"w38-public-legacy-{label}"
+    create_recipe = [{"blocks": [{
+        "ref": fixture["block"],
+        "inputs": {"message": f"PUBLIC-CREATE-{label}"},
+    }]}]
+    edit_recipe = [{"blocks": [{
+        "ref": fixture["block"],
+        "inputs": {"message": f"PUBLIC-EDIT-{label}"},
+    }]}]
+
+    with Session(engine) as s:
+        create_body = _body(fixture, public=True, recipe=create_recipe)
+        create_body.name = template_name
+        assert api.save_template(
+            create_body,
+            user=s.get(User, fixture["author"]), session=s,
+        )["ok"]
+        template = s.exec(select(Template).where(
+            Template.name == template_name,
+            Template.owner_id == fixture["author"],
+        )).one()
+        assert template.public is True
+        assert json.loads(template.recipe_json) == create_recipe
+        stored_block = s.exec(select(Block).where(
+            Block.key == fixture["block"],
+        )).one()
+        assert json.loads(stored_block.input_schema_json) == schema
+
+        edit_body = _body(fixture, public=True, recipe=edit_recipe)
+        edit_body.name = template_name
+        assert api.edit_template_ep(
+            template.id, edit_body,
+            user=s.get(User, fixture["author"]), session=s,
+        )["ok"]
+        assert json.loads(s.get(Template, template.id).recipe_json) == edit_recipe
+        stored_block = s.exec(select(Block).where(
+            Block.key == fixture["block"],
+        )).one()
+        assert json.loads(stored_block.input_schema_json) == schema
+
+        result = api.deploy(
+            api.DeployBody(
+                templateId=template.id, name=f"w38-public-legacy-{label}",
+            ),
+            user=s.get(User, fixture["deployer"]), session=s,
+        )
+        plan = execution_plan.open_execution_plan(
+            s.get(Job, result["jobId"]).execution_plan_enc,
+        )
+        assert plan["recipe"] == edit_recipe
+        assert json.loads(plan["blocks"][fixture["block"]]["input_schema_json"]) == [
+            {"name": "message", "default": "legacy", "type": "text"},
+        ]
+
+
+def test_public_create_and_edit_accept_legacy_omitted_text_type():
+    _assert_public_legacy_implicit_text_schema(
+        [{"name": "message", "default": "legacy"}], "omitted",
+    )
+
+
+def test_public_create_and_edit_accept_legacy_null_text_type():
+    _assert_public_legacy_implicit_text_schema(
+        [{"name": "message", "type": None, "default": "legacy"}], "null",
+    )
+
+
+def test_public_legacy_explicit_invalid_types_remain_rejected_without_echo():
+    invalid_types = ("opaque", "secrett", ["secret"], "")
+    for index, field_type in enumerate(invalid_types):
+        fixture = _sensitive_fixture()
+        with session_scope() as s:
+            block = s.exec(select(Block).where(Block.key == fixture["block"])).one()
+            block.input_schema_json = json.dumps([
+                {"name": "message", "type": field_type},
+            ])
+            s.add(block)
+        literal = f"INVALID-TYPE-LITERAL-{index}"
+        recipe = [{"blocks": [{
+            "ref": fixture["block"], "inputs": {"message": literal},
+        }]}]
+        with Session(engine) as s:
+            before = len(s.exec(select(Template)).all())
+            body = _body(fixture, public=True, recipe=recipe)
+            body.name = f"w38-invalid-public-type-{index}"
+            exc = _expect_http(400, lambda: api.save_template(
+                body, user=s.get(User, fixture["author"]), session=s,
+            ))
+            assert literal not in str(exc.detail)
+            assert len(s.exec(select(Template)).all()) == before
+
+
 def test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan():
     fixture = _sensitive_fixture()
     with session_scope() as s:
@@ -733,9 +833,11 @@ def test_cross_owner_blank_sensitive_without_ask_is_rejected_before_persistence(
 def test_cross_owner_malformed_snapshot_schemas_fail_before_persistence():
     malformed_schemas = (
         [{"name": "credential", "type": "secrett"}],
+        [{"name": "credential", "type": "opaque"}],
         [{"type": "secret"}],
         [{"name": "bad-name", "type": "secret"}],
         [{"name": "credential", "type": ["secret"]}],
+        [{"name": "credential", "type": ""}],
     )
     for schema in malformed_schemas:
         fixture = _sensitive_fixture()
@@ -1140,6 +1242,9 @@ if __name__ == "__main__":
     test_five_concurrent_failures_lock_account()
     test_seed_migrates_b_ssh_before_pruning()
     test_custom_block_create_and_edit_canonicalize_omitted_type()
+    test_public_create_and_edit_accept_legacy_omitted_text_type()
+    test_public_create_and_edit_accept_legacy_null_text_type()
+    test_public_legacy_explicit_invalid_types_remain_rejected_without_echo()
     test_same_owner_private_legacy_missing_type_schema_is_canonicalized_in_plan()
     test_authenticated_imported_plan_with_missing_type_is_rejected()
     test_public_literal_is_rejected_without_echo()

@@ -414,3 +414,140 @@ informational LF/CRLF warnings; production sentinel scan returned no matches (ex
 - `app/execution_plan.py`
 - `tests/test_wave38.py`
 - `.superpowers/sdd/2026-08-31-security-data-integrity-remediation/task-2-report.md`
+
+## Fix Round 3
+
+### Final-review Important addressed
+
+`_validate_public_recipe_sensitive_inputs()` now runs the existing
+`normalize_input_schema()` against the detached JSON-decoded stored schema before the
+authoritative strict schema check and `validate_public_sensitive_inputs()`. This aligns
+public create/edit with the accepted legacy implicit-text contract already used by
+execution-plan construction.
+
+The correction does not write the normalized schema back to the legacy `Block`, change
+new block create/edit canonicalization, or normalize an authenticated execution plan.
+Only omitted/null legacy field types become explicit text in the public validator's local
+copy; blank, misspelled, unknown, and non-string explicit types remain invalid.
+
+### TDD regressions and controls
+
+- `test_public_create_and_edit_accept_legacy_omitted_text_type` directly inserts an
+  owner-visible legacy custom block whose field omits `type`, then exercises real public
+  create and edit, exact stored recipes, unchanged legacy schema, cross-owner deploy, and
+  the sealed job snapshot's explicit `type: "text"`.
+- `test_public_create_and_edit_accept_legacy_null_text_type` exercises the same API and
+  snapshot path for the historically equivalent explicit `null` form.
+- `test_public_legacy_explicit_invalid_types_remain_rejected_without_echo` proves
+  `opaque`, `secrett`, list-shaped, and blank explicit types all return sanitized HTTP
+  400 without inserting a Template.
+- The cross-owner malformed-schema matrix now also includes explicit `opaque` and blank
+  types and retains same-session Deployment/Job/IP rollback checks.
+- Existing controls retained in the focused run cover password/secret literal and blank
+  handling, unknown-block rejection and masking, and strict authenticated missing-type
+  plan rejection.
+
+### RED evidence
+
+Exact commands run against unchanged production at `138cdb3` after adding only tests:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_public_create_and_edit_accept_legacy_omitted_text_type()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_public_create_and_edit_accept_legacy_null_text_type()'"
+```
+
+Both exited 1 at the real `api.save_template()` call. The omitted-type run ended with:
+
+```text
+fastapi.exceptions.HTTPException: 400: block 'c-w38-sensitive-aa4e32' is unavailable
+```
+
+The null-type run ended with:
+
+```text
+fastapi.exceptions.HTTPException: 400: block 'c-w38-sensitive-228685' is unavailable
+```
+
+The stack for both passed through `_validate_public_recipe_sensitive_inputs()` and
+`validate_public_sensitive_inputs()`, confirming the missing local normalization was the
+failure rather than test setup, visibility, or execution-plan decoding.
+
+Pre-change security-control command:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_public_legacy_explicit_invalid_types_remain_rejected_without_echo(); t.test_authenticated_imported_plan_with_missing_type_is_rejected(); t.test_cross_owner_unknown_block_is_rejected_before_any_rows_are_inserted(); t.test_unknown_ref_less_block_masks_all_nonempty_inputs()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_cross_owner_malformed_snapshot_schemas_fail_before_persistence(); t.test_public_literal_is_rejected_without_echo(); t.test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit()'"
+```
+
+Both controls exited 0 with no output before the production edit.
+
+### Focused GREEN evidence
+
+Exact commands after the one production correction:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_public_create_and_edit_accept_legacy_omitted_text_type()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_public_create_and_edit_accept_legacy_null_text_type()'"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python -c 'from tests import test_wave38 as t; t.test_public_legacy_explicit_invalid_types_remain_rejected_without_echo(); t.test_public_literal_is_rejected_without_echo(); t.test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit(); t.test_cross_owner_malformed_snapshot_schemas_fail_before_persistence(); t.test_cross_owner_unknown_block_is_rejected_before_any_rows_are_inserted(); t.test_unknown_legacy_block_masks_all_nonempty_inputs(); t.test_unknown_ref_less_block_masks_all_nonempty_inputs(); t.test_authenticated_imported_plan_with_missing_type_is_rejected()'"
+```
+
+All three exited 0 with no output.
+
+### Affected suite and required waves
+
+Exact commands:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave9.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave10.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave26.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave34.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave36.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave37.py"
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && GOBLINDOCK_DEV=1 /mnt/e/goblindock/.venv/bin/python tests/test_wave38.py"
+```
+
+All exited 0. Waves 9, 10, 26, 34, 36, 37, and the full affected wave 38
+printed their pass sentinels. Wave 37 also emitted its two expected, internally caught
+rebuild-abort traces before `ALL WAVE 37 UNIT TESTS PASSED`.
+
+### Compile, diff, and non-disclosure checks
+
+Exact commands:
+
+```text
+wsl.exe --distribution Ubuntu-22.04 -- bash -lc "cd /mnt/e/goblindock/.worktrees/end-to-end-review-remediation && PYTHONPYCACHEPREFIX=/tmp/gd-task2-fix3-pycache /mnt/e/goblindock/.venv/bin/python -m compileall -q app tests"
+git diff --check
+rg -n "PUBLIC-CREATE|PUBLIC-EDIT|INVALID-TYPE-LITERAL|MALFORMED-SCHEMA-MUST-NOT-RUN|DO-NOT-ECHO|TOKEN-NOT-ECHO|AUTHOR-FALLBACK|IMPORTED-AUTHOR|UNKNOWN-BLOCK|DEPLOYER-PROVIDED|PRIVATE-AUTHOR|DEPLOY_PASSWORD|DEPLOY_TOKEN" app
+```
+
+Compileall exited 0 with no output. Diff check exited 0 with only Git's informational
+LF/CRLF warnings. The production literal scan returned no matches (expected `rg` exit 1).
+
+### Non-disclosure, rollback, and self-review
+
+- Public compatibility uses a detached decoded/copy-normalized schema. Exact assertions
+  prove both omitted and null legacy `Block.input_schema_json` values remain unchanged
+  after public create, edit, and cross-owner deployment.
+- Recipe literals are stored exactly and appear in the accepted immutable plan, but no
+  rejection detail echoes them. Invalid explicit-type tests assert both sanitized errors
+  and unchanged Template counts.
+- The existing authoritative `input_schema_problems(..., require_type=True)` still runs
+  after normalization. Only `None`/omission takes the text default; `opaque`, `secrett`,
+  list-shaped, and blank types never enter `schemas_by_ref`.
+- Password/secret literals and blank non-ask values still fail the public boundary;
+  cross-owner malformed plans still fail before Deployment/Job/IP insertion.
+- Unknown references remain rejected in admission, and unknown/ref-less values remain
+  fully masked for non-owners while empty values are preserved.
+- `open_execution_plan()` was not modified and its independently authenticated
+  missing-type regression remains GREEN. New custom-block create/edit canonicalization
+  and private/same-owner plan behavior are unchanged.
+- Mutation review: removing the new call fails both compatibility tests; normalizing the
+  persisted row fails unchanged-schema assertions; weakening explicit-type or strict
+  authenticated-plan validation fails the retained controls.
+
+### Fix Round 3 files
+
+- `app/api.py`
+- `tests/test_wave38.py`
+- `.superpowers/sdd/2026-08-31-security-data-integrity-remediation/task-2-report.md`

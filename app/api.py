@@ -1686,7 +1686,9 @@ def _validate_public_recipe_sensitive_inputs(session: Session, recipe: list) -> 
     schemas_by_ref = {}
     for block in rows:
         try:
-            schema = json.loads(block.input_schema_json or "[]")
+            schema = normalize_input_schema(
+                json.loads(block.input_schema_json or "[]"),
+            )
         except (json.JSONDecodeError, TypeError):
             continue
         if not input_schema_problems(schema, require_type=True):
