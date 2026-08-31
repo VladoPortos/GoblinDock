@@ -155,6 +155,17 @@ def test_beta_build_branch_publishes_without_changing_release_tag_rules():
     assert not missing, f"Image publisher is missing: {', '.join(missing)}"
 
 
+def test_docker_entrypoint_keeps_posix_line_endings_on_windows_checkouts():
+    """The Linux entrypoint shebang must survive a Windows Git checkout."""
+    root = Path(__file__).resolve().parents[1]
+    attributes = (root / ".gitattributes").read_text(encoding="utf-8").splitlines()
+    entrypoint = (root / "docker-entrypoint.sh").read_bytes()
+
+    assert "docker-entrypoint.sh text eol=lf" in attributes
+    assert entrypoint.startswith(b"#!/bin/sh\n"), "entrypoint shebang is not LF-terminated"
+    assert b"\r\n" not in entrypoint, "entrypoint contains Windows CRLF bytes"
+
+
 def _starter_engine():
     local_engine = create_engine(
         "sqlite://",
@@ -1541,6 +1552,7 @@ def test_base_image_create_and_edit_persist_normalized_checksum_atomically():
 if __name__ == "__main__":
     test_ci_runs_ui_behavior_suites_and_fail_closed_syntax_checks_all_20_scripts()
     test_beta_build_branch_publishes_without_changing_release_tag_rules()
+    test_docker_entrypoint_keeps_posix_line_endings_on_windows_checkouts()
     test_sri_rejects_local_vendor_resource_without_integrity()
     test_sri_rejects_local_vendor_resource_with_sha256_only()
     test_sri_rejects_duplicate_resource_replacing_distinct_vendor_asset()

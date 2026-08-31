@@ -1,1 +1,2 @@
 web/vendor/** -text
+docker-entrypoint.sh text eol=lf
