@@ -318,6 +318,32 @@ class Proxmox:
         except Exception:  # noqa: BLE001
             return False
 
+    def validate_snippet_volume(self, volid: str, node: Optional[str] = None) -> None:
+        """Require a normalized, configured, and API-visible cloud-init snippet.
+
+        SSH/SFTP success alone does not prove that Proxmox can attach the volume.
+        Check the active snippet storage advertises ``snippets`` and that its content
+        API lists this exact volume before accepting a VM-create request.
+        """
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+):snippets/([A-Za-z0-9_.-]+)", volid or "")
+        if not match:
+            raise ProxmoxError(f"invalid snippet volume id: {volid!r}")
+        storage = match.group(1)
+        if storage != self.snippet_storage:
+            raise ProxmoxError(
+                f"snippet volume storage {storage!r} does not match configured storage "
+                f"{self.snippet_storage!r}"
+            )
+        node = node or self.pick_node()
+        stores = self.api.nodes(node).storage.get() or []
+        active = next((item for item in stores if (item or {}).get("storage") == storage), None)
+        contents = [part.strip() for part in str((active or {}).get("content", "")).split(",")]
+        if not active or "snippets" not in contents:
+            raise ProxmoxError(f"storage {storage!r} is not enabled for snippets on {node}")
+        volumes = self.api.nodes(node).storage(storage).content.get(content="snippets") or []
+        if volid not in {(item or {}).get("volid") for item in volumes}:
+            raise ProxmoxError(f"snippet volume {volid!r} is not visible on {node}")
+
     def create_vm_import(
         self, vmid: int, name: str, import_path: str, cores: int, ram_mb: int,
         node: Optional[str] = None,
@@ -517,7 +543,7 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
     finally:
         client.close()
 
-    return f"{conn.snippet_storage}:snippets/{filename}"
+    return f"{store}:snippets/{filename}"
 
 
 def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:

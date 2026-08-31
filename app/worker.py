@@ -12,6 +12,7 @@ import re
 import threading
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Optional
 
@@ -474,6 +475,88 @@ def _load_materialized_job_plan(job: Job, dep: Deployment) -> tuple[dict, list[d
     return plan, recipe, blocks
 
 
+@dataclass(frozen=True)
+class DeployPreflight:
+    """Cloud-init material prepared and, when required, delivered before create."""
+    config: dict
+    managed_private_key: str
+    root_password: str
+    credential_user: str
+    snippet_volume: str = ""
+
+
+def _preflight_deploy_cloud_init(
+    ctx: JobCtx, px: Proxmox, conn: Connection, dep: Deployment, node: str, vmid: int,
+    cfg: dict, recipe_cmds: list[str], user_pubkey: str,
+) -> DeployPreflight:
+    """Prepare native cloud-init or prove required snippet delivery before create."""
+    managed_private_key, managed_pubkey = _managed_keypair()
+    pubkeys = [key for key in (user_pubkey, managed_pubkey) if key]
+    effective_recipe = any(cmd.strip() and cmd.strip() != "set -e" for cmd in recipe_cmds)
+    # Keep the established no-key/native path credential-free: native cloud-init
+    # would expose a plaintext cipassword. When a snippet channel is selected, a
+    # generated root credential is safe because only its hash is delivered.
+    root_password = gen_vm_password() if auto_root_password_enabled() and (
+        effective_recipe or conn.ssh_key_path
+    ) else ""
+    credential_user = ""
+    import urllib.parse
+    params = {
+        "name": dep.name,
+        "cores": _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores),
+        "memory": _clamp_resource(int(cfg.get("ram", 2)) * 1024, conn.max_ram_mb),
+        "ipconfig0": "ip=dhcp" if cfg.get("network_mode", "dhcp") == "dhcp" else cfg.get("ipconfig0", "ip=dhcp"),
+        "agent": "enabled=1",
+        "serial0": "socket",
+        "vga": "std",
+    }
+    bridge = cfg.get("bridge")
+    if bridge:
+        net0 = f"virtio,bridge={bridge}"
+        if cfg.get("vlan"):
+            net0 += f",tag={int(cfg['vlan'])}"
+        params["net0"] = net0
+    if cfg.get("dns"):
+        params["nameserver"] = cfg["dns"]
+
+    if not (effective_recipe or root_password):
+        params["ciuser"] = "goblin"
+        if pubkeys:
+            params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
+        return DeployPreflight(params, managed_private_key, root_password, credential_user)
+
+    volid = ""
+    try:
+        cloud_config = _deploy_cloud_config(
+            dep.name, pubkeys, recipe_cmds,
+            root_pw_hash=crypt_sha512(root_password) if root_password else "",
+        )
+        volid = write_snippet_over_ssh(conn, f"gd-deploy-{vmid}.yml", cloud_config)
+        px.validate_snippet_volume(volid, node=node)
+    except Exception:
+        if volid:
+            try:
+                delete_snippet_over_ssh(conn, f"gd-deploy-{vmid}.yml")
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    params["cicustom"] = f"user={volid}"
+    credential_user = "root" if root_password else ""
+    ctx.log(f"[{_ts()}] cloud-init: guest-agent + first-boot blocks via snippet {volid}", "l-acc")
+    return DeployPreflight(params, managed_private_key, root_password, credential_user, volid)
+
+
+def _clear_selected_vmid(dep_id: Optional[int], vmid: int) -> None:
+    """Undo a local VMID choice that was never accepted by Proxmox."""
+    if not dep_id:
+        return
+    with session_scope() as s:
+        dep = s.get(Deployment, dep_id)
+        if dep and dep.vmid == vmid:
+            dep.vmid = None
+            s.add(dep)
+
+
 def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5) -> None:
     # phase_base/phase_total let a rebuild present this as a continuation (e.g. phases
     # 2..6 of 6) instead of resetting the progress bar to "Phase 1 of 5".
@@ -505,107 +588,67 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ctx.log(f"[{_ts()}] goblindock: allocated VMID {new_vmid} on {node}", "l-dim")
     ctx.finish_step(st, t)
 
-    ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")
-    st = ctx.add_step("Ensure base cloud image on node storage")
-    t = ctx.start_step(st)
-    filename = _ensure_base_disk(ctx, px, node, cfg)
-    ctx.finish_step(st, t)
-
-    ctx.progress(20, f"Phase {_ph(3)} of {phase_total} · Create")
-    st = ctx.add_step(f"Create VM and import base disk → {dep.name}")
-    t = ctx.start_step(st)
-    import_path = px.iso_volume_path(filename)
-    ctx.log(f"[{_ts()}] create vm {new_vmid} import-from {import_path}", "l-acc")
-    create_submitted = False
-    try:
-        upid = px.create_vm_import(new_vmid, dep.name, import_path,
-                                   cores=cores, ram_mb=ram_mb, node=node)
-        create_submitted = True
-        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
-    except Exception:
-        # A pre-submission failure can be a collision with a VM we do not own.
-        if create_submitted:
-            try:
-                px.destroy(new_vmid, node=node)
-            except Exception:  # noqa: BLE001
-                pass
-        raise
-    ctx.log(f"[{_ts()}] ✓ disk imported", "l-ok")
-    ctx.finish_step(st, t)
+    # Persist the candidate before delivery so an accepted create request always has
+    # an identity for later reconciliation. Pre-submission failures clear it below.
     with session_scope() as s:
         d = s.get(Deployment, dep.id)
         d.vmid = new_vmid
         d.node = node
         s.add(d)
 
-    ctx.progress(45, f"Phase {_ph(4)} of {phase_total} · Configure")
-    st = ctx.add_step("Apply cloud-init (name, SSH key, network, size)")
-    t = ctx.start_step(st)
     user_pubkey = _ssh_pubkey(secret_owner_id, allow_global=allow_global_secrets)
-    managed_priv, managed_pub = _managed_keypair()
-    pubkeys = [k for k in (user_pubkey, managed_pub) if k]
-    root_pw = gen_vm_password() if auto_root_password_enabled() else ""
-    cred_user = ""
-    import urllib.parse
-    params = {
-        "name": dep.name,
-        "cores": cores,
-        "memory": ram_mb,
-        "ipconfig0": "ip=dhcp" if cfg.get("network_mode", "dhcp") == "dhcp" else cfg.get("ipconfig0", "ip=dhcp"),
-        "agent": "enabled=1",
-        "serial0": "socket",   # serial console (xterm); Ubuntu cloud images use ttyS0
-        "vga": "std",          # real VGA framebuffer so the GRAPHICAL console = the display
-    }
-    # Apply the chosen network's bridge + VLAN tag (the imported VM otherwise keeps the
-    # create-time net0) and DNS, so the operator-configured network is actually honoured
-    # rather than silently dropped. NOTE: exercise on real Proxmox hardware.
-    _bridge = cfg.get("bridge")
-    if _bridge:
-        _net0 = f"virtio,bridge={_bridge}"
-        if cfg.get("vlan"):
-            _net0 += f",tag={int(cfg['vlan'])}"
-        params["net0"] = _net0
-    if cfg.get("dns"):
-        params["nameserver"] = cfg["dns"]
     recipe_cmds = compile_cloudinit(
         recipe, blocks,
         _secret_lookup_factory(secret_owner_id, allow_global=allow_global_secrets),
     ) if recipe else []
+    preflight: Optional[DeployPreflight] = None
+    create_submitted = False
+    try:
+        preflight = _preflight_deploy_cloud_init(
+            ctx, px, conn, dep, node, new_vmid, cfg, recipe_cmds, user_pubkey,
+        )
 
-    used_snippet = False
-    if conn.ssh_key_path:
-        try:
-            cc = _deploy_cloud_config(dep.name, pubkeys, recipe_cmds,
-                                      root_pw_hash=crypt_sha512(root_pw) if root_pw else "")
-            volid = write_snippet_over_ssh(conn, f"gd-deploy-{new_vmid}.yml", cc)
-            params["cicustom"] = f"user={volid}"
-            used_snippet = True
-            if root_pw:
-                cred_user = "root"
-            ctx.log(f"[{_ts()}] cloud-init: guest-agent + first-boot blocks via snippet {volid}", "l-acc")
-        except Exception as e:  # noqa: BLE001
-            ctx.log(f"[{_ts()}] snippet unavailable ({e}); using native cloud-init", "l-warn")
-    if not used_snippet:
-        params["ciuser"] = "goblin"
-        if root_pw:
-            # The hashed-snippet path was unavailable (no SSH key on the connection), and
-            # native cloud-init can only take a cipassword in PLAINTEXT in the VM config
-            # (readable via `qm config`). Rather than persist a plaintext credential, skip
-            # it: there is no audited console password on this fallback path.
-            ctx.log(f"[{_ts()}] console password unavailable — connection has no SSH key for the hashed cloud-init snippet", "l-warn")
-            root_pw = ""
-            cred_user = ""
-        if pubkeys:
-            params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
-    px.set_config(new_vmid, node=node, **params)
+        ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")
+        st = ctx.add_step("Ensure base cloud image on node storage")
+        t = ctx.start_step(st)
+        filename = _ensure_base_disk(ctx, px, node, cfg)
+        ctx.finish_step(st, t)
+
+        ctx.progress(20, f"Phase {_ph(3)} of {phase_total} · Create")
+        st = ctx.add_step(f"Create VM and import base disk → {dep.name}")
+        t = ctx.start_step(st)
+        import_path = px.iso_volume_path(filename)
+        ctx.log(f"[{_ts()}] create vm {new_vmid} import-from {import_path}", "l-acc")
+        upid = px.create_vm_import(new_vmid, dep.name, import_path,
+                                   cores=cores, ram_mb=ram_mb, node=node)
+        create_submitted = True
+        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
+    except Exception:
+        # A failure before a UPID can be a collision with a VM we do not own. Undo
+        # only our uploaded snippet and local candidate; an accepted request retains
+        # its identity for reconciliation rather than risking a destructive guess.
+        if not create_submitted:
+            if preflight and preflight.snippet_volume:
+                try:
+                    delete_snippet_over_ssh(conn, f"gd-deploy-{new_vmid}.yml")
+                except Exception:  # noqa: BLE001
+                    pass
+            _clear_selected_vmid(dep.id, new_vmid)
+        raise
+    ctx.log(f"[{_ts()}] ✓ disk imported", "l-ok")
+    ctx.finish_step(st, t)
+    ctx.progress(45, f"Phase {_ph(4)} of {phase_total} · Configure")
+    st = ctx.add_step("Apply cloud-init (name, SSH key, network, size)")
+    t = ctx.start_step(st)
+    px.set_config(new_vmid, node=node, **preflight.config)
     ctx.log(f"[{_ts()}] cloud-init: hostname={dep.name} cores={cores} mem={ram_mb}MB", "l-dim")
     # Persist the VM credential as soon as cloud-init config is applied, so a later failure
     # (especially on a rebuild, whose old VM is already destroyed) can never leave a stale
     # password on the row — the stored credential always matches what was pushed to this VMID.
     with session_scope() as s:
         d = s.get(Deployment, dep.id)
-        d.root_password_enc = encrypt(root_pw) if root_pw else ""
-        d.cred_user = cred_user
+        d.root_password_enc = encrypt(preflight.root_password) if preflight.root_password else ""
+        d.cred_user = preflight.credential_user
         s.add(d)
     # resize disk (grow only). Track success so the deployment records the VM's REAL
     # disk size rather than the requested grow target when the resize silently failed.
@@ -634,7 +677,7 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         t = ctx.start_step(st)
         try:
             _run_ansible_phase(
-                ctx, recipe, blocks, secret_owner_id, ip, managed_priv, dep.name,
+                ctx, recipe, blocks, secret_owner_id, ip, preflight.managed_private_key, dep.name,
                 allow_global=allow_global_secrets,
             )
             ctx.finish_step(st, t)

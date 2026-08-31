@@ -6,6 +6,7 @@ import json
 import os
 import sys
 import tempfile
+from contextlib import contextmanager
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
@@ -26,6 +27,7 @@ from app.db import engine, init_db, session_scope  # noqa: E402
 from app.models import Block, Connection, Deployment, Image, Job, Network, Template, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
 from app import serialize as S  # noqa: E402
+from app.proxmox import Proxmox, ProxmoxError  # noqa: E402
 
 init_db()
 
@@ -159,9 +161,221 @@ def test_legacy_queued_job_persists_execution_plan_once():
         assert s.get(Job, job_id).execution_plan_enc == persisted
 
 
+# --------------------------------------------------------------------------- #
+# Deployment cloud-init preflight                                             #
+# --------------------------------------------------------------------------- #
+def _mk_worker_job(*, recipe: list[dict], blocks: dict[str, Block], ssh_key_path: str) -> tuple[int, object]:
+    """Store a detached execution-plan-shaped deploy job for worker boundary tests."""
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        user = User(
+            email=f"wave37-worker-{suffix}@example.com", name="wave37-worker",
+            password_hash=hash_password("StrongPass12!"),
+        )
+        conn = Connection(
+            name=f"w37-worker-conn-{suffix}", host="pve", token_id="u@pve!token",
+            node="pve", ssh_key_path=ssh_key_path,
+        )
+        dep = Deployment(
+            name=f"w37-worker-vm-{suffix}", owner_id=None, connection_id=None,
+            node="pve", status="working",
+        )
+        s.add(user)
+        s.add(conn)
+        s.flush()
+        user_id = user.id
+        dep.owner_id = user.id
+        dep.connection_id = conn.id
+        s.add(dep)
+        s.flush()
+        job = Job(
+            type="deploy", status="running", deployment_id=dep.id,
+            connection_id=conn.id, created_by=user.id,
+            context_json='{"src_url":"https://example.com/base.img"}',
+        )
+        s.add(job)
+        s.flush()
+        job_id = job.id
+
+    original = worker._load_materialized_job_plan
+    worker._load_materialized_job_plan = lambda _job, _dep: (
+        {"owner_id": user_id}, recipe, blocks,
+    )
+    return job_id, original
+
+
+def _cloudinit_recipe() -> tuple[list[dict], dict[str, Block]]:
+    block = Block(
+        key="w37-cloudinit", name="first boot", phase="cloudinit",
+        input_schema_json="[]", cloudinit_template="echo ready",
+    )
+    return [{"blocks": [{"ref": "w37-cloudinit", "inputs": {}}]}], {block.key: block}
+
+
+@contextmanager
+def _fake_proxmox(calls: list[str], *, native_params: list[dict] | None = None):
+    class FakeProxmox:
+        def __init__(self, _conn):
+            self.node = "pve"
+
+        def next_free_vmid(self, *_args, **_kwargs):
+            return 8501
+
+        def storage_has_volume(self, *_args, **_kwargs):
+            return True
+
+        def iso_volume_path(self, filename):
+            return f"local:import/{filename}"
+
+        def validate_snippet_volume(self, _volid, node=None):
+            calls.append("validate")
+
+        def create_vm_import(self, *_args, **_kwargs):
+            calls.append("create")
+            if native_params is not None:
+                return "UPID:create"
+            raise RuntimeError("stop after create")
+
+        def wait_task(self, *_args, **_kwargs):
+            return None
+
+        def set_config(self, *_args, **params):
+            if native_params is not None:
+                native_params.append(params)
+            raise RuntimeError("stop after native config")
+
+    saved = worker.Proxmox
+    worker.Proxmox = FakeProxmox
+    try:
+        yield
+    finally:
+        worker.Proxmox = saved
+
+
+@contextmanager
+def _patched_worker(**replacements):
+    saved = {name: getattr(worker, name) for name in replacements}
+    try:
+        for name, value in replacements.items():
+            setattr(worker, name, value)
+        yield
+    finally:
+        for name, value in saved.items():
+            setattr(worker, name, value)
+
+
+def _run_worker_job(job_id: int):
+    with session_scope() as s:
+        job = Job(**s.get(Job, job_id).model_dump())
+    worker._run_deploy(worker.JobCtx(job_id), job)
+
+
+def test_recipe_without_ssh_key_fails_before_vm_creation():
+    """Dropping required recipe delivery must not submit a VM that cannot run it."""
+    recipe, blocks = _cloudinit_recipe()
+    job_id, original_plan_loader = _mk_worker_job(recipe=recipe, blocks=blocks, ssh_key_path="")
+    calls = []
+    try:
+        with _fake_proxmox(calls):
+            try:
+                _run_worker_job(job_id)
+            except ProxmoxError as exc:
+                assert "SSH key" in str(exc)
+            else:
+                raise AssertionError("a recipe deployment without a snippet key must fail")
+    finally:
+        worker._load_materialized_job_plan = original_plan_loader
+    assert calls == [], f"required cloud-init failure must precede create, got {calls}"
+
+
+def test_recipe_free_deployment_uses_native_ciuser_without_snippet():
+    """A plain VM remains deployable without the optional SSH snippet channel."""
+    job_id, original_plan_loader = _mk_worker_job(recipe=[], blocks={}, ssh_key_path="")
+    calls, params = [], []
+    try:
+        with _fake_proxmox(calls, native_params=params), _patched_worker(
+            auto_root_password_enabled=lambda: False,
+            _managed_keypair=lambda: ("managed-private", "ssh-ed25519 managed"),
+            _ssh_pubkey=lambda *_args, **_kwargs: "",
+        ):
+            try:
+                _run_worker_job(job_id)
+            except RuntimeError as exc:
+                assert str(exc) == "stop after native config"
+            else:
+                raise AssertionError("test double must stop after native cloud-init config")
+    finally:
+        worker._load_materialized_job_plan = original_plan_loader
+    assert calls == ["create"], calls
+    assert params and params[0]["ciuser"] == "goblin", params
+
+
+def test_required_snippet_upload_validate_then_create():
+    """A required first-boot recipe is uploaded and visible before VM submission."""
+    recipe, blocks = _cloudinit_recipe()
+    job_id, original_plan_loader = _mk_worker_job(
+        recipe=recipe, blocks=blocks, ssh_key_path="/keys/id_managed",
+    )
+    calls = []
+    try:
+        with _fake_proxmox(calls), _patched_worker(
+            write_snippet_over_ssh=lambda *_args: calls.append("upload") or "local:snippets/gd-deploy-8501.yml",
+            delete_snippet_over_ssh=lambda *_args: calls.append("delete"),
+            auto_root_password_enabled=lambda: False,
+            _managed_keypair=lambda: ("managed-private", "ssh-ed25519 managed"),
+            _ssh_pubkey=lambda *_args, **_kwargs: "",
+        ):
+            try:
+                _run_worker_job(job_id)
+            except RuntimeError as exc:
+                assert str(exc) == "stop after create"
+            else:
+                raise AssertionError("test double must stop at VM submission")
+    finally:
+        worker._load_materialized_job_plan = original_plan_loader
+    assert calls[:3] == ["upload", "validate", "create"], calls
+
+
+def test_validate_snippet_volume_requires_visible_snippet_on_enabled_storage():
+    """A successful upload is not usable until the configured store lists that volume."""
+    calls = []
+
+    class Content:
+        def get(self, **kwargs):
+            calls.append(("content", kwargs))
+            return [{"volid": "local:snippets/gd-deploy-8501.yml"}]
+
+    class Storage:
+        content = Content()
+
+        def get(self):
+            calls.append(("stores", {}))
+            return [{"storage": "local", "content": "images, snippets"}]
+
+        def __call__(self, _store):
+            return self
+
+    class Node:
+        storage = Storage()
+
+    class Nodes:
+        def __call__(self, _node):
+            return Node()
+
+    px = object.__new__(Proxmox)
+    px.snippet_storage = "local"
+    px.api = type("Api", (), {"nodes": Nodes()})()
+    assert px.validate_snippet_volume("local:snippets/gd-deploy-8501.yml", node="pve") is None
+    assert calls == [("stores", {}), ("content", {"content": "snippets"})], calls
+
+
 if __name__ == "__main__":
     test_execution_plan_is_encrypted_and_immutable()
     test_execution_plan_rejects_malformed_ciphertext()
     test_job_detail_does_not_disclose_execution_plan_or_captured_command()
     test_legacy_queued_job_persists_execution_plan_once()
+    test_recipe_without_ssh_key_fails_before_vm_creation()
+    test_recipe_free_deployment_uses_native_ciuser_without_snippet()
+    test_required_snippet_upload_validate_then_create()
+    test_validate_snippet_volume_requires_visible_snippet_on_enabled_storage()
     print("\\nALL WAVE 37 UNIT TESTS PASSED")
