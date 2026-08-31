@@ -1993,7 +1993,7 @@ class ConnBody(BaseModel):
     ssh_host: str = ""
     ssh_user: str = "root"
     ssh_key_path: str = ""
-    max_cores: int = 0       # per-VM ceilings for this target (0 = inherit global)
+    max_cores: int = 0       # per-VM ceilings for this target (0 = unlimited)
     max_ram_gb: int = 0
     max_disk_gb: int = 0
 
@@ -2621,7 +2621,7 @@ def edit_connection(conn_id: int, body: ConnEditBody, user: User = Depends(requi
         if data.get(fld) is not None:
             data[fld] = _clean_storage_id(data[fld], fld.replace("_", " "))
     for k, v in data.items():
-        if v is not None:                      # 0 is allowed (resets to inherit global)
+        if v is not None:                      # 0 is allowed (unlimited)
             setattr(c, k, v)
     session.add(c)
     record_audit(session, user, "connection.update", "connection", c.id, c.name)

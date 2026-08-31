@@ -401,14 +401,16 @@ def connection_dict(session: Session, c: Connection, status: Optional[dict] = No
         "bridge": c.bridge,
         "vms": len(vms),
         "node": c.node,
-        # round-trippable config for the edit form (token secret is NEVER sent; the
-        # SSH/TLS settings are env/API-managed and not exposed to the form)
+        # round-trippable config for the admin edit form (token secret is NEVER sent)
         "host": c.host,
         "port": c.port,
         "tokenId": c.token_id,
         "verifyTls": c.verify_tls,
         "isoStorage": c.iso_storage,
         "snippetStorage": c.snippet_storage,
+        "sshHost": c.ssh_host,
+        "sshUser": c.ssh_user,
+        "sshKeyPath": c.ssh_key_path,
         # per-target VM ceilings — authoritative; 0 = unlimited (no per-VM cap)
         "maxCores": c.max_cores,
         "maxRamGb": c.max_ram_mb // 1024,

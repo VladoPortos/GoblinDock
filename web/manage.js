@@ -237,23 +237,67 @@
   }
 
   /* ---- Connections ---- */
+  function connectionDraft(conn) {
+    const c = conn || {};
+    const hostFromUrl = (c.url || '').replace(/^https?:\/\//, '').split(':')[0];
+    return {
+      name: c.name ?? '',
+      host: c.host ?? hostFromUrl,
+      port: c.port ?? 8006,
+      token_id: c.tokenId ?? '',
+      token_secret: '',
+      node: c.node ?? '',
+      storage: c.storage === '—' ? '' : (c.storage ?? (conn ? '' : 'local-zfs')),
+      iso_storage: c.isoStorage ?? 'local',
+      snippet_storage: c.snippetStorage ?? 'local',
+      bridge: c.bridge ?? 'vmbr0',
+      verify_tls: c.verifyTls == null ? true : !!c.verifyTls,
+      ssh_host: c.sshHost ?? '',
+      ssh_user: c.sshUser ?? 'root',
+      ssh_key_path: c.sshKeyPath ?? '',
+      max_cores: c.maxCores ?? 0,
+      max_ram_gb: c.maxRamGb ?? 0,
+      max_disk_gb: c.maxDiskGb ?? 0,
+    };
+  }
+
+  function finiteNumber(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function nonnegativeNumber(value) {
+    return Math.max(0, finiteNumber(value, 0));
+  }
+
+  function connectionPayload(draft, editing) {
+    const payload = {
+      name: draft.name,
+      host: draft.host,
+      port: finiteNumber(draft.port, 8006),
+      token_id: draft.token_id,
+      verify_tls: draft.verify_tls,
+      node: draft.node,
+      storage: draft.storage,
+      iso_storage: draft.iso_storage,
+      snippet_storage: draft.snippet_storage,
+      bridge: draft.bridge,
+      ssh_host: draft.ssh_host,
+      ssh_user: draft.ssh_user,
+      ssh_key_path: draft.ssh_key_path,
+      max_cores: nonnegativeNumber(draft.max_cores),
+      max_ram_gb: nonnegativeNumber(draft.max_ram_gb),
+      max_disk_gb: nonnegativeNumber(draft.max_disk_gb),
+    };
+    if (!editing || String(draft.token_secret ?? '').trim()) {
+      payload.token_secret = draft.token_secret ?? '';
+    }
+    return payload;
+  }
+
   function ConnModal({ conn, onClose, onDone }) {
     const editing = !!conn;
-    const [f, setF] = useState(() => ({
-      name: conn ? conn.name : '',
-      host: conn ? (conn.host || (conn.url || '').replace(/^https?:\/\//, '').split(':')[0]) : '',
-      port: conn ? (conn.port || 8006) : 8006,
-      token_id: conn ? (conn.tokenId || '') : '', token_secret: '',
-      node: conn ? conn.node : '',
-      storage: conn ? (conn.storage === '—' ? '' : conn.storage) : 'local-zfs',
-      iso_storage: conn ? (conn.isoStorage || 'local') : 'local',
-      snippet_storage: conn ? (conn.snippetStorage || 'local') : 'local',
-      bridge: conn ? conn.bridge : 'vmbr0',
-      verify_tls: conn ? !!conn.verifyTls : true,
-      max_cores: conn ? (conn.maxCores || 0) : 0,
-      max_ram_gb: conn ? (conn.maxRamGb || 0) : 0,
-      max_disk_gb: conn ? (conn.maxDiskGb || 0) : 0,
-    }));
+    const [f, setF] = useState(() => connectionDraft(conn));
     const [busy, setBusy] = useState(false);
     const [probe, setProbe] = useState(null);      // null until a successful "Load from Proxmox"
     const [probing, setProbing] = useState(false);
@@ -291,14 +335,11 @@
       if (!f.name || !f.host || (!editing && (!f.token_id || !f.token_secret))) { toast('Name, host and token are required', 'err'); return; }
       setBusy(true);
       try {
-        const limits = { max_cores: Number(f.max_cores) || 0, max_ram_gb: Number(f.max_ram_gb) || 0, max_disk_gb: Number(f.max_disk_gb) || 0 };
+        const payload = connectionPayload(f, editing);
         if (editing) {
-          const payload = { name: f.name, host: f.host, port: Number(f.port), node: f.node, storage: f.storage, iso_storage: f.iso_storage, snippet_storage: f.snippet_storage, bridge: f.bridge, verify_tls: f.verify_tls, ...limits };
-          if (f.token_id) payload.token_id = f.token_id;
-          if (f.token_secret) payload.token_secret = f.token_secret;
           await window.API.editConnection(conn.connId, payload);
         } else {
-          await window.API.addConnection({ ...f, port: Number(f.port), ...limits });
+          await window.API.addConnection(payload);
         }
         onDone();
       } catch (e) { toast(e.message, 'err'); setBusy(false); }
@@ -307,6 +348,7 @@
       h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
         h(Field, { label: 'Name', value: f.name, onChange: (v) => set('name', v) }),
         h(Field, { label: 'Host / IP', value: f.host, onChange: (v) => set('host', v), mono: true }),
+        h(Field, { label: 'API port', value: f.port, onChange: (v) => set('port', v.replace(/[^0-9]/g, '')), mono: true }),
         h(Field, { label: 'Token ID', value: f.token_id, onChange: (v) => set('token_id', v), mono: true, placeholder: 'goblindock@pve!app' }),
         h(Field, { label: 'Token secret' + (editing ? ' (leave blank to keep)' : ''), value: f.token_secret, onChange: (v) => set('token_secret', v), mono: true, type: 'password', placeholder: editing ? '••••••••' : '' }),
         h('div', { style: { gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 10 } },
@@ -328,12 +370,16 @@
         probe
           ? h(SelectField, { label: 'ISO storage', value: f.iso_storage, onChange: (v) => set('iso_storage', v), options: isoStoreOpts })
           : h(Field, { label: 'ISO storage', value: f.iso_storage, onChange: (v) => set('iso_storage', v), mono: true }),
+        h(Field, { label: 'Snippet storage', value: f.snippet_storage, onChange: (v) => set('snippet_storage', v), mono: true }),
         probe
           ? h(SelectField, { label: 'Bridge', value: f.bridge, onChange: (v) => set('bridge', v), options: bridgeOpts })
           : h(Field, { label: 'Bridge', value: f.bridge, onChange: (v) => set('bridge', v), mono: true }),
+        h(Field, { label: 'SSH host', value: f.ssh_host, onChange: (v) => set('ssh_host', v), mono: true }),
+        h(Field, { label: 'SSH user', value: f.ssh_user, onChange: (v) => set('ssh_user', v), mono: true }),
+        h(Field, { label: 'SSH key path', value: f.ssh_key_path, onChange: (v) => set('ssh_key_path', v), mono: true, placeholder: '/run/secrets/pve_key' }),
         h('div', { style: { gridColumn: '1 / -1' } },
           h('label', { className: 'field-label' }, 'Per-VM limits for this target ',
-            h('span', { className: 'hint', style: { fontWeight: 400, fontSize: 11 } }, '· 0 = inherit global')),
+            h('span', { className: 'hint', style: { fontWeight: 400, fontSize: 11 } }, '· 0 = unlimited')),
           h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
             h(Field, { label: 'Max vCPU', value: f.max_cores, onChange: (v) => set('max_cores', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' }),
             h(Field, { label: 'Max RAM (GB)', value: f.max_ram_gb, onChange: (v) => set('max_ram_gb', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' }),
@@ -652,4 +698,5 @@
   window.Secrets = Secrets;
   window.Variables = Variables;
   window.Settings = Settings;
+  window.ConnectionUI = { connectionDraft, connectionPayload };
 })();
