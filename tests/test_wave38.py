@@ -2,9 +2,13 @@
 import asyncio
 import json
 import os
+import sqlite3
+import stat
 import sys
 import tempfile
 import threading
+from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -22,7 +26,8 @@ os.environ.setdefault("GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(),
 from fastapi import HTTPException                 # noqa: E402
 from sqlmodel import Session, select              # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
-from app import api, execution_plan, recipes, seed  # noqa: E402
+from app import api, backup, execution_plan, recipes, seed  # noqa: E402
+from app.config import settings                     # noqa: E402
 from app import serialize as S                     # noqa: E402
 from app.models import (                           # noqa: E402
     Block, Connection, Deployment, Image, IpAllocation, Job, Network, Template,
@@ -31,6 +36,115 @@ from app.models import (                           # noqa: E402
 from app.security import encrypt, hash_password    # noqa: E402
 
 init_db()
+
+
+_MISSING = object()
+
+
+@contextmanager
+def _patched(obj, name, value):
+    original = getattr(obj, name, _MISSING)
+    setattr(obj, name, value)
+    try:
+        yield
+    finally:
+        if original is _MISSING:
+            delattr(obj, name)
+        else:
+            setattr(obj, name, original)
+
+
+@contextmanager
+def _isolated_backups(*, keep):
+    original_dir = settings.backup_dir
+    original_keep = settings.backup_keep
+    with tempfile.TemporaryDirectory(prefix="gd-wave38-backup-") as root:
+        settings.backup_dir = Path(root) / "backups"
+        settings.backup_keep = keep
+        try:
+            yield settings.backup_dir
+        finally:
+            settings.backup_dir = original_dir
+            settings.backup_keep = original_keep
+
+
+def _expect_raises(exc_type, fn):
+    try:
+        fn()
+    except exc_type as exc:
+        return exc
+    raise AssertionError(f"expected {exc_type.__name__}")
+
+
+def _assert_valid_sqlite_backup(path):
+    con = sqlite3.connect(str(path))
+    try:
+        assert con.execute("PRAGMA quick_check").fetchall() == [("ok",)]
+    finally:
+        con.close()
+
+
+def _seed_published_backup():
+    path = backup.backup_now("seed")
+    _assert_valid_sqlite_backup(path)
+    return path, path.read_bytes(), backup.list_backups()
+
+
+def _assert_failed_publish_preserved(seed, seed_bytes, before):
+    assert backup.list_backups() == before
+    assert seed.exists() and seed.read_bytes() == seed_bytes
+    assert not list(backup.backup_dir().glob(".goblindock-backup-*.tmp"))
+
+
+def test_backup_verification_failure_preserves_published_listing_and_rotation():
+    with _isolated_backups(keep=1):
+        seed, seed_bytes, before = _seed_published_backup()
+
+        def fail_verification(_path):
+            raise sqlite3.DatabaseError("injected verification failure")
+
+        with _patched(backup, "_verify_sqlite_backup", fail_verification):
+            _expect_raises(
+                sqlite3.DatabaseError,
+                lambda: backup.backup_now("verification-failure"),
+            )
+
+        _assert_failed_publish_preserved(seed, seed_bytes, before)
+
+
+def test_backup_replace_failure_preserves_published_listing_and_rotation():
+    with _isolated_backups(keep=1):
+        seed, seed_bytes, before = _seed_published_backup()
+
+        def fail_replace(_source, _destination):
+            raise OSError("injected publication failure")
+
+        with _patched(backup.os, "replace", fail_replace):
+            _expect_raises(
+                OSError,
+                lambda: backup.backup_now("publication-failure"),
+            )
+
+        _assert_failed_publish_preserved(seed, seed_bytes, before)
+
+
+def test_successful_backup_is_valid_secure_and_rotated_to_requested_count():
+    with _isolated_backups(keep=2) as directory:
+        made = [backup.backup_now("success") for _ in range(4)]
+        published = backup.list_backups()
+
+        assert [item["name"] for item in published] == [
+            path.name for path in made[-2:][::-1]
+        ]
+        assert len(published) == 2
+        assert not list(directory.glob(".goblindock-backup-*.tmp"))
+        for item in published:
+            _assert_valid_sqlite_backup(directory / item["name"])
+
+        if os.name == "posix":
+            assert stat.S_IMODE(directory.stat().st_mode) == 0o700
+            for item in published:
+                assert stat.S_IMODE((directory / item["name"]).stat().st_mode) == 0o600
 
 
 def test_first_admin_setup_contract_is_unchanged():
@@ -968,6 +1082,9 @@ def test_console_grant_is_a_frozen_snapshot():
 
 
 if __name__ == "__main__":
+    test_backup_verification_failure_preserves_published_listing_and_rotation()
+    test_backup_replace_failure_preserves_published_listing_and_rotation()
+    test_successful_backup_is_valid_secure_and_rotated_to_requested_count()
     test_first_admin_setup_contract_is_unchanged()
     test_five_concurrent_failures_lock_account()
     test_seed_migrates_b_ssh_before_pruning()
