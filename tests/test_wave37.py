@@ -21,6 +21,7 @@ for ext in ("", "-wal", "-shm"):
 os.environ["GOBLINDOCK_DB"] = _DB
 os.environ.setdefault("GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(), "gd-data-test"))
 
+from fastapi import HTTPException  # noqa: E402
 from sqlmodel import Session, select  # noqa: E402
 
 from app import api, appsettings, execution_plan, worker  # noqa: E402
@@ -540,6 +541,320 @@ def test_validate_snippet_volume_rejects_inactive_storage():
         raise AssertionError("inactive snippet storage must be rejected")
 
 
+# --------------------------------------------------------------------------- #
+# Durable post-boot guest-IP waits                                             #
+# --------------------------------------------------------------------------- #
+def _retire_waiting_jobs() -> None:
+    """Keep this module's shared SQLite fixture from leaking active jobs across tests."""
+    with session_scope() as s:
+        for job in s.exec(select(Job).where(Job.status.in_(("queued", "waiting")))).all():
+            job.status = "failed"
+            job.error = "test fixture retired"
+            job.finished_at = utcnow()
+            s.add(job)
+
+
+def _mk_captured_waiting_job(*, age: timedelta = timedelta(minutes=1),
+                             cancel_requested: bool = False,
+                             reserve_ip: bool = False) -> tuple[int, int, int, str]:
+    _retire_waiting_jobs()
+    user_id, template_id, block_key = _mk_plan_fixture(command="captured-command")
+    result = _deploy(template_id, user_id, {"0.0": {"hostname": "captured-host"}})
+    with session_scope() as s:
+        job = s.get(Job, result["jobId"])
+        dep = s.get(Deployment, result["depId"])
+        job.status = "waiting"
+        job.started_at = utcnow() - timedelta(minutes=2)
+        job.waiting_since = utcnow() - age
+        job.cancel_requested = cancel_requested
+        job.finished_at = None
+        job.phase = "Waiting for guest IP"
+        dep.vmid = 8600 + (job.id % 200)
+        dep.node = "pve"
+        dep.status = "working"
+        s.add(job)
+        s.add(dep)
+        if reserve_ip:
+            s.add(IpAllocation(
+                network_id=dep.network_id, ip=f"10.37.1.{job.id % 200 + 10}",
+                deployment_id=dep.id, state="reserved",
+            ))
+        s.flush()
+        return job.id, dep.id, job.connection_id, block_key
+
+
+def test_missing_guest_ip_defers_required_ansible_without_false_success():
+    """A missing agent IP must not let an Ansible deployment become successful."""
+    _retire_waiting_jobs()
+    user_id, template_id, _block_key = _mk_plan_fixture(command="defer-command")
+    result = _deploy(template_id, user_id, {"0.0": {"hostname": "defer-host"}})
+    with session_scope() as s:
+        job = s.get(Job, result["jobId"])
+        job.status = "running"
+        job.started_at = utcnow()
+        s.add(job)
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def pick_node(self): return "pve"
+        def next_free_vmid(self, *_args, **_kwargs): return 8610
+        def iso_volume_path(self, filename): return f"local:import/{filename}"
+        def create_vm_import(self, *_args, **_kwargs): return "UPID:create"
+        def wait_task(self, *_args, **_kwargs): return None
+        def set_config(self, *_args, **_kwargs): return None
+        def resize_disk(self, *_args, **_kwargs): return None
+        def start(self, *_args, **_kwargs): return "UPID:start"
+        def mac_of(self, *_args, **_kwargs): return "52:54:00:37:00:10"
+        def vm_config(self, *_args, **_kwargs): return {"scsi0": "size=20G"}
+
+    def _unexpected_ansible(*_args, **_kwargs):
+        raise AssertionError("Ansible must not run without an IP")
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _preflight_deploy_cloud_init=lambda *_args, **_kwargs: worker.DeployPreflight(
+            {"ciuser": "goblin"}, "managed-private", "", "",
+        ),
+        _ensure_base_disk=lambda *_args, **_kwargs: "base.img",
+        _wait_for_ip=lambda *_args, **_kwargs: None,
+        run_playbook=_unexpected_ansible,
+    ):
+        worker._execute(result["jobId"])
+
+    with session_scope() as s:
+        job = s.get(Job, result["jobId"])
+        dep = s.get(Deployment, result["depId"])
+        assert job.status == "waiting"
+        assert job.waiting_since is not None
+        assert job.finished_at is None
+        assert job.phase == "Waiting for guest IP"
+        assert dep.status == "working"
+        assert dep.vmid == 8610
+        assert dep.mac == "52:54:00:37:00:10"
+        assert (dep.cpu, dep.ram, dep.disk) == (1, 2, 20)
+    _retire_waiting_jobs()
+
+
+def test_waiting_job_resumes_only_captured_ansible_plan_when_ip_appears():
+    """Resume must ignore mutable block rows and execute the admission-time plan."""
+    job_id, dep_id, _conn_id, block_key = _mk_captured_waiting_job()
+    with session_scope() as s:
+        s.exec(select(Block).where(Block.key == block_key)).one().ansible_template = (
+            "- debug: msg=mutated-command"
+        )
+
+    playbooks: list[str] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, *_args, **_kwargs): return "10.37.1.42"
+
+    def _run(playbook, _ip, _user, _key, **_kwargs):
+        playbooks.append(playbook)
+        return "successful", 0
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=_run,
+    ):
+        assert worker._poll_waiting_jobs() is True
+
+    assert len(playbooks) == 1
+    assert "captured-command" in playbooks[0]
+    assert "mutated-command" not in playbooks[0]
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        dep = s.get(Deployment, dep_id)
+        assert job.status == "succeeded"
+        assert job.finished_at is not None
+        assert dep.status == "running"
+        assert dep.ip == "10.37.1.42"
+
+
+def test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership():
+    """The exact wait deadline fails visibly while retaining the VM and IP allocation."""
+    job_id, dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(0), reserve_ip=True,
+    )
+    boundary = utcnow()
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        job.waiting_since = boundary - timedelta(minutes=30)
+        s.add(job)
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, *_args, **_kwargs):
+            raise AssertionError("deadline must be checked before another external poll")
+
+    with _patched_worker(Proxmox=_Px):
+        assert worker._poll_waiting_jobs(now=boundary - timedelta(microseconds=1)) is True
+        with session_scope() as s:
+            assert s.get(Job, job_id).status == "waiting"
+        assert worker._poll_waiting_jobs(now=boundary) is True
+
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        dep = s.get(Deployment, dep_id)
+        allocations = s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep_id,
+        )).all()
+        assert job.status == "failed"
+        assert job.finished_at is not None
+        assert "guest IP" in job.error
+        assert dep is not None and dep.vmid is not None
+        assert dep.status == "error"
+        assert len(allocations) == 1
+
+
+def test_waiting_cancellation_uses_deployment_reconciliation():
+    """A canceled wait must take the same absence-confirmed cleanup path as running work."""
+    job_id, dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        cancel_requested=True, reserve_ip=True,
+    )
+    destroyed: list[int] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def destroy(self, vmid, **_kwargs):
+            destroyed.append(vmid)
+            return "UPID:destroy"
+        def wait_task(self, *_args, **_kwargs): return None
+        def list_qemu(self, _node=None, **_kwargs): return []
+
+    with _patched_worker(Proxmox=_Px):
+        assert worker._poll_waiting_jobs() is True
+
+    assert destroyed
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        allocations = s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep_id,
+        )).all()
+        assert job.status == "canceled"
+        assert job.finished_at is not None
+        assert s.get(Deployment, dep_id) is None
+        assert allocations == []
+
+
+def test_waiting_poll_yields_to_queued_work():
+    """The serial worker must claim queued work before touching an older IP wait."""
+    waiting_id, _dep_id, conn_id, _block_key = _mk_captured_waiting_job()
+    with session_scope() as s:
+        queued = Job(type="image_sync", status="queued", connection_id=conn_id)
+        s.add(queued)
+        s.flush()
+        queued_id = queued.id
+    assert worker._poll_waiting_jobs() is False
+    with session_scope() as s:
+        assert s.get(Job, waiting_id).status == "waiting"
+        assert s.get(Job, queued_id).status == "queued"
+        s.get(Job, queued_id).status = "failed"
+
+
+def test_restart_recovery_leaves_durable_wait_untouched():
+    """Restart recovery must fail dead running work but preserve resumable waits."""
+    waiting_id, dep_id, _conn_id, _block_key = _mk_captured_waiting_job(reserve_ip=True)
+    with session_scope() as s:
+        running = Job(type="image_sync", status="running", started_at=utcnow())
+        s.add(running)
+        s.flush()
+        running_id = running.id
+    worker._recover_orphans()
+    with session_scope() as s:
+        assert s.get(Job, waiting_id).status == "waiting"
+        assert s.get(Job, waiting_id).finished_at is None
+        assert s.get(Deployment, dep_id).status == "working"
+        assert s.get(Job, running_id).status == "failed"
+    _retire_waiting_jobs()
+
+
+def test_waiting_is_active_in_state_widget_and_serialization():
+    """Every read model must present a durable wait as active/working, never terminal."""
+    job_id, dep_id, _conn_id, _block_key = _mk_captured_waiting_job()
+    request = type("Request", (), {"session": {}})()
+    saved_px_cache = api._px_cache
+    api._px_cache = lambda _conns: {}
+    try:
+        with session_scope() as s:
+            user = s.get(User, s.get(Job, job_id).created_by)
+            state = api.state(request, user=user, session=s)
+            widget = api.widget_summary(user=user, session=s)
+            detail = S.job_detail(s, s.get(Job, job_id), viewer=user)
+            brief = S.job_brief(s, s.get(Job, job_id))
+    finally:
+        api._px_cache = saved_px_cache
+    vm = next(item for item in state["VMS"] if item["depId"] == dep_id)
+    assert vm["status"] == "working"
+    assert vm["job"]["jobId"] == job_id
+    assert widget["jobs_active"] == 1
+    assert detail["status"] == "working" and detail["rawStatus"] == "waiting"
+    assert brief["status"] == "working"
+    _retire_waiting_jobs()
+
+
+def test_waiting_can_cancel_but_cannot_be_dismissed_purged_or_retained_as_terminal():
+    """Job mutations must treat waiting as active and retention must leave it alone."""
+    job_id, _dep_id, _conn_id, _block_key = _mk_captured_waiting_job()
+    with session_scope() as s:
+        user = s.get(User, s.get(Job, job_id).created_by)
+        api.cancel_job(job_id, user=user, session=s)
+    with session_scope() as s:
+        assert s.get(Job, job_id).cancel_requested is True
+        user = s.get(User, s.get(Job, job_id).created_by)
+        for mutation in (api.delete_job, api.purge_job_permanently):
+            try:
+                mutation(job_id, user=user, session=s)
+            except HTTPException as exc:
+                assert getattr(exc, "status_code", None) == 409
+            else:
+                raise AssertionError("waiting jobs must reject terminal-only deletion")
+        assert api.clear_jobs(user=user, session=s)["cleared"] == 0
+        assert api.purge_all_jobs(user=user, session=s)["purged"] == 0
+    saved_retention = appsettings.get_job_retention_days
+    appsettings.get_job_retention_days = lambda: 1
+    try:
+        api.prune_old_jobs()
+    finally:
+        appsettings.get_job_retention_days = saved_retention
+    with session_scope() as s:
+        assert s.get(Job, job_id) is not None
+        assert s.get(Job, job_id).dismissed is False
+    _retire_waiting_jobs()
+
+
+def test_waiting_blocks_connection_deletion_and_deduplicates_sync():
+    """Connection guards and heavyweight sync admission must include durable waits."""
+    _retire_waiting_jobs()
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        admin = User(email=f"active-boundary-{suffix}@example.com", name="admin",
+                     role="admin", password_hash=hash_password("StrongPass12!"))
+        conn = Connection(name=f"active-boundary-{suffix}", host="pve",
+                          token_id="u@pve!token", node="pve")
+        image = Image(kind="base", name=f"active-image-{suffix}",
+                      source_url="https://example.com/base.img", build_status="ready")
+        s.add(admin); s.add(conn); s.add(image); s.flush()
+        waiting = Job(type="image_sync", status="waiting", image_id=image.id,
+                      connection_id=conn.id, created_by=admin.id, waiting_since=utcnow())
+        s.add(waiting); s.flush()
+        admin_id, conn_id, image_id, waiting_id = admin.id, conn.id, image.id, waiting.id
+    with session_scope() as s:
+        admin = s.get(User, admin_id)
+        synced = api.sync_image(image_id, api.SyncBody(connectionId=conn_id),
+                                user=admin, session=s)
+        assert synced == {"ok": True, "jobId": waiting_id, "deduped": True}
+        try:
+            api.delete_connection(conn_id, user=admin, session=s)
+        except HTTPException as exc:
+            assert getattr(exc, "status_code", None) == 409
+            assert "active job" in str(getattr(exc, "detail", ""))
+        else:
+            raise AssertionError("a waiting job must retain its connection")
+    _retire_waiting_jobs()
+
+
 if __name__ == "__main__":
     test_execution_plan_is_encrypted_and_immutable()
     test_execution_plan_rejects_malformed_ciphertext()
@@ -554,4 +869,13 @@ if __name__ == "__main__":
     test_required_snippet_upload_validate_then_create()
     test_validate_snippet_volume_requires_visible_snippet_on_enabled_storage()
     test_validate_snippet_volume_rejects_inactive_storage()
+    test_missing_guest_ip_defers_required_ansible_without_false_success()
+    test_waiting_job_resumes_only_captured_ansible_plan_when_ip_appears()
+    test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership()
+    test_waiting_cancellation_uses_deployment_reconciliation()
+    test_waiting_poll_yields_to_queued_work()
+    test_restart_recovery_leaves_durable_wait_untouched()
+    test_waiting_is_active_in_state_widget_and_serialization()
+    test_waiting_can_cancel_but_cannot_be_dismissed_purged_or_retained_as_terminal()
+    test_waiting_blocks_connection_deletion_and_deduplicates_sync()
     print("\\nALL WAVE 37 UNIT TESTS PASSED")

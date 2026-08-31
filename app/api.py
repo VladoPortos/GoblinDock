@@ -504,7 +504,7 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     if deps:
         for j in session.exec(
             select(Job).where(Job.deployment_id.in_([d.id for d in deps]),
-                              Job.status.in_(["queued", "running"])).order_by(Job.id.desc())
+                              Job.status.in_(["queued", "running", "waiting"])).order_by(Job.id.desc())
         ).all():
             active_by_dep.setdefault(j.deployment_id, j)
     vms = [S.vm_dict(session, d, user, px_cache, users, conns, active_by_dep) for d in deps]
@@ -595,7 +595,7 @@ def widget_summary(user: User = Depends(widget_key_user),
     def _count(*names: str) -> int:
         return sum(1 for st in statuses if st in names)
 
-    job_q = select(Job.id).where(Job.status.in_(("queued", "running")))
+    job_q = select(Job.id).where(Job.status.in_(("queued", "running", "waiting")))
     if not is_admin:
         job_q = job_q.where(Job.created_by == user.id)
     jobs_active = len(session.exec(job_q).all())
@@ -1363,11 +1363,11 @@ def sync_image(img_id: int, body: SyncBody, user: User = Depends(require_admin),
     conn = session.get(Connection, body.connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
-    # De-dupe: return any already queued/running sync for this image+connection instead
+    # De-dupe: return any already active sync for this image+connection instead
     # of piling identical heavyweight downloads onto the worker.
     existing = session.exec(select(Job).where(
         Job.type == "image_sync", Job.image_id == img.id,
-        Job.connection_id == conn.id, Job.status.in_(("queued", "running")))).first()
+        Job.connection_id == conn.id, Job.status.in_(("queued", "running", "waiting")))).first()
     if existing:
         return {"ok": True, "jobId": existing.id, "deduped": True}
     job = Job(type="image_sync", title=f"Syncing {img.name} → {conn.name}",
@@ -1982,7 +1982,7 @@ def cancel_job(job_id: int, user: User = Depends(current_user), session: Session
         raise HTTPException(404, "not found")
     if not _job_owned(job, user):
         raise HTTPException(403, "not your job")
-    if job.status in ("queued", "running"):
+    if job.status in ("queued", "running", "waiting"):
         job.cancel_requested = True
         session.add(job)
         session.commit()
@@ -2028,7 +2028,7 @@ def delete_job(job_id: int, user: User = Depends(current_user), session: Session
         raise HTTPException(404, "not found")
     if not _job_owned(job, user):
         raise HTTPException(403, "not your job")
-    if job.status in ("queued", "running"):
+    if job.status in ("queued", "running", "waiting"):
         raise HTTPException(409, "job is still running — cancel it first")
     job.dismissed = True
     job.dismissed_at = utcnow()
@@ -2065,7 +2065,7 @@ def purge_job_permanently(job_id: int, user: User = Depends(current_user),
         raise HTTPException(404, "not found")
     if not _job_owned(job, user):
         raise HTTPException(403, "not your job")
-    if job.status in ("queued", "running"):
+    if job.status in ("queued", "running", "waiting"):
         raise HTTPException(409, "job is still running — cancel it first")
     _purge_job(session, job)
     session.commit()
@@ -2075,7 +2075,7 @@ def purge_job_permanently(job_id: int, user: User = Depends(current_user),
 @router.post("/jobs/purge-all")
 def purge_all_jobs(user: User = Depends(current_user), session: Session = Depends(get_session)):
     """Hard-delete every FINISHED job the viewer can see (admin = all jobs, else own) plus
-    their steps/logs. Running/queued jobs are left untouched."""
+    their steps/logs. Active jobs are left untouched."""
     q = select(Job).where(Job.status.in_(["succeeded", "failed", "canceled"]))
     if user.role != "admin":
         q = q.where(Job.created_by == user.id)
@@ -2362,7 +2362,7 @@ def delete_connection(conn_id: int, user: User = Depends(require_admin),
         raise HTTPException(409, "connection is referenced by a template")
     if session.exec(select(Job).where(
             Job.connection_id == conn_id,
-            Job.status.in_(["queued", "running"]),
+            Job.status.in_(["queued", "running", "waiting"]),
     )).first():
         raise HTTPException(409, "connection is referenced by an active job")
     if session.exec(select(Image).where(Image.connection_id == conn_id, Image.kind == "golden")).first():

@@ -46,7 +46,6 @@ from .models import (
 from .proxmox import (
     JobCancelled,
     Proxmox,
-    ProxmoxError,
     base_disk_filename,
     delete_snippet_over_ssh,
     write_snippet_over_ssh,
@@ -63,6 +62,26 @@ from . import statebus
 
 _worker_thread: Optional[threading.Thread] = None
 _stop = threading.Event()
+WAITING_TIMEOUT = timedelta(minutes=30)
+
+
+class JobDeferred(Exception):
+    """Control-flow signal: the job is durably waiting and is not terminal."""
+
+
+def _defer_for_guest_ip(ctx: "JobCtx") -> None:
+    """Persist a resumable post-boot wait before unwinding the active execution."""
+    with session_scope() as s:
+        job = s.get(Job, ctx.job_id)
+        if not job:
+            raise RuntimeError("missing job while deferring for guest IP")
+        job.status = "waiting"
+        job.waiting_since = job.waiting_since or utcnow()
+        job.phase = "Waiting for guest IP"
+        job.finished_at = None
+        s.add(job)
+    ctx.log(f"[{_ts()}] waiting for guest IP before applying Ansible…", "l-dim")
+    raise JobDeferred()
 
 
 # --------------------------------------------------------------------------- #
@@ -676,8 +695,24 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ip = _wait_for_ip(ctx, px, new_vmid, node, timeout=260) or ip_static
     ctx.finish_step(st, t)
 
-    # Post-boot: apply the ansible-phase blocks of the runtime recipe (if any).
-    if recipe and ip and has_ansible_blocks(recipe, blocks):
+    # Persist the accepted VM's identity and resource facts before post-boot Ansible.
+    # If the guest agent is slow, the durable waiting job must still retain everything
+    # needed to identify and reconcile the VM after a process restart.
+    with session_scope() as s:
+        d = s.get(Deployment, dep.id)
+        d.ip = ip or ""
+        d.mac = px.mac_of(new_vmid, node) or d.mac
+        d.cpu = cores
+        d.ram = ram_mb // 1024
+        d.disk = _effective_disk_gb(resize_ok, disk_gb, _scsi0_size_gb(px, new_vmid, node))
+        s.add(d)
+
+    # Post-boot: apply the ansible-phase blocks of the immutable runtime recipe.
+    requires_ansible = bool(recipe and has_ansible_blocks(recipe, blocks))
+    if requires_ansible and not ip:
+        ctx.add_step("Apply recipe (ansible, post-boot)")
+        _defer_for_guest_ip(ctx)
+    if requires_ansible:
         st = ctx.add_step("Apply recipe (ansible, post-boot)")
         t = ctx.start_step(st)
         try:
@@ -692,11 +727,6 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
 
     with session_scope() as s:
         d = s.get(Deployment, dep.id)
-        d.ip = ip or ""
-        d.mac = px.mac_of(new_vmid, node) or d.mac
-        d.cpu = cores
-        d.ram = ram_mb // 1024
-        d.disk = _effective_disk_gb(resize_ok, disk_gb, _scsi0_size_gb(px, new_vmid, node))
         d.status = "running"
         d.error = ""
         d.cleanup_origin = None
@@ -893,6 +923,10 @@ def _execute(job_id: int) -> None:
             job.pct = 100
             job.finished_at = utcnow()
             s.add(job)
+        statebus.bump()
+    except JobDeferred:
+        # The job and VM facts were committed before this control-flow signal. It is
+        # active, not successful or failed, and the idle loop will resume it later.
         statebus.bump()
     except Exception as e:  # noqa: BLE001
         # Cancellation is identified by TYPE, never by error text — a genuine failure
@@ -1226,6 +1260,170 @@ def _reconcile_ips() -> None:
                     s.add(d)
 
 
+def _waiting_ansible_step(job_id: int) -> int:
+    """Return the pending Ansible step, repairing old/test waits without one."""
+    name = "Apply recipe (ansible, post-boot)"
+    with session_scope() as s:
+        steps = s.exec(
+            select(JobStep).where(JobStep.job_id == job_id).order_by(JobStep.seq)
+        ).all()
+        for step in reversed(steps):
+            if step.name == name and step.state in ("pending", "running"):
+                return step.seq
+        seq = max((step.seq for step in steps), default=0) + 1
+        s.add(JobStep(job_id=job_id, seq=seq, name=name, state="pending"))
+        return seq
+
+
+def _resume_waiting_ansible(job_id: int, ip: str) -> None:
+    """Run only the captured Ansible plan and complete one durable waiting job."""
+    with session_scope() as s:
+        stored_job = s.get(Job, job_id)
+        if not stored_job or stored_job.status != "waiting":
+            return
+        if not stored_job.execution_plan_enc:
+            raise RuntimeError("waiting job has no captured execution plan")
+        job = Job(**stored_job.model_dump())
+        dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
+        if not dep:
+            raise RuntimeError("waiting job deployment is missing")
+        dep_id, dep_name, dep_owner_id = dep.id, dep.name, dep.owner_id
+        dep.ip = ip
+        s.add(dep)
+
+    try:
+        plan = open_execution_plan(job.execution_plan_enc)
+    except ValueError as exc:
+        raise RuntimeError("invalid execution plan") from exc
+    if plan["owner_id"] != dep_owner_id:
+        raise RuntimeError("execution plan owner mismatch")
+    recipe, blocks = materialize_execution_plan(plan)
+    if not has_ansible_blocks(recipe, blocks):
+        raise RuntimeError("waiting job captured no Ansible plan")
+
+    owner_id, allow_global = _owner_secret_context(plan["owner_id"])
+    managed_private_key, _managed_public_key = _managed_keypair()
+    ctx = JobCtx(job_id)
+    step = _waiting_ansible_step(job_id)
+    ctx.progress(90, "Apply recipe (ansible, post-boot)")
+    started = ctx.start_step(step)
+    try:
+        _run_ansible_phase(
+            ctx, recipe, blocks, owner_id, ip, managed_private_key, dep_name,
+            allow_global=allow_global,
+        )
+        ctx.finish_step(step, started)
+    except Exception:
+        ctx.finish_step(step, started, state="failed")
+        raise
+
+    with session_scope() as s:
+        job_row = s.get(Job, job_id)
+        dep_row = s.get(Deployment, dep_id)
+        if not job_row or job_row.status != "waiting" or not dep_row:
+            return
+        dep_row.ip = ip
+        dep_row.status = "running"
+        dep_row.error = ""
+        dep_row.cleanup_origin = None
+        dep_row.cleanup_last_attempt_at = None
+        job_row.status = "succeeded"
+        job_row.pct = 100
+        job_row.phase = "Complete"
+        job_row.finished_at = utcnow()
+        s.add(dep_row)
+        s.add(job_row)
+    ctx.log(f"[{_ts()}] ✓ {dep_name} ready at {ip}", "l-ok")
+    statebus.bump()
+
+
+def _finish_waiting_error(job_id: int, exc: Exception) -> None:
+    """Finish a resumed wait through the same failure/cancel reconciliation invariant."""
+    cancelled = isinstance(exc, JobCancelled)
+    ctx = JobCtx(job_id)
+    ctx.log(f"[{_ts()}] ✗ {'canceled' if cancelled else exc}", "l-err")
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if not job or job.status != "waiting":
+            return
+        job.status = "canceled" if cancelled else "failed"
+        job.error = "canceled" if cancelled else str(exc)
+        job.finished_at = utcnow()
+        s.add(job)
+        has_dep = job.deployment_id is not None
+    if has_dep:
+        if cancelled:
+            _reconcile_canceled_job(job_id)
+        else:
+            _reconcile_failed_job(job_id)
+    statebus.bump()
+
+
+def _timeout_waiting_job(job_id: int) -> None:
+    """Fail an expired IP wait without releasing its VM or reserved IP ownership."""
+    error = "guest IP was not reported within 30 minutes"
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if not job or job.status != "waiting":
+            return
+        job.status = "failed"
+        job.error = error
+        job.finished_at = utcnow()
+        s.add(job)
+        dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
+        if dep:
+            dep.status = "error"
+            dep.error = error
+            dep.cleanup_origin = None
+            dep.cleanup_last_attempt_at = None
+            s.add(dep)
+    JobCtx(job_id).log(f"[{_ts()}] ✗ {error}", "l-err")
+    statebus.bump()
+
+
+def _poll_waiting_jobs(now: Optional[datetime] = None) -> bool:
+    """Poll at most the oldest wait, but only when no queued work is available."""
+    poll_at = ensure_utc(now) or utcnow()
+    with session_scope() as s:
+        if s.exec(select(Job.id).where(Job.status == "queued").limit(1)).first() is not None:
+            return False
+        stored = s.exec(
+            select(Job).where(Job.status == "waiting")
+            .order_by(Job.waiting_since, Job.id)
+        ).first()
+        if not stored:
+            return False
+        job = Job(**stored.model_dump())
+        dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
+        conn = s.get(Connection, job.connection_id) if job.connection_id else None
+        dep = Deployment(**dep.model_dump()) if dep else None
+        conn = Connection(**conn.model_dump()) if conn else None
+
+    if job.cancel_requested:
+        _finish_waiting_error(job.id, JobCancelled())
+        return True
+
+    waiting_since = ensure_utc(job.waiting_since) or ensure_utc(job.started_at) or ensure_utc(job.created_at)
+    if waiting_since is not None and poll_at >= waiting_since + WAITING_TIMEOUT:
+        _timeout_waiting_job(job.id)
+        return True
+
+    if not dep or not conn or dep.vmid is None:
+        _finish_waiting_error(job.id, RuntimeError("waiting job target is missing"))
+        return True
+    try:
+        ip = Proxmox(conn).agent_ipv4(dep.vmid, dep.node or conn.node)
+    except Exception:  # noqa: BLE001
+        ip = None
+    if not ip:
+        return True
+    try:
+        _resume_waiting_ansible(job.id, ip)
+    except Exception as exc:  # noqa: BLE001
+        _finish_waiting_error(job.id, exc)
+    return True
+
+
 def _recover_orphans() -> None:
     """Crash recovery: a job left 'running' by a previous process is dead. Fail it AND
     reconcile the resource it was mutating — otherwise the deployment stays "working"
@@ -1256,6 +1454,7 @@ def _loop() -> None:
         try:
             job_id = _claim_next_job()
             if job_id is None:
+                _poll_waiting_jobs()
                 idle += 1
                 if idle % 15 == 0:  # ~ every 15s while idle
                     _reconcile_ips()

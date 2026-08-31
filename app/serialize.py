@@ -39,8 +39,10 @@ _status_cache: dict[tuple, tuple[float, dict]] = {}
 _STATUS_TTL = 3.0
 
 # DB job status → the 3-state status vocabulary the UI renders (chips, meters).
-_UI_STATUS = {"running": "working", "queued": "working", "succeeded": "done",
-              "failed": "error", "canceled": "error"}
+_UI_STATUS = {
+    "running": "working", "queued": "working", "waiting": "working",
+    "succeeded": "done", "failed": "error", "canceled": "error",
+}
 
 
 def _fmt_uptime(seconds: int) -> str:
@@ -137,7 +139,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     else:
         active = session.exec(
             select(Job).where(Job.deployment_id == dep.id,
-                              Job.status.in_(["queued", "running"])).order_by(Job.id.desc())
+                              Job.status.in_(["queued", "running", "waiting"])).order_by(Job.id.desc())
         ).first()
     if active:
         steps = session.exec(select(JobStep).where(JobStep.job_id == active.id)).all()
