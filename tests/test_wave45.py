@@ -116,6 +116,8 @@ def test_matching_checksum_cache_is_reused_but_checksum_change_redownloads():
 
     class _Px:
         def __init__(self, present: set[str]) -> None:
+            self.conn = Connection(id=452, name="wave45-matching", host="pve", token_id="u@p!t")
+            self.iso_storage = "local"
             self.present = present
             self.downloads: list[tuple] = []
 
@@ -127,9 +129,22 @@ def test_matching_checksum_cache_is_reused_but_checksum_change_redownloads():
             return "UPID:download"
 
         def wait_task(self, *_args, **_kwargs):
+            if self.downloads:
+                self.present.add(self.downloads[-1][0])
             return None
 
-    cached = _Px({new_name})
+        def delete_storage_volume(self, filename, node=None):
+            self.present.discard(filename)
+            return None
+
+    cached = _Px(set())
+    assert worker._ensure_base_disk(
+        _Ctx(), cached, "pve", {
+            "src_url": source, "checksum": new_checksum, "checksum_algorithm": "sha256",
+        },
+    ) == new_name
+    assert len(cached.downloads) == 1
+    cached.downloads.clear()
     assert worker._ensure_base_disk(
         _Ctx(), cached, "pve", {
             "src_url": source, "checksum": new_checksum, "checksum_algorithm": "sha256",
@@ -205,6 +220,60 @@ def test_download_cancellation_remains_a_cancellation_when_file_appears():
         raise AssertionError("download cancellation was swallowed")
 
 
+def test_retry_never_reuses_leftover_from_failed_checksum_download():
+    """A failed target must stay distrusted across retries until validation succeeds."""
+    source = "https://images.example.test/cloud/retry-base.img"
+    checksum = "5" * 64
+
+    class _Px:
+        def __init__(self) -> None:
+            self.conn = Connection(id=45, name="wave45-retry", host="pve", token_id="u@p!t")
+            self.iso_storage = "local"
+            self.present: set[str] = set()
+            self.downloads: list[str] = []
+            self.waits = 0
+            self.deletes = 0
+
+        def storage_has_volume(self, filename, node=None):
+            return filename in self.present
+
+        def download_url(self, filename, *_args, **_kwargs):
+            self.downloads.append(filename)
+            return "UPID:download"
+
+        def wait_task(self, *_args, **_kwargs):
+            self.waits += 1
+            self.present.add(self.downloads[-1])
+            if self.waits == 1:
+                raise ProxmoxError("checksum mismatch")
+
+        def delete_storage_volume(self, filename, node=None):
+            self.deletes += 1
+            if self.deletes == 1:
+                raise ProxmoxError("temporary cleanup failure")
+            self.present.discard(filename)
+            return None
+
+    px = _Px()
+    cfg = {"src_url": source, "checksum": checksum, "checksum_algorithm": "sha256"}
+    try:
+        worker._ensure_base_disk(_Ctx(), px, "pve", cfg)
+    except RuntimeError as exc:
+        assert "checksum mismatch" in str(exc)
+    else:
+        raise AssertionError("failed checksum download was accepted")
+    assert px.present, "fixture must retain the failed target after cleanup fails"
+
+    filename = worker._ensure_base_disk(_Ctx(), px, "pve", cfg)
+    assert px.downloads == [filename, filename], "retry reused the failed leftover"
+    assert px.deletes >= 2
+
+    # A subsequent call may reuse only the target whose successful validation was
+    # durably recorded by the second attempt.
+    assert worker._ensure_base_disk(_Ctx(), px, "pve", cfg) == filename
+    assert px.downloads == [filename, filename]
+
+
 def test_cached_images_uses_the_checksum_specific_volume_identity():
     """The cache-status endpoint must agree with the worker about the selected bytes."""
     suffix = os.urandom(3).hex()
@@ -246,6 +315,7 @@ class _HandshakeSSHClient:
 
     def __init__(self) -> None:
         self._host_keys = paramiko.HostKeys()
+        self._system_host_keys = paramiko.HostKeys()
         self._host_keys_filename = None
         self._policy = None
 
@@ -289,6 +359,7 @@ def test_non_strict_ssh_persists_first_key_accepts_it_again_and_rejects_change()
         known_hosts = Path(tmp) / "ssh_known_hosts"
         first_key = paramiko.RSAKey.generate(1024)
         changed_key = paramiko.RSAKey.generate(1024)
+        changed_algorithm_key = paramiko.ECDSAKey.generate()
         conn = Connection(name="wave45-tofu", host="pve.example.test", token_id="u@p!t")
         try:
             paramiko.SSHClient = _HandshakeSSHClient
@@ -314,6 +385,14 @@ def test_non_strict_ssh_persists_first_key_accepts_it_again_and_rejects_change()
                 pass
             else:
                 raise AssertionError("changed SSH host key was trusted")
+
+            _HandshakeSSHClient.presented_key = changed_algorithm_key
+            try:
+                _ssh_client(conn, key=None, timeout=1)
+            except paramiko.BadHostKeyException:
+                pass
+            else:
+                raise AssertionError("changed SSH host-key algorithm was trusted")
         finally:
             paramiko.SSHClient = old_client
             settings.data_dir = old_dir
@@ -488,6 +567,7 @@ _TESTS = [
     test_matching_checksum_cache_is_reused_but_checksum_change_redownloads,
     test_download_failure_fails_closed_even_when_target_file_appears,
     test_download_cancellation_remains_a_cancellation_when_file_appears,
+    test_retry_never_reuses_leftover_from_failed_checksum_download,
     test_cached_images_uses_the_checksum_specific_volume_identity,
     test_non_strict_ssh_persists_first_key_accepts_it_again_and_rejects_change,
     test_snippet_upload_marks_resolved_cloud_config_owner_only,

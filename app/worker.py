@@ -7,6 +7,7 @@ This is the "worker" of the design's web+worker split, collapsed into one proces
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
@@ -57,7 +58,7 @@ from .recipes import (
     has_ansible_blocks,
 )
 from .security import crypt_sha512, decrypt, encrypt, gen_vm_password
-from .appsettings import auto_root_password_enabled
+from .appsettings import auto_root_password_enabled, get_setting, set_setting
 from . import statebus
 
 _worker_thread: Optional[threading.Thread] = None
@@ -411,19 +412,64 @@ def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str],
 # --------------------------------------------------------------------------- #
 # Job implementations                                                          #
 # --------------------------------------------------------------------------- #
+def _base_disk_validation_marker(
+    px: Proxmox, node: str, filename: str, checksum: str, checksum_algorithm: str,
+) -> tuple[str, str]:
+    """Stable DB marker for one connection/node/storage cache target."""
+    conn = getattr(px, "conn", None)
+    identity = "\0".join((
+        str(getattr(conn, "id", "") or ""),
+        str(getattr(conn, "host", "") or ""),
+        str(getattr(conn, "port", "") or ""),
+        str(node or ""),
+        str(getattr(px, "iso_storage", "") or getattr(conn, "iso_storage", "") or "local"),
+        filename,
+    ))
+    key = "image_cache_validation:" + hashlib.sha256(identity.encode()).hexdigest()
+    digest = (checksum or "").strip().lower()
+    algorithm = (checksum_algorithm or "").strip().lower()
+    value = f"verified:{algorithm}:{digest}" if digest else "downloaded"
+    return key, value
+
+
+def _discard_base_disk(px: Proxmox, node: str, filename: str, *, required: bool) -> None:
+    """Remove a target that may be partial; optionally fail unless absence is known."""
+    try:
+        upid = px.delete_storage_volume(filename, node=node)
+        if isinstance(upid, str) and upid:
+            px.wait_task(upid, node=node, timeout=120)
+        if px.storage_has_volume(filename, node=node):
+            raise RuntimeError(f"untrusted cache target {filename} is still present")
+    except Exception as exc:  # noqa: BLE001
+        if required:
+            raise RuntimeError(f"could not remove untrusted cache target {filename}: {exc}") from exc
+
+
 def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
     """Make sure the base cloud image is cached on the node's image storage.
-    Returns the cached filename. Tolerates a concurrent download of the same
-    file (deploy + sync racing is fine); raises on real download/checksum failures."""
+    Returns the cached filename. Checksum-bearing entries are reusable only after
+    this installation durably recorded successful Proxmox validation."""
     src_url = cfg.get("src_url")
     if not src_url:
         raise RuntimeError("no base image source URL")
     checksum = cfg.get("checksum", "")
     checksum_algorithm = cfg.get("checksum_algorithm", "")
     filename = base_disk_filename(src_url, checksum, checksum_algorithm)
+    marker_key, verified_value = _base_disk_validation_marker(
+        px, node, filename, checksum, checksum_algorithm,
+    )
+    marker = get_setting(marker_key)
     if px.storage_has_volume(filename, node=node):
-        ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
-        return filename
+        trusted = marker == verified_value
+        if (checksum and not trusted) or marker == "untrusted":
+            ctx.log(f"[{_ts()}] removing untrusted cache target {filename}", "l-warn")
+            _discard_base_disk(px, node, filename, required=True)
+        else:
+            ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
+            return filename
+    # Commit distrust before submitting work: cancellation, process death, task
+    # failure, or checksum mismatch can then never make a leftover reusable.
+    set_setting(marker_key, "untrusted")
     try:
         ctx.log(f"[{_ts()}] downloading {filename} — large images can take several minutes", "l-acc")
         upid = px.download_url(filename, src_url, node=node,
@@ -452,12 +498,15 @@ def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
                     ctx.phase_note(f"downloading {m.group(1)}%")
 
         px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=3600, on_poll=_progress)
+        set_setting(marker_key, verified_value)
         ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
     except JobCancelled:
+        _discard_base_disk(px, node, filename, required=False)
         raise
     except Exception as e:  # noqa: BLE001
         # A target appearing after a failed task may be partial or checksum-invalid.
         # Only a successful Proxmox task is evidence that the cache entry is usable.
+        _discard_base_disk(px, node, filename, required=False)
         raise RuntimeError(f"image download/verification failed: {e}") from e
     return filename
 

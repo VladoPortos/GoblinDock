@@ -13,6 +13,7 @@ import ipaddress
 import logging
 import os
 import re
+import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
@@ -34,6 +35,7 @@ _warned_insecure_tls: set = set()
 # Docker's default bridge subnet — a guest running containers can report docker0's
 # 172.17.x gateway, which must never be mistaken for the VM's real management IP.
 _DOCKER_BRIDGE_NET = ipaddress.ip_network("172.17.0.0/16")
+_ssh_tofu_lock = threading.Lock()
 
 
 def _proxmox_port(value) -> int:
@@ -340,6 +342,14 @@ class Proxmox:
         except Exception:  # noqa: BLE001
             return False
 
+    def delete_storage_volume(self, filename: str, node: Optional[str] = None):
+        """Delete one safe import-cache volume, returning a task id when PVE does."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", filename or ""):
+            raise ProxmoxError(f"invalid storage filename: {filename!r}")
+        node = node or self.pick_node()
+        volid = self.iso_volume_path(filename)
+        return self.api.nodes(node).storage(self.iso_storage).content(volid).delete()
+
     def validate_snippet_volume(self, volid: str, node: Optional[str] = None) -> None:
         """Require a normalized, configured, and API-visible cloud-init snippet.
 
@@ -502,6 +512,41 @@ def _load_ssh_key(path: str):
     return None
 
 
+def _tofu_host_key_policy(paramiko, tofu_path: Path):
+    """Persist the first key for a hostname, then reject every unknown key type.
+
+    Paramiko's AutoAddPolicy works per hostname *and algorithm*, which would accept
+    an ECDSA attacker key after an RSA key was pinned.  TOFU is hostname-wide here:
+    once any algorithm is known, only an exact previously pinned key is acceptable.
+    """
+    class _HostnameTofuPolicy(paramiko.MissingHostKeyPolicy):
+        def missing_host_key(self, client, hostname, key):
+            with _ssh_tofu_lock:
+                persisted = paramiko.HostKeys()
+                persisted.load(str(tofu_path))
+                pinned = []
+                for host_keys in (
+                    getattr(client, "_system_host_keys", None),
+                    getattr(client, "_host_keys", None),
+                    persisted,
+                ):
+                    known = host_keys.lookup(hostname) if host_keys is not None else None
+                    if known:
+                        pinned.extend(known.values())
+                if any(existing == key for existing in pinned):
+                    # A concurrent first connection may have persisted this exact key
+                    # after this client loaded its snapshot but before its handshake.
+                    client._host_keys.add(hostname, key.get_name(), key)
+                    return
+                if pinned:
+                    raise paramiko.BadHostKeyException(hostname, key, pinned[0])
+                client._host_keys.add(hostname, key.get_name(), key)
+                client.save_host_keys(str(tofu_path))
+                os.chmod(tofu_path, 0o600)
+
+    return _HostnameTofuPolicy()
+
+
 def _ssh_client(conn: Connection, key, timeout: int):
     """Connected paramiko SSHClient for the node — shared by snippet write/delete.
     Honours any known_hosts we have so a pinned node can't be MITM'd. Strict
@@ -533,7 +578,9 @@ def _ssh_client(conn: Connection, key, timeout: int):
         os.chmod(tofu_path, 0o600)
         client.load_host_keys(str(tofu_path))
     client.set_missing_host_key_policy(
-        paramiko.RejectPolicy() if settings.ssh_strict else paramiko.AutoAddPolicy()
+        paramiko.RejectPolicy()
+        if settings.ssh_strict
+        else _tofu_host_key_policy(paramiko, tofu_path)
     )
     client.connect(conn.ssh_host or conn.host, username=conn.ssh_user or "root", pkey=key, timeout=timeout)
     return client
