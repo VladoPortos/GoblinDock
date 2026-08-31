@@ -338,8 +338,8 @@ class Proxmox:
         stores = self.api.nodes(node).storage.get() or []
         active = next((item for item in stores if (item or {}).get("storage") == storage), None)
         contents = [part.strip() for part in str((active or {}).get("content", "")).split(",")]
-        if not active or "snippets" not in contents:
-            raise ProxmoxError(f"storage {storage!r} is not enabled for snippets on {node}")
+        if not active or not active.get("active") or "snippets" not in contents:
+            raise ProxmoxError(f"storage {storage!r} is not active for snippets on {node}")
         volumes = self.api.nodes(node).storage(storage).content.get(content="snippets") or []
         if volid not in {(item or {}).get("volid") for item in volumes}:
             raise ProxmoxError(f"snippet volume {volid!r} is not visible on {node}")

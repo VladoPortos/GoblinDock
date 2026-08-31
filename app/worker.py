@@ -487,12 +487,14 @@ class DeployPreflight:
 
 def _preflight_deploy_cloud_init(
     ctx: JobCtx, px: Proxmox, conn: Connection, dep: Deployment, node: str, vmid: int,
-    cfg: dict, recipe_cmds: list[str], user_pubkey: str,
+    cfg: dict, recipe_cmds: list[str], user_pubkey: str, recipe_requires_snippet: bool,
 ) -> DeployPreflight:
     """Prepare native cloud-init or prove required snippet delivery before create."""
     managed_private_key, managed_pubkey = _managed_keypair()
     pubkeys = [key for key in (user_pubkey, managed_pubkey) if key]
-    effective_recipe = any(cmd.strip() and cmd.strip() != "set -e" for cmd in recipe_cmds)
+    effective_recipe = recipe_requires_snippet or any(
+        cmd.strip() and cmd.strip() != "set -e" for cmd in recipe_cmds
+    )
     # Keep the established no-key/native path credential-free: native cloud-init
     # would expose a plaintext cipassword. When a snippet channel is selected, a
     # generated root credential is safe because only its hash is delivered.
@@ -601,11 +603,13 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         recipe, blocks,
         _secret_lookup_factory(secret_owner_id, allow_global=allow_global_secrets),
     ) if recipe else []
+    recipe_requires_snippet = bool(recipe and has_ansible_blocks(recipe, blocks))
     preflight: Optional[DeployPreflight] = None
     create_submitted = False
     try:
         preflight = _preflight_deploy_cloud_init(
             ctx, px, conn, dep, node, new_vmid, cfg, recipe_cmds, user_pubkey,
+            recipe_requires_snippet,
         )
 
         ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")

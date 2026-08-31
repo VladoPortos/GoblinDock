@@ -212,6 +212,14 @@ def _cloudinit_recipe() -> tuple[list[dict], dict[str, Block]]:
     return [{"blocks": [{"ref": "w37-cloudinit", "inputs": {}}]}], {block.key: block}
 
 
+def _ansible_recipe() -> tuple[list[dict], dict[str, Block]]:
+    block = Block(
+        key="w37-ansible", name="post boot", phase="ansible",
+        input_schema_json="[]", ansible_template="- debug: msg=ready",
+    )
+    return [{"blocks": [{"ref": "w37-ansible", "inputs": {}}]}], {block.key: block}
+
+
 @contextmanager
 def _fake_proxmox(calls: list[str], *, native_params: list[dict] | None = None):
     class FakeProxmox:
@@ -271,8 +279,8 @@ def _run_worker_job(job_id: int):
 
 
 def test_recipe_without_ssh_key_fails_before_vm_creation():
-    """Dropping required recipe delivery must not submit a VM that cannot run it."""
-    recipe, blocks = _cloudinit_recipe()
+    """An Ansible-only admitted recipe still needs the managed-key snippet channel."""
+    recipe, blocks = _ansible_recipe()
     job_id, original_plan_loader = _mk_worker_job(recipe=recipe, blocks=blocks, ssh_key_path="")
     calls = []
     try:
@@ -350,7 +358,7 @@ def test_validate_snippet_volume_requires_visible_snippet_on_enabled_storage():
 
         def get(self):
             calls.append(("stores", {}))
-            return [{"storage": "local", "content": "images, snippets"}]
+            return [{"storage": "local", "content": "images, snippets", "active": 1}]
 
         def __call__(self, _store):
             return self
@@ -369,6 +377,39 @@ def test_validate_snippet_volume_requires_visible_snippet_on_enabled_storage():
     assert calls == [("stores", {}), ("content", {"content": "snippets"})], calls
 
 
+def test_validate_snippet_volume_rejects_inactive_storage():
+    """A disabled store must not be treated as a delivery target even if it lists snippets."""
+    class Content:
+        def get(self, **_kwargs):
+            return [{"volid": "local:snippets/gd-deploy-8501.yml"}]
+
+    class Storage:
+        content = Content()
+
+        def get(self):
+            return [{"storage": "local", "content": "snippets", "active": 0}]
+
+        def __call__(self, _store):
+            return self
+
+    class Node:
+        storage = Storage()
+
+    class Nodes:
+        def __call__(self, _node):
+            return Node()
+
+    px = object.__new__(Proxmox)
+    px.snippet_storage = "local"
+    px.api = type("Api", (), {"nodes": Nodes()})()
+    try:
+        px.validate_snippet_volume("local:snippets/gd-deploy-8501.yml", node="pve")
+    except ProxmoxError as exc:
+        assert "active" in str(exc)
+    else:
+        raise AssertionError("inactive snippet storage must be rejected")
+
+
 if __name__ == "__main__":
     test_execution_plan_is_encrypted_and_immutable()
     test_execution_plan_rejects_malformed_ciphertext()
@@ -378,4 +419,5 @@ if __name__ == "__main__":
     test_recipe_free_deployment_uses_native_ciuser_without_snippet()
     test_required_snippet_upload_validate_then_create()
     test_validate_snippet_volume_requires_visible_snippet_on_enabled_storage()
+    test_validate_snippet_volume_rejects_inactive_storage()
     print("\\nALL WAVE 37 UNIT TESTS PASSED")
