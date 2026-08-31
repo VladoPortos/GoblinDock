@@ -893,6 +893,205 @@ def test_waiting_blocks_connection_deletion_and_deduplicates_sync():
     _retire_waiting_jobs()
 
 
+# --------------------------------------------------------------------------- #
+# Lifecycle task completion                                                    #
+# --------------------------------------------------------------------------- #
+def _mk_lifecycle_task_fixture(*, job_type: str | None = None) -> tuple[int, int, int | None]:
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        user = User(
+            email=f"wave37-lifecycle-{suffix}@example.com", name="wave37-lifecycle",
+            password_hash=hash_password("StrongPass12!"),
+        )
+        conn = Connection(
+            name=f"w37-lifecycle-conn-{suffix}", host="pve",
+            token_id="u@pve!token", node="pve",
+        )
+        s.add(user)
+        s.add(conn)
+        s.flush()
+        dep = Deployment(
+            name=f"w37-lifecycle-vm-{suffix}", owner_id=user.id,
+            connection_id=conn.id, node="pve", vmid=8737, status="running",
+        )
+        s.add(dep)
+        s.flush()
+        job_id = None
+        if job_type:
+            job = Job(
+                type=job_type, status="running", deployment_id=dep.id,
+                connection_id=conn.id, created_by=user.id, context_json="{}",
+            )
+            s.add(job)
+            s.flush()
+            job_id = job.id
+        return user.id, dep.id, job_id
+
+
+def test_direct_lifecycle_actions_wait_for_their_submitted_upids():
+    """Start, stop, and restart must report success only after their task completes."""
+    calls = []
+
+    class _Px:
+        def __init__(self, _conn): pass
+        def start(self, vmid, node=None):
+            calls.append(("submit", "start", vmid, node))
+            return "UPID:start"
+        def stop(self, vmid, node=None):
+            calls.append(("submit", "stop", vmid, node))
+            return "UPID:stop"
+        def reboot(self, vmid, node=None):
+            calls.append(("submit", "restart", vmid, node))
+            return "UPID:restart"
+        def wait_task(self, upid, node=None, timeout=None):
+            calls.append(("wait", upid, node, timeout))
+
+    saved = api.Proxmox
+    api.Proxmox = _Px
+    try:
+        for action in ("start", "stop", "restart"):
+            uid, dep_id, _job_id = _mk_lifecycle_task_fixture()
+            calls.clear()
+            with Session(engine) as s:
+                assert api.vm_action(
+                    dep_id, api.ActionBody(action=action),
+                    user=s.get(User, uid), session=s,
+                ) == {"ok": True}
+            assert calls == [
+                ("submit", action, 8737, "pve"),
+                ("wait", f"UPID:{action}", "pve", 120),
+            ], (action, calls)
+    finally:
+        api.Proxmox = saved
+
+
+def test_direct_lifecycle_task_failure_and_timeout_return_502():
+    """A failed or timed-out Proxmox task must never be acknowledged as a VM action success."""
+    calls = []
+    failure = None
+
+    class _Px:
+        def __init__(self, _conn): pass
+        def start(self, *_args, **_kwargs): return "UPID:start"
+        def stop(self, *_args, **_kwargs): return "UPID:stop"
+        def reboot(self, *_args, **_kwargs): return "UPID:restart"
+        def wait_task(self, upid, node=None, timeout=None):
+            calls.append((upid, node, timeout))
+            raise failure
+
+    saved = api.Proxmox
+    api.Proxmox = _Px
+    try:
+        for action in ("start", "stop", "restart"):
+            for message in ("task finished with ERROR", "task timed out"):
+                uid, dep_id, _job_id = _mk_lifecycle_task_fixture()
+                calls.clear()
+                failure = ProxmoxError(message)
+                with Session(engine) as s:
+                    try:
+                        api.vm_action(
+                            dep_id, api.ActionBody(action=action),
+                            user=s.get(User, uid), session=s,
+                        )
+                    except HTTPException as exc:
+                        assert exc.status_code == 502, (action, message, exc.status_code)
+                        assert message in str(exc.detail), (action, message, exc.detail)
+                    else:
+                        raise AssertionError((action, message, "task failure was acknowledged"))
+                assert calls == [(f"UPID:{action}", "pve", 120)], (action, message, calls)
+    finally:
+        api.Proxmox = saved
+
+
+def _run_worker_lifecycle_case(job_type: str, vm_status: str, *, stop_error: bool = False):
+    _uid, _dep_id, job_id = _mk_lifecycle_task_fixture(job_type=job_type)
+    calls = []
+    sleeps = []
+
+    class _Px:
+        def __init__(self, _conn): pass
+        def vm_current(self, vmid, node=None):
+            calls.append(("inspect", vmid, node))
+            return {"status": vm_status}
+        def stop(self, vmid, node=None):
+            calls.append(("stop", vmid, node))
+            return "UPID:stop"
+        def destroy(self, vmid, node=None):
+            calls.append(("destroy", vmid, node))
+            return "UPID:destroy"
+        def wait_task(self, upid, node=None, cancelled=None, timeout=None):
+            calls.append(("wait", upid, node, timeout, callable(cancelled)))
+            if stop_error and upid == "UPID:stop":
+                raise ProxmoxError("stop task failed")
+        def list_qemu(self, node=None):
+            calls.append(("inventory", node))
+            return []
+
+    def forbidden_sleep(seconds):
+        sleeps.append(seconds)
+        raise AssertionError(f"fixed lifecycle sleep used: {seconds}")
+
+    deploy_calls = []
+    with session_scope() as s:
+        job = Job(**s.get(Job, job_id).model_dump())
+    error = None
+    with _patched_worker(
+        Proxmox=_Px,
+        _run_deploy=lambda *_args, **_kwargs: deploy_calls.append("deploy"),
+    ):
+        saved_sleep = worker.time.sleep
+        worker.time.sleep = forbidden_sleep
+        try:
+            if job_type == "rebuild":
+                worker._run_rebuild(worker.JobCtx(job_id), job)
+            else:
+                worker._run_destroy(worker.JobCtx(job_id), job)
+        except Exception as exc:  # returned for exact behavior assertions below
+            error = exc
+        finally:
+            worker.time.sleep = saved_sleep
+    return calls, sleeps, deploy_calls, error
+
+
+def test_worker_rebuild_and_destroy_await_stop_without_fixed_sleep():
+    """A running VM's stop task must finish before either destructive worker path advances."""
+    for job_type in ("rebuild", "destroy"):
+        calls, sleeps, deploy_calls, error = _run_worker_lifecycle_case(job_type, "running")
+        assert error is None, (job_type, error)
+        assert sleeps == [], (job_type, sleeps)
+        stop_index = calls.index(("stop", 8737, "pve"))
+        stop_wait_index = calls.index(("wait", "UPID:stop", "pve", 300, True))
+        destroy_index = calls.index(("destroy", 8737, "pve"))
+        assert stop_index < stop_wait_index < destroy_index, (job_type, calls)
+        assert ("wait", "UPID:destroy", "pve", 300, True) in calls, (job_type, calls)
+        assert deploy_calls == (["deploy"] if job_type == "rebuild" else []), deploy_calls
+
+
+def test_worker_rebuild_and_destroy_skip_stop_when_vm_is_stopped():
+    """A stopped VM must proceed directly to destroy without submitting a redundant stop task."""
+    for job_type in ("rebuild", "destroy"):
+        calls, sleeps, _deploy_calls, error = _run_worker_lifecycle_case(job_type, "stopped")
+        assert error is None, (job_type, error)
+        assert sleeps == [], (job_type, sleeps)
+        assert ("inspect", 8737, "pve") in calls, (job_type, calls)
+        assert not any(call[0] == "stop" for call in calls), (job_type, calls)
+        assert not any(call[:2] == ("wait", "UPID:stop") for call in calls), (job_type, calls)
+
+
+def test_worker_stop_task_failure_aborts_before_destroy():
+    """A non-OK stop task must fail the job path instead of racing ahead to destroy."""
+    for job_type in ("rebuild", "destroy"):
+        calls, sleeps, deploy_calls, error = _run_worker_lifecycle_case(
+            job_type, "running", stop_error=True,
+        )
+        assert isinstance(error, ProxmoxError), (job_type, error)
+        assert "stop task failed" in str(error), (job_type, error)
+        assert sleeps == [], (job_type, sleeps)
+        assert ("wait", "UPID:stop", "pve", 300, True) in calls, (job_type, calls)
+        assert not any(call[0] == "destroy" for call in calls), (job_type, calls)
+        assert deploy_calls == [], (job_type, deploy_calls)
+
+
 if __name__ == "__main__":
     test_execution_plan_is_encrypted_and_immutable()
     test_execution_plan_rejects_malformed_ciphertext()
@@ -917,4 +1116,9 @@ if __name__ == "__main__":
     test_waiting_is_active_in_state_widget_and_serialization()
     test_waiting_can_cancel_but_cannot_be_dismissed_purged_or_retained_as_terminal()
     test_waiting_blocks_connection_deletion_and_deduplicates_sync()
+    test_direct_lifecycle_actions_wait_for_their_submitted_upids()
+    test_direct_lifecycle_task_failure_and_timeout_return_502()
+    test_worker_rebuild_and_destroy_await_stop_without_fixed_sleep()
+    test_worker_rebuild_and_destroy_skip_stop_when_vm_is_stopped()
+    test_worker_stop_task_failure_aborts_before_destroy()
     print("\\nALL WAVE 37 UNIT TESTS PASSED")

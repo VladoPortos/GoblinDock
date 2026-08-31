@@ -597,7 +597,7 @@ def test_cleanup_retry_stamps_each_target_immediately_before_external_work():
     assert calls == ["pve"], "only the first target is old enough for another attempt"
 
 
-def test_rebuild_admission_uses_deploy_allocation_lock():
+def test_rebuild_admission_uses_lifecycle_admission_lock():
     uid = _mk_user("w36-rebuild-lock@example.com")
     template_id, network_id = _mk_deployable_template(uid, static=True)
     with session_scope() as s:
@@ -630,7 +630,7 @@ def test_rebuild_admission_uses_deploy_allocation_lock():
     api._build_job_ctx = observed_build
     thread = threading.Thread(target=rebuild)
     try:
-        with api._deploy_lock:
+        with api._lifecycle_admission_lock:
             thread.start()
             assert not entered_build.wait(timeout=0.25), \
                 "rebuild must wait behind deployment/IP admission lock"
@@ -642,7 +642,138 @@ def test_rebuild_admission_uses_deploy_allocation_lock():
 
     assert entered_build.is_set(), "rebuild should proceed after the lock is released"
     assert result and isinstance(result[0], dict), result
-    print("test_rebuild_admission_uses_deploy_allocation_lock OK")
+    print("test_rebuild_admission_uses_lifecycle_admission_lock OK")
+
+
+def _mk_lifecycle_deployment(uid: int, *, status: str = "running") -> int:
+    template_id, network_id = _mk_deployable_template(uid)
+    with session_scope() as s:
+        template = s.get(Template, template_id)
+        dep = Deployment(
+            name="lifecycle-" + os.urandom(3).hex(), owner_id=uid,
+            connection_id=template.connection_id, image_id=template.base_image_id,
+            template_id=template.id, network_id=network_id, node="pve", vmid=8365,
+            status=status,
+        )
+        s.add(dep)
+        s.flush()
+        return dep.id
+
+
+def test_sequential_duplicate_destroy_returns_one_active_job():
+    """A repeated delete must return the first job instead of admitting a duplicate."""
+    uid = _mk_user("w36-destroy-sequential@example.com")
+    dep_id = _mk_lifecycle_deployment(uid)
+
+    results = []
+    for _ in range(2):
+        with Session(engine) as s:
+            results.append(api.vm_destroy(dep_id, user=s.get(User, uid), session=s))
+
+    assert results[0]["jobId"] == results[1]["jobId"], results
+    with session_scope() as s:
+        jobs = s.exec(select(Job).where(
+            Job.deployment_id == dep_id, Job.type == "destroy",
+        )).all()
+        assert len(jobs) == 1, [job.id for job in jobs]
+    print("test_sequential_duplicate_destroy_returns_one_active_job OK")
+
+
+def test_concurrent_duplicate_destroy_returns_one_active_job():
+    """Two synchronized delete requests must serialize their query-and-insert decision."""
+    uid = _mk_user("w36-destroy-concurrent@example.com")
+    dep_id = _mk_lifecycle_deployment(uid)
+    audit_barrier = threading.Barrier(2)
+    original_record_audit = api.record_audit
+
+    def synchronized_audit(*args, **kwargs):
+        try:
+            audit_barrier.wait(timeout=0.5)
+        except threading.BrokenBarrierError:
+            pass
+        return original_record_audit(*args, **kwargs)
+
+    def destroy():
+        with Session(engine) as s:
+            return api.vm_destroy(dep_id, user=s.get(User, uid), session=s)
+
+    api.record_audit = synchronized_audit
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            results = list(pool.map(lambda _index: destroy(), range(2)))
+    finally:
+        api.record_audit = original_record_audit
+
+    assert results[0]["jobId"] == results[1]["jobId"], results
+    with session_scope() as s:
+        jobs = s.exec(select(Job).where(
+            Job.deployment_id == dep_id, Job.type == "destroy",
+        )).all()
+        assert len(jobs) == 1, [job.id for job in jobs]
+    print("test_concurrent_duplicate_destroy_returns_one_active_job OK")
+
+
+def test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status():
+    """Queued, running, and waiting work must all block incompatible lifecycle jobs."""
+    uid = _mk_user("w36-lifecycle-conflicts@example.com")
+    cases = [
+        ("rebuild", active_type, active_status)
+        for active_type in ("deploy", "rebuild", "destroy")
+        for active_status in ("queued", "running", "waiting")
+    ] + [
+        ("destroy", active_type, active_status)
+        for active_type in ("deploy", "rebuild")
+        for active_status in ("queued", "running", "waiting")
+    ]
+
+    for requested, active_type, active_status in cases:
+        dep_id = _mk_lifecycle_deployment(uid)
+        with session_scope() as s:
+            s.add(Job(
+                type=active_type, status=active_status, deployment_id=dep_id,
+                connection_id=s.get(Deployment, dep_id).connection_id, created_by=uid,
+            ))
+        with Session(engine) as s:
+            before = len(s.exec(select(Job).where(Job.deployment_id == dep_id)).all())
+            if requested == "rebuild":
+                call = lambda: api.vm_rebuild(dep_id, user=s.get(User, uid), session=s)
+            else:
+                call = lambda: api.vm_destroy(dep_id, user=s.get(User, uid), session=s)
+            exc = _expect_http(409, call)
+            assert active_type in str(exc.detail), (requested, active_type, active_status, exc.detail)
+            after = len(s.exec(select(Job).where(Job.deployment_id == dep_id)).all())
+            assert after == before, (requested, active_type, active_status, before, after)
+    print("test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status OK")
+
+
+def test_cleanup_pending_rejects_every_vm_lifecycle_operation():
+    """An ambiguously owned VM must not accept direct, rebuild, or destroy operations."""
+    uid = _mk_user("w36-cleanup-lifecycle@example.com")
+    dep_id = _mk_lifecycle_deployment(uid, status="cleanup_pending")
+    original_proxmox = api.Proxmox
+    api.Proxmox = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("cleanup-pending lifecycle rejection must precede Proxmox access")
+    )
+    try:
+        for action in ("start", "stop", "restart"):
+            with Session(engine) as s:
+                exc = _expect_http(409, lambda: api.vm_action(
+                    dep_id, api.ActionBody(action=action),
+                    user=s.get(User, uid), session=s,
+                ))
+                assert "cleanup" in str(exc.detail).lower(), (action, exc.detail)
+        for operation in (api.vm_rebuild, api.vm_destroy):
+            with Session(engine) as s:
+                exc = _expect_http(409, lambda: operation(
+                    dep_id, user=s.get(User, uid), session=s,
+                ))
+                assert "cleanup" in str(exc.detail).lower(), (operation.__name__, exc.detail)
+    finally:
+        api.Proxmox = original_proxmox
+
+    with session_scope() as s:
+        assert s.exec(select(Job).where(Job.deployment_id == dep_id)).all() == []
+    print("test_cleanup_pending_rejects_every_vm_lifecycle_operation OK")
 
 
 def test_template_write_rejects_malformed_recipe_shape():
@@ -878,7 +1009,11 @@ if __name__ == "__main__":
     test_orphan_recovery_keeps_allocations_until_absence_is_confirmed()
     test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_absence()
     test_cleanup_retry_stamps_each_target_immediately_before_external_work()
-    test_rebuild_admission_uses_deploy_allocation_lock()
+    test_rebuild_admission_uses_lifecycle_admission_lock()
+    test_sequential_duplicate_destroy_returns_one_active_job()
+    test_concurrent_duplicate_destroy_returns_one_active_job()
+    test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status()
+    test_cleanup_pending_rejects_every_vm_lifecycle_operation()
     test_template_write_rejects_malformed_recipe_shape()
     test_template_write_rejects_private_block_from_another_user()
     test_template_write_rejects_non_object_inputs()

@@ -236,8 +236,9 @@ def allocate_ip(session: Session, net: Network, deployment_id: int) -> Optional[
                 session.add(IpAllocation(network_id=net.id, ip=ip,
                                          deployment_id=deployment_id, state="reserved"))
                 # Join the caller's transaction. Deployment admission holds
-                # `_deploy_lock` until its final commit, so the next waiter cannot read
-                # past this uncommitted reservation in the single-process runtime.
+                # `_lifecycle_admission_lock` until its final commit, so the next
+                # waiter cannot read past this uncommitted reservation in the
+                # single-process runtime.
                 session.flush()
                 return ip
             cur = cur + 1
@@ -704,7 +705,22 @@ def _auto_name(session: Session, base: str = "gd") -> str:
     return f"{base}-{n}"
 
 
-_deploy_lock = threading.Lock()
+_lifecycle_admission_lock = threading.Lock()
+_ACTIVE_LIFECYCLE_STATUSES = ("queued", "running", "waiting")
+_LIFECYCLE_TYPES = ("deploy", "rebuild", "destroy")
+
+
+def _active_lifecycle_job(session: Session, deployment_id: int) -> Optional[Job]:
+    return session.exec(select(Job).where(
+        Job.deployment_id == deployment_id,
+        Job.type.in_(_LIFECYCLE_TYPES),
+        Job.status.in_(_ACTIVE_LIFECYCLE_STATUSES),
+    ).order_by(Job.id.desc())).first()
+
+
+def _reject_cleanup_pending(dep: Deployment) -> None:
+    if dep.status == "cleanup_pending":
+        raise HTTPException(409, "VM cleanup is pending — wait for reconciliation to finish")
 
 
 @router.post("/deployments")
@@ -712,7 +728,7 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
     # Quota admission, deployment row, IP reservation, job and audit must be one
     # serialized transaction. Sync FastAPI handlers run concurrently in a threadpool
     # even with one Uvicorn worker, so an unlocked count-then-insert is racy.
-    with _deploy_lock:
+    with _lifecycle_admission_lock:
         return _deploy_transaction(body, user, session)
 
 
@@ -789,6 +805,7 @@ class ActionBody(BaseModel):
 def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
               session: Session = Depends(get_session)):
     dep = _owned_deployment(session, dep_id, user)
+    _reject_cleanup_pending(dep)
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
@@ -796,13 +813,14 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
     node = dep.node or conn.node
     try:
         if body.action == "start":
-            px.start(dep.vmid, node)
+            upid = px.start(dep.vmid, node)
         elif body.action == "stop":
-            px.stop(dep.vmid, node)
+            upid = px.stop(dep.vmid, node)
         elif body.action == "restart":
-            px.reboot(dep.vmid, node)
+            upid = px.reboot(dep.vmid, node)
         else:
             raise HTTPException(400, "unknown action")
+        px.wait_task(upid, node=node, timeout=120)
     except HTTPException:
         raise
     except Exception as e:  # noqa: BLE001
@@ -817,12 +835,16 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
 def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
     # Rebuild may need to recreate a missing legacy/static allocation. Keep its flush
     # and final commit inside the same lock used by new deployment admission.
-    with _deploy_lock:
+    with _lifecycle_admission_lock:
         return _vm_rebuild_transaction(dep_id, user, session)
 
 
 def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     dep = _owned_deployment(session, dep_id, user)
+    _reject_cleanup_pending(dep)
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
     if not dep.template_id:
         raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
     tpl = session.get(Template, dep.template_id)
@@ -855,7 +877,18 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
 
 @router.delete("/deployments/{dep_id}")
 def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    with _lifecycle_admission_lock:
+        return _vm_destroy_transaction(dep_id, user, session)
+
+
+def _vm_destroy_transaction(dep_id: int, user: User, session: Session):
     dep = _owned_deployment(session, dep_id, user)
+    _reject_cleanup_pending(dep)
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        if active.type == "destroy":
+            return {"ok": True, "jobId": active.id}
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
     dep.status = "working"
     dep.cleanup_origin = None
     dep.cleanup_last_attempt_at = None

@@ -758,6 +758,27 @@ def _wait_for_ip(ctx: JobCtx, px: Proxmox, vmid: int, node: str, timeout: int = 
     return None
 
 
+def _stop_vm_for_lifecycle(ctx: JobCtx, px: Proxmox, vmid: int, node: str) -> bool:
+    """Stop a confirmed-present VM when needed and wait for the stop task.
+
+    False means the inventory probe confirmed that the VM is already absent.
+    """
+    try:
+        status = (px.vm_current(vmid, node) or {}).get("status")
+    except Exception as e:  # noqa: BLE001
+        presence, detail = _probe_vm_presence(px, vmid, node)
+        if presence == VM_ABSENT:
+            return False
+        if presence == VM_UNKNOWN:
+            raise RuntimeError(f"could not inspect VM {vmid} before stop: {detail}") from e
+        status = "unknown"
+    if status == "stopped":
+        return True
+    upid = px.stop(vmid, node=node)
+    px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
+    return True
+
+
 def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     conn, dep = _load_job_targets(job)
     # rebuild destroys the existing VM first — honour a cancel that landed after claim
@@ -771,25 +792,23 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     t = ctx.start_step(st)
     old_vmid = dep.vmid
     if old_vmid:
-        try:
-            px.stop(old_vmid, node=node)
-            time.sleep(3)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            upid = px.destroy(old_vmid, node=node)
-            px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
-        except JobCancelled:
-            # A cancel during the pre-rebuild destroy: do NOT recreate — propagate so
-            # _execute reconciles the cancel against the VM's actual state.
-            raise
-        except Exception as e:  # noqa: BLE001
-            # The old VM may simply be gone already (then we continue), but if it
-            # SURVIVED we must NOT recreate over it: reusing the VMID would collide on
-            # create, and the create-failure cleanup would then destroy this very VM.
-            if _vm_exists(px, old_vmid, node):
-                raise RuntimeError(
-                    f"rebuild aborted: could not destroy old VM {old_vmid}: {e}") from e
+        if _stop_vm_for_lifecycle(ctx, px, old_vmid, node):
+            try:
+                upid = px.destroy(old_vmid, node=node)
+                px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
+            except JobCancelled:
+                # A cancel during the pre-rebuild destroy: do NOT recreate — propagate so
+                # _execute reconciles the cancel against the VM's actual state.
+                raise
+            except Exception as e:  # noqa: BLE001
+                # The old VM may simply be gone already (then we continue), but if it
+                # SURVIVED we must NOT recreate over it: reusing the VMID would collide on
+                # create, and the create-failure cleanup would then destroy this very VM.
+                if _vm_exists(px, old_vmid, node):
+                    raise RuntimeError(
+                        f"rebuild aborted: could not destroy old VM {old_vmid}: {e}") from e
+                ctx.log(f"[{_ts()}] old VM {old_vmid} already absent; continuing", "l-dim")
+        else:
             ctx.log(f"[{_ts()}] old VM {old_vmid} already absent; continuing", "l-dim")
     ctx.log(f"[{_ts()}] keeping identity: name={dep.name} ip={dep.ip or 'dhcp'}", "l-dim")
     ctx.finish_step(st, t)
@@ -812,18 +831,15 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
     ctx.progress(10, "Stopping")
     st = ctx.add_step(f"Stop {dep.name}")
     t = ctx.start_step(st)
+    vm_present = True
     if dep.vmid:
-        try:
-            px.stop(dep.vmid, node=node)
-            time.sleep(3)
-        except Exception:  # noqa: BLE001
-            pass
+        vm_present = _stop_vm_for_lifecycle(ctx, px, dep.vmid, node)
     ctx.finish_step(st, t)
 
     ctx.progress(50, "Destroying")
     st = ctx.add_step(f"Destroy {dep.name} (purge disk)")
     t = ctx.start_step(st)
-    if dep.vmid:
+    if dep.vmid and vm_present:
         try:
             upid = px.destroy(dep.vmid, node=node)
             px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
