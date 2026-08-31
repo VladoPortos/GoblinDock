@@ -12,6 +12,7 @@ const uiSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'ui.js'), 'ut
 const jobSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'job.js'), 'utf8');
 const historySource = fs.readFileSync(path.join(__dirname, '..', 'web', 'history.js'), 'utf8');
 const shellSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'shell.js'), 'utf8');
+const builderSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'builder.js'), 'utf8');
 const stylesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'styles.css'), 'utf8');
 let nextId = 0;
 const React = {
@@ -549,6 +550,224 @@ function jobDetailFixture(rawStatus, status, title, error) {
     log: [],
   };
 }
+
+function builderHarness() {
+  let stateCursor = 0;
+  const stateChanges = [];
+  const HarnessReact = {
+    createElement: React.createElement,
+    useState(initial) {
+      const index = stateCursor++;
+      return [typeof initial === 'function' ? initial() : initial,
+        (value) => stateChanges.push({ index, value })];
+    },
+    useEffect() {},
+    useRef(initial) { return { current: initial }; },
+  };
+  const paletteBlock = {
+    id: 'package-install', name: 'Install packages', cat: 'Install', section: 'Install',
+    desc: 'Install selected packages', icon: 'package', builtin: true, phase: 'ansible',
+    schema: [],
+  };
+  const harnessWindow = {
+    React: HarnessReact,
+    Icon(props) {
+      return HarnessReact.createElement('span', { 'data-icon': props.name });
+    },
+    GD: {
+      PALETTE: [paletteBlock],
+      TEMPLATES: [{
+        templateId: 3950, name: 'Keyboard template', cpu: 2, mem: 4, disk: 20,
+        os: 'ubuntu', public: false, recipe: [{
+          id: 's-inst', name: 'Install', blocks: [{
+            ref: paletteBlock.id, name: paletteBlock.name, inputs: {}, ask: [],
+          }],
+        }],
+      }],
+      BASE_IMAGES: [], CONNECTIONS: [], NETWORKS: [], SECRETS: [],
+    },
+    GDStore: { nav: { templateId: 3950 }, refresh() { return Promise.resolve(); }, toast() {} },
+    API: { compile() { return Promise.resolve({ yaml: '' }); } },
+    UI: {
+      Modal(props) { return HarnessReact.createElement('div', { className: 'modal' }, props.children); },
+      OSGlyph() {}, Field() {}, TextArea() {}, SelectField() {}, Toggle() {}, TagInput() {},
+      FormModal(props) { return HarnessReact.createElement('form', null, props.children); },
+    },
+  };
+  vm.runInNewContext(builderSource, { React: HarnessReact, window: harnessWindow, setTimeout() {} }, {
+    filename: 'web/builder.js',
+  });
+  return {
+    window: harnessWindow,
+    render(component) {
+      stateCursor = 0;
+      return resolveTree(component());
+    },
+    stateChanges,
+  };
+}
+
+const navigationHarness = jobSurfaceHarness({ gd: { me: { isAdmin: true }, VMS: [] } });
+function renderSidebar(collapsed, setCollapsed = () => {}) {
+  return navigationHarness.render(() => navigationHarness.window.Shell.Sidebar({
+    route: 'dashboard', go() {}, collapsed, setCollapsed,
+  }));
+}
+const expandedSidebar = renderSidebar(false);
+const expandedNavButtons = findAll(expandedSidebar, (node) => node.type === 'button'
+  && String(node.props.className || '').includes('nav-item'));
+assert.ok(expandedNavButtons.length > 1, 'sidebar destinations and collapse must be native buttons');
+for (const button of expandedNavButtons) {
+  assert.equal(button.props.type, 'button', 'sidebar buttons must not submit an enclosing form');
+}
+const activeDestination = expandedNavButtons.find((button) => textOf(button).includes('Dashboard'));
+assert.ok(activeDestination, 'the active dashboard destination must render');
+assert.equal(activeDestination.props['aria-current'], 'page');
+const inactiveDestination = expandedNavButtons.find((button) => textOf(button).includes('Templates'));
+assert.equal(inactiveDestination.props['aria-current'], undefined);
+const collapseButton = expandedNavButtons.find((button) => button.props['aria-label'] === 'Collapse');
+assert.ok(collapseButton, 'expanded sidebar collapse control needs an accessible name');
+assert.equal(collapseButton.props.title, 'Collapse');
+let nextCollapsed;
+const operableCollapseButton = findAll(renderSidebar(false, (update) => {
+  nextCollapsed = update(false);
+}), (node) => node.type === 'button' && node.props['aria-label'] === 'Collapse')[0];
+operableCollapseButton.props.onClick();
+assert.equal(nextCollapsed, true, 'the native Collapse button must invoke the sidebar state change');
+
+const collapsedSidebar = renderSidebar(true);
+const expandButton = findAll(collapsedSidebar, (node) => node.type === 'button'
+  && node.props['aria-label'] === 'Expand')[0];
+assert.ok(expandButton, 'collapsed sidebar control must change its accessible name to Expand');
+assert.equal(expandButton.props.type, 'button');
+assert.equal(expandButton.props.title, 'Expand');
+const collapsedDashboard = findAll(collapsedSidebar, (node) => node.type === 'button'
+  && node.props['aria-current'] === 'page')[0];
+assert.equal(collapsedDashboard.props['aria-label'], 'Dashboard',
+  'collapsed destinations must retain an accessible name');
+
+const keyboardBuilder = builderHarness();
+assert.ok(keyboardBuilder.window.BuilderUI, 'builder.js must export window.BuilderUI');
+assert.equal(typeof keyboardBuilder.window.BuilderUI.activatePlacedBlock, 'function');
+const { activatePlacedBlock } = keyboardBuilder.window.BuilderUI;
+let selectedBlocks = 0;
+let preventedSpaces = 0;
+const placedTarget = {};
+activatePlacedBlock({
+  type: 'keydown', key: ' ', target: placedTarget, currentTarget: placedTarget,
+  preventDefault() { preventedSpaces += 1; },
+}, () => { selectedBlocks += 1; });
+assert.equal(selectedBlocks, 1, 'Space must invoke placed-block selection');
+assert.equal(preventedSpaces, 1, 'Space must prevent page scrolling');
+activatePlacedBlock({
+  type: 'keydown', key: 'Enter', target: placedTarget, currentTarget: placedTarget,
+  preventDefault() { throw new Error('Enter must not require preventDefault'); },
+}, () => { selectedBlocks += 1; });
+assert.equal(selectedBlocks, 2, 'Enter must invoke placed-block selection');
+activatePlacedBlock({
+  type: 'keydown', key: 'Escape', target: placedTarget, currentTarget: placedTarget,
+  preventDefault() { throw new Error('irrelevant keys must not be canceled'); },
+}, () => { selectedBlocks += 1; });
+assert.equal(selectedBlocks, 2, 'irrelevant keys must not select a placed block');
+const nestedButton = {};
+activatePlacedBlock({
+  type: 'click',
+  target: { closest() { return nestedButton; } },
+  currentTarget: { contains(candidate) { return candidate === nestedButton; } },
+}, () => { selectedBlocks += 1; });
+assert.equal(selectedBlocks, 2, 'nested action clicks must not bubble into block selection');
+
+const builderTree = keyboardBuilder.render(() => keyboardBuilder.window.Builder({ go() {} }));
+const paletteItem = findAll(builderTree, (node) => node.props.className === 'palette-block')[0];
+assert.ok(paletteItem, 'builder palette fixture must render');
+assert.equal(paletteItem.type, 'button', 'palette primary actions must be native buttons');
+assert.equal(paletteItem.props.type, 'button');
+assert.equal(paletteItem.props.draggable, true, 'pointer drag/drop must remain available');
+assert.equal(typeof paletteItem.props.onDragStart, 'function');
+
+const placedBlock = findAll(builderTree, (node) => String(node.props.className || '').includes('placed-block'))[0];
+assert.ok(placedBlock, 'placed builder fixture must render');
+assert.equal(placedBlock.type, 'div', 'placed blocks must not wrap nested actions in a native button');
+assert.equal(placedBlock.props.role, 'button');
+assert.equal(placedBlock.props.tabIndex, 0);
+assert.equal(placedBlock.props['aria-pressed'], false);
+assert.equal(typeof placedBlock.props.onClick, 'function');
+assert.equal(typeof placedBlock.props.onKeyDown, 'function');
+const renderedTarget = {};
+let renderedSpacePrevented = 0;
+const changesBeforeKeyboard = keyboardBuilder.stateChanges.length;
+placedBlock.props.onKeyDown({
+  type: 'keydown', key: ' ', target: renderedTarget, currentTarget: renderedTarget,
+  preventDefault() { renderedSpacePrevented += 1; },
+});
+assert.equal(keyboardBuilder.stateChanges.length, changesBeforeKeyboard + 1,
+  'the rendered placed block must wire Space to its selection state');
+assert.match(keyboardBuilder.stateChanges.at(-1).value, /^u\d+$/);
+assert.equal(renderedSpacePrevented, 1,
+  'the rendered placed block must prevent page scrolling for Space');
+const placedActions = findAll(placedBlock, (node) => node.type === 'button');
+assert.deepEqual(placedActions.map((button) => button.props['aria-label']), [
+  'Move Install packages up', 'Duplicate Install packages', 'Remove Install packages',
+]);
+assert.ok(placedActions.every((button) => button.props.type === 'button'));
+const nestedChangesBefore = keyboardBuilder.stateChanges.length;
+const nestedActionTarget = { closest() { return placedActions[0]; } };
+placedBlock.props.onClick({
+  type: 'click', target: nestedActionTarget,
+  currentTarget: { contains(candidate) { return candidate === placedActions[0]; } },
+});
+assert.equal(keyboardBuilder.stateChanges.length, nestedChangesBefore,
+  'the rendered placed block must ignore click bubbling from nested action buttons');
+const placedGrip = findAll(placedBlock, (node) => node.props.className === 'pb-grip')[0];
+assert.equal(placedGrip.props.onClick, undefined, 'the decorative grip must not masquerade as a control');
+assert.equal(placedGrip.props['aria-hidden'], true);
+const dropzone = findAll(builderTree, (node) => String(node.props.className || '').includes('dropzone'))[0];
+assert.equal(typeof dropzone.props.onDragOver, 'function');
+assert.equal(typeof dropzone.props.onDrop, 'function',
+  'the canvas drop target must remain wired for pointer drag/drop');
+
+const codeField = keyboardBuilder.render(() => keyboardBuilder.window.SchemaField({
+  field: { type: 'code', label: 'Install script', name: 'script' },
+  value: '', onChange() {},
+}));
+const codePreview = findAll(codeField, (node) => node.type === 'div'
+  && node.children.some((child) => child && child.type === 'pre'))[0];
+assert.ok(codePreview, 'code preview fixture must render');
+assert.equal(typeof codePreview.props.onClick, 'function',
+  'the existing pointer-sized code preview target must remain available');
+assert.equal(textOf(findAll(codePreview, (node) => node.type === 'pre')[0]),
+  '# empty — click or use Open editor', 'empty preview copy must describe both controls');
+const openEditor = findAll(codePreview, (node) => node.type === 'button'
+  && textOf(node) === 'Open editor')[0];
+assert.ok(openEditor);
+assert.equal(openEditor.props.type, 'button');
+
+const passwordField = keyboardBuilder.render(() => keyboardBuilder.window.SchemaField({
+  field: { type: 'password', label: 'Root password', name: 'password' },
+  value: '', onChange() {},
+}));
+const showPassword = findAll(passwordField, (node) => node.type === 'button')[0];
+assert.equal(showPassword.props.type, 'button');
+assert.equal(showPassword.props['aria-label'], 'Show password');
+
+const customBlockEditor = keyboardBuilder.render(() => keyboardBuilder.window.BlockEditorModal({
+  initial: { name: 'Custom', schema: [{ name: 'token', type: 'secret', default: '' }] },
+  onClose() {}, onSaved() {},
+}));
+const removeInput = findAll(customBlockEditor, (node) => node.type === 'button'
+  && String(node.props.className || '').includes('danger'))[0];
+assert.ok(removeInput, 'custom block input removal control must render');
+assert.equal(removeInput.props.type, 'button');
+assert.equal(removeInput.props['aria-label'], 'Remove token input');
+
+assert.match(cssRule('.nav-item:focus-visible'), /outline|box-shadow/,
+  'sidebar controls need a visible keyboard focus indicator');
+assert.match(cssRule('.palette-block:focus-visible'), /outline|box-shadow/,
+  'palette buttons need a visible keyboard focus indicator');
+assert.match(cssRule('.placed-block:focus-visible'), /outline|box-shadow/,
+  'placed blocks need a visible keyboard focus indicator');
+assert.match(cssRule('.placed-block:focus-within .pb-actions'), /opacity\s*:\s*1\s*;/,
+  'nested block actions must remain visible while focus is within the block');
 
 function renderedJobState(rawStatus, status, title, error) {
   const fixture = jobDetailFixture(rawStatus, status, title, error);

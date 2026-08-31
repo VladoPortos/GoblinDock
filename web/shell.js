@@ -33,11 +33,14 @@
         NAV.map(sec => h(React.Fragment, { key: sec.group },
           !collapsed && h('div', { className: 'nav-label' }, sec.group),
           collapsed && h('div', { style: { height: 10 } }),
-          sec.items.filter(it => !it.admin || (GD.me && GD.me.isAdmin)).map(it => h('div', {
+          sec.items.filter(it => !it.admin || (GD.me && GD.me.isAdmin)).map(it => h('button', {
             key: it.id,
+            type: 'button',
             className: 'nav-item' + (route === it.id ? ' active' : ''),
             onClick: () => go(it.id),
             title: collapsed ? it.label : null,
+            'aria-label': collapsed ? it.label : undefined,
+            'aria-current': route === it.id ? 'page' : undefined,
           },
             h(Icon, { name: it.icon, size: 18 }),
             !collapsed && h('span', null, it.label),
@@ -46,7 +49,8 @@
         ))
       ),
       h('div', { className: 'sidebar-foot' },
-        h('div', { className: 'nav-item', onClick: () => setCollapsed(c => !c), title: 'Collapse' },
+        h('button', { type: 'button', className: 'nav-item', onClick: () => setCollapsed(c => !c),
+          title: collapsed ? 'Expand' : 'Collapse', 'aria-label': collapsed ? 'Expand' : 'Collapse' },
           h(Icon, { name: 'collapse', size: 18 }),
           !collapsed && h('span', null, 'Collapse')
         )

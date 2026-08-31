@@ -38,6 +38,18 @@
     return sc.some((f) => (f.type === 'text' || f.type === 'secret' || f.type === 'password') && !f.optional && !(b.inputs || {})[f.name] && !((b.ask || []).includes(f.name)));
   }
 
+  function activatePlacedBlock(event, select) {
+    if (event.target !== event.currentTarget && event.target && event.target.closest) {
+      const nested = event.target.closest('button, a, input, select, textarea');
+      if (nested && (!event.currentTarget.contains || event.currentTarget.contains(nested))) return;
+    }
+    const click = event.type === 'click';
+    const key = event.type === 'keydown' ? event.key : '';
+    if (!click && key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return;
+    if ((key === ' ' || key === 'Spacebar') && event.preventDefault) event.preventDefault();
+    select();
+  }
+
   // ---------- Palette ----------
   function Palette({ onAdd, dragRef, onNewBlock }) {
     const [tab, setTab] = useState('builtin');
@@ -49,7 +61,8 @@
     return h('div', { className: 'bpane', style: { width: 256, borderRight: '1px solid var(--border-soft)' } },
       h('div', { className: 'bpane-head' },
         h('span', { className: 'panel-title' }, 'Block Palette'),
-        h('button', { className: 'btn ghost sm', title: 'New custom block', style: { marginLeft: 'auto' }, onClick: onNewBlock }, h(Icon, { name: 'plus', size: 14 }))),
+        h('button', { type: 'button', className: 'btn ghost sm', title: 'New custom block',
+          'aria-label': 'New custom block', style: { marginLeft: 'auto' }, onClick: onNewBlock }, h(Icon, { name: 'plus', size: 14 }))),
       h('div', { style: { padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 9 } },
         h('div', { className: 'seg', style: { width: '100%' } },
           h('button', { className: tab === 'builtin' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setTab('builtin') }, 'Built-in'),
@@ -61,15 +74,15 @@
         Object.keys(cats).map((cat) => h('div', { key: cat, style: { marginBottom: 14 } },
           h('div', { className: 'nav-label', style: { padding: '6px 2px 8px' } }, cat),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 7 } },
-            cats[cat].map((b) => h('div', {
-              key: b.id, className: 'palette-block', draggable: true,
+            cats[cat].map((b) => h('button', {
+              key: b.id, type: 'button', className: 'palette-block', draggable: true,
               onDragStart: () => { dragRef.current = b; }, onClick: () => onAdd(b), title: 'Click or drag to add',
             },
               h('span', { className: 'pb-ico' }, h(Icon, { name: b.icon, size: 15 })),
               h('div', { style: { minWidth: 0 } },
                 h('div', { className: 'mono', style: { fontSize: 12, fontWeight: 600 } }, b.name),
                 h('div', { className: 'hint', style: { fontSize: 10.5 } }, b.desc)),
-              h('span', { className: 'pb-grip' }, h(Icon, { name: 'grip', size: 14 }))))))),
+              h('span', { className: 'pb-grip', 'aria-hidden': true }, h(Icon, { name: 'grip', size: 14 }))))))),
         tab === 'mine' && Object.keys(cats).length === 0 && h('div', { className: 'hint', style: { padding: 12, textAlign: 'center' } }, 'No custom blocks yet. Click ＋ to create one.')));
   }
 
@@ -96,10 +109,12 @@
                 ? h('div', { className: 'dz-hint mono' }, h(Icon, { name: 'plus', size: 15 }), 'drop blocks here')
                 : sec.blocks.map((b, bi) => h('div', {
                     key: b.uid, className: 'placed-block' + (sel === b.uid ? ' sel' : '') + (warnOf(b) ? ' warn' : ''),
-                    onClick: () => setSel(b.uid),
+                    role: 'button', tabIndex: 0, 'aria-pressed': sel === b.uid,
+                    'aria-label': 'Select ' + b.name,
+                    onClick: (event) => activatePlacedBlock(event, () => setSel(b.uid)),
+                    onKeyDown: (event) => activatePlacedBlock(event, () => setSel(b.uid)),
                   },
-                    h('span', { className: 'pb-grip', style: { cursor: 'grab' }, title: 'Reorder',
-                      onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, 1); } }, h(Icon, { name: 'grip', size: 15 })),
+                    h('span', { className: 'pb-grip', 'aria-hidden': true }, h(Icon, { name: 'grip', size: 15 })),
                     h('span', { className: 'placed-ico' }, h(Icon, { name: refIcon(b.ref), size: 15 })),
                     h('div', { style: { minWidth: 0, flex: 1 } },
                       h('div', { className: 'row', style: { gap: 7 } },
@@ -114,9 +129,9 @@
                           h(Icon, { name: 'info', size: 11 }), 'asks at deploy')),
                       h('div', { className: 'hint mono', style: { fontSize: 11, marginTop: 2 } }, summaryOf(b))),
                     h('div', { className: 'pb-actions' },
-                      h('button', { className: 'icon-btn', title: 'Move up', onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, -1); } }, h(Icon, { name: 'chevronR', size: 14, style: { transform: 'rotate(-90deg)' } })),
-                      h('button', { className: 'icon-btn', title: 'Duplicate', onClick: (e) => { e.stopPropagation(); onDup(sec.id, b); } }, h(Icon, { name: 'duplicate', size: 14 })),
-                      h('button', { className: 'icon-btn danger', title: 'Remove', onClick: (e) => { e.stopPropagation(); onRemove(sec.id, b.uid); } }, h(Icon, { name: 'trash', size: 14 })))))))))));
+                      h('button', { type: 'button', className: 'icon-btn', title: 'Move up', 'aria-label': 'Move ' + b.name + ' up', onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, -1); } }, h(Icon, { name: 'chevronR', size: 14, style: { transform: 'rotate(-90deg)' } })),
+                      h('button', { type: 'button', className: 'icon-btn', title: 'Duplicate', 'aria-label': 'Duplicate ' + b.name, onClick: (e) => { e.stopPropagation(); onDup(sec.id, b); } }, h(Icon, { name: 'duplicate', size: 14 })),
+                      h('button', { type: 'button', className: 'icon-btn danger', title: 'Remove', 'aria-label': 'Remove ' + b.name, onClick: (e) => { e.stopPropagation(); onRemove(sec.id, b.uid); } }, h(Icon, { name: 'trash', size: 14 })))))))))));
   }
 
   // ---------- schema-driven field ----------
@@ -133,6 +148,7 @@
           autoComplete: 'new-password',
           onChange: (e) => { const v = e.target.value; setPw(v); commit(v, confirm); } }),
         h('button', { type: 'button', className: 'icon-btn', title: show ? 'Hide' : 'Show',
+          'aria-label': (show ? 'Hide' : 'Show') + ' password',
           onClick: () => setShow(!show) }, h(Icon, { name: show ? 'eyeOff' : 'eye', size: 14 }))),
       h('input', { className: 'input mono', type: show ? 'text' : 'password', value: confirm, placeholder: 'confirm password',
         autoComplete: 'new-password', style: { marginTop: 6 },
@@ -146,7 +162,8 @@
       h('div', { style: { flex: 1 } }, h(Field, { value, onChange, mono: true })),
       secrets.length > 0 && h('select', {
         className: 'select', style: { width: 38, padding: 0, textAlign: 'center' }, value: '',
-        title: 'Insert a secret', onChange: (e) => { if (e.target.value) onChange('{{ secrets.' + e.target.value + ' }}'); },
+        title: 'Insert a secret', 'aria-label': 'Insert a secret',
+        onChange: (e) => { if (e.target.value) onChange('{{ secrets.' + e.target.value + ' }}'); },
       }, [h('option', { key: '', value: '' }, '🔒'), ...secrets.map((s) => h('option', { key: s.id, value: s.name }, s.name))]));
   }
 
@@ -187,9 +204,9 @@
       h('div', { onClick: () => setOpen(true), title: 'Open editor',
         style: { cursor: 'pointer', border: '1px solid var(--border)', borderRadius: 9, background: 'var(--inset)', padding: '9px 11px', overflow: 'hidden' } },
         h('pre', { className: 'mono', style: { margin: 0, fontSize: 11.5, color: value ? 'var(--text-dim)' : 'var(--text-faint)', whiteSpace: 'pre', overflow: 'hidden', maxHeight: 78 } },
-          (lines.slice(0, 4).join('\n')) || '# empty — click to edit'),
+          (lines.slice(0, 4).join('\n')) || '# empty — click or use Open editor'),
         h('div', { className: 'row', style: { marginTop: 8, gap: 8 } },
-          h('button', { className: 'btn sm', onClick: (e) => { e.stopPropagation(); setOpen(true); } }, h(Icon, { name: 'code', size: 13 }), 'Open editor'),
+          h('button', { type: 'button', className: 'btn sm', onClick: (e) => { e.stopPropagation(); setOpen(true); } }, h(Icon, { name: 'code', size: 13 }), 'Open editor'),
           h('span', { className: 'hint mono', style: { fontSize: 10.5, marginLeft: 'auto' } }, lines.length, lines.length === 1 ? ' line' : ' lines'))),
       open && h(Modal, { onClose: () => setOpen(false), width: 'min(940px, 96vw)' },
         h('div', { className: 'modal-head' },
@@ -302,13 +319,15 @@
       h('div', null,
         h('div', { className: 'row', style: { marginBottom: 6 } },
           h('label', { className: 'field-label', style: { margin: 0 } }, 'Inputs'),
-          h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: addField }, h(Icon, { name: 'plus', size: 13 }), 'Add input')),
+          h('button', { type: 'button', className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: addField }, h(Icon, { name: 'plus', size: 13 }), 'Add input')),
         f.schema.map((fld, i) => h('div', { key: i, className: 'row', style: { gap: 6, marginBottom: 6 } },
           h('input', { className: 'input mono', style: { flex: 1 }, value: fld.name, placeholder: 'name', onChange: (e) => setField(i, 'name', e.target.value) }),
           h('select', { className: 'select', style: { width: 100 }, value: fld.type, onChange: (e) => setField(i, 'type', e.target.value) },
             ['text', 'tags', 'bool', 'select', 'code', 'secret', 'password'].map((t) => h('option', { key: t, value: t }, t))),
           h('input', { className: 'input mono', style: { flex: 1 }, value: fld.default == null ? '' : fld.default, placeholder: 'default', onChange: (e) => setField(i, 'default', e.target.value) }),
-          h('button', { className: 'icon-btn danger', onClick: () => set('schema', f.schema.filter((_, j) => j !== i)) }, h(Icon, { name: 'trash', size: 14 })))),
+          h('button', { type: 'button', className: 'icon-btn danger',
+            'aria-label': 'Remove ' + (fld.name || 'input') + ' input',
+            onClick: () => set('schema', f.schema.filter((_, j) => j !== i)) }, h(Icon, { name: 'trash', size: 14 })))),
         f.schema.length === 0 && h('div', { className: 'hint', style: { fontSize: 11.5 } }, 'No inputs — the block runs as-is.')));
   }
 
@@ -461,13 +480,15 @@
           h(Icon, { name: 'code', size: 17, style: { color: 'var(--accent)' } }),
           h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, 'Generated Ansible playbook'),
           h('span', { className: 'badge', style: { marginLeft: 6 } }, 'read-only'),
-          h('button', { className: 'icon-btn', style: { marginLeft: 'auto' }, onClick: () => setYaml(false) }, h(Icon, { name: 'x', size: 16 }))),
+          h('button', { type: 'button', className: 'icon-btn', style: { marginLeft: 'auto' },
+            'aria-label': 'Close generated playbook', onClick: () => setYaml(false) }, h(Icon, { name: 'x', size: 16 }))),
         h('div', { style: { padding: 0 } },
           h('pre', { className: 'logpane', style: { margin: 0, borderRadius: 0, border: 'none', maxHeight: '60vh', fontSize: 12 } }, yamlText))),
       blockModal && h(BlockEditorModal, { initial: blockModal.initial, onClose: () => setBlockModal(null), onSaved: () => { setBlockModal(null); window.GDStore.toast('Block saved', 'ok'); window.GDStore.refresh().catch(() => {}); } }));
   }
 
   window.Builder = Builder;
+  window.BuilderUI = { activatePlacedBlock };
   window.BlockEditorModal = BlockEditorModal;
   window.SchemaField = SchemaField;
 })();
