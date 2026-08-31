@@ -52,3 +52,58 @@ through background controls while the drawer is open.
 
 Recommended fix: implement dialog focus entry/trapping, Escape dismissal, and opener
 focus restoration with regression coverage.
+
+## Important — unavailable Proxmox connections need an explicit disabled state
+
+An administrator may intentionally stop using a Proxmox source because it is
+offline, under maintenance, retired, or otherwise unavailable. Connection settings
+currently need a persistent enabled/disabled control so this situation is not
+treated as an endless connection failure.
+
+When a Proxmox connection is disabled:
+
+- Keep its connection configuration and known VM records so it can be re-enabled
+  without reconfiguration or data loss.
+- Hide all VMs associated with that connection from normal VM inventory and
+  dashboard views.
+- Stop background inventory polling and other automatic operations against that
+  connection.
+- Do not offer the disabled connection or its nodes as targets for new operations.
+- Make the disabled state visible in Settings, with a clear way to enable the
+  connection again and refresh its inventory.
+
+The disabled state must be distinct from a connection that is enabled but
+temporarily unreachable. Re-enabling should not silently delete or duplicate its
+previously known VMs; the first successful refresh should reconcile them.
+
+Recommended fix: add a persisted enabled flag to Proxmox connections, enforce it in
+polling and operation scheduling, and exclude associated VM records from normal
+inventory responses while preserving them in the database.
+
+## Important — missing upstream VMs need a local-only cleanup path
+
+A VM may be deleted directly in Proxmox while GoblinDock still has a database record
+for it. GoblinDock then shows the stale VM as offline. Using the normal Delete action
+launches a Proxmox deletion for a VM that no longer exists, which fails and leaves
+the stale local record in place.
+
+The VM actions need an explicit **Clean up** or **Delete locally only** option with
+these semantics:
+
+- Never send a delete request to Proxmox; remove only GoblinDock's local VM record
+  and the local relationships that prevent that record from disappearing.
+- Keep the existing normal Delete action for VMs that still exist: delete upstream
+  first and remove the local record only after upstream deletion succeeds.
+- Clearly warn that local-only deletion does not delete a real VM from Proxmox.
+- If Proxmox is reachable and confirms the VM is missing, present cleanup as the
+  natural recovery action.
+- If the Proxmox source is disabled or unreachable, still permit local-only cleanup
+  when explicitly confirmed, but explain that GoblinDock cannot verify whether the
+  VM still exists upstream.
+- Record the local cleanup in activity/audit history so an administrator can tell it
+  apart from a successful Proxmox deletion.
+
+Recommended fix: add a dedicated local-only deletion endpoint and guarded UI action
+rather than overloading normal deletion or treating every Proxmox error as proof that
+the VM is gone. Add coverage for a confirmed upstream 404/not-found response, an
+unreachable source, a disabled source, and a VM that still exists upstream.
