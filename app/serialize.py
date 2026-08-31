@@ -264,7 +264,7 @@ def base_image_dict(img: Image) -> dict:
         "name": img.name,
         "os": img.os_family,
         "size": img.size or "—",
-        "checksum": img.checksum or "cloud-init ready",
+        "checksum": img.checksum or "",
         "source_url": img.source_url,
     }
 

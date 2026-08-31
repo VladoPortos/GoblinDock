@@ -149,6 +149,19 @@ def _has_control_chars(s: str) -> bool:
 _CHECKSUM_ALGO = {32: "md5", 40: "sha1", 64: "sha256", 96: "sha384", 128: "sha512"}
 
 
+def _clean_checksum(value: str) -> str:
+    checksum = (value or "").strip().lower()
+    if not checksum:
+        return ""
+    if len(checksum) not in _CHECKSUM_ALGO or not re.fullmatch(r"[0-9a-f]+", checksum):
+        raise HTTPException(
+            400,
+            "invalid checksum: enter a bare hexadecimal digest with "
+            "32, 40, 64, 96 or 128 characters",
+        )
+    return checksum
+
+
 def _checksum_algo(checksum: str) -> str:
     cs = (checksum or "").strip().lower()
     return _CHECKSUM_ALGO.get(len(cs), "") if re.fullmatch(r"[0-9a-f]*", cs) else ""
@@ -1544,9 +1557,10 @@ class BaseImageBody(BaseModel):
 @router.post("/images/base")
 def add_base_image(body: BaseImageBody, user: User = Depends(require_admin),
                    session: Session = Depends(get_session)):
+    checksum = _clean_checksum(body.checksum)
     url = validate_image_url(body.source_url)
     img = Image(kind="base", name=body.name, os_family=body.os_family,
-                source_url=url, checksum=body.checksum,
+                source_url=url, checksum=checksum,
                 build_status="ready", created_by=user.id, size="cloud image")
     session.add(img)
     record_audit(session, user, "image.add_base", "image", "-", body.name)
@@ -3017,6 +3031,7 @@ def edit_image(img_id: int, body: BaseImageEditBody, user: User = Depends(curren
         raise HTTPException(403, "admin only")
     if img.kind == "golden" and img.created_by != user.id and user.role != "admin":
         raise HTTPException(403, "not yours")
+    checksum = _clean_checksum(body.checksum) if body.checksum is not None else None
     if body.name is not None and body.name.strip():
         img.name = _clean_name(body.name, "image name")
     if body.os_family:
@@ -3026,8 +3041,8 @@ def edit_image(img_id: int, body: BaseImageEditBody, user: User = Depends(curren
         if user.role != "admin":
             raise HTTPException(403, "custom image URLs are admin-only")
         img.source_url = validate_image_url(body.source_url)
-    if body.checksum is not None:
-        img.checksum = body.checksum
+    if checksum is not None:
+        img.checksum = checksum
     session.add(img)
     record_audit(session, user, "image.update", "image", img.id, img.name)
     session.commit()

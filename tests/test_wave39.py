@@ -12,6 +12,9 @@ from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlsplit
 
+from fastapi import HTTPException
+from sqlmodel import Session, select
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 os.environ.setdefault("GOBLINDOCK_DEV", "1")
@@ -26,9 +29,9 @@ os.environ.setdefault(
     "GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(), "gd-data-test")
 )
 
-from app import serialize as S  # noqa: E402
-from app.db import init_db, session_scope  # noqa: E402
-from app.models import Connection  # noqa: E402
+from app import api, serialize as S  # noqa: E402
+from app.db import engine, init_db, session_scope  # noqa: E402
+from app.models import Connection, Image, User  # noqa: E402
 
 init_db()
 
@@ -422,6 +425,136 @@ def test_connection_admin_round_trip_and_public_redaction():
     assert token_secret_sentinel not in json.dumps(public)
 
 
+def _expect_checksum_400(value):
+    try:
+        api._clean_checksum(value)
+    except HTTPException as exc:
+        assert exc.status_code == 400, (exc.status_code, exc.detail)
+        assert value not in str(exc.detail), "checksum errors must not echo supplied digests"
+        return
+    raise AssertionError(f"expected checksum rejection for {value!r}")
+
+
+def test_checksum_validation_normalizes_supported_digests_without_legacy_regression():
+    """Creation validation must accept only the five supported bare-hex digest sizes."""
+    assert api._clean_checksum("") == ""
+    assert api._clean_checksum(" \t\r\n") == ""
+    for length in (32, 40, 64, 96, 128):
+        assert api._clean_checksum("  " + ("A" * length) + "\t") == "a" * length
+
+    for malformed in (
+        "g" * 32,
+        "a" * 31,
+        "a" * 48,
+        ("a" * 16) + " " + ("a" * 16),
+        "sha256:" + ("a" * 64),
+    ):
+        _expect_checksum_400(malformed)
+
+    legacy = "sha256:not-a-bare-legacy-value"
+    assert api._checksum_algo(legacy) == "", "deployment context must tolerate legacy rows"
+    assert S.base_image_dict(Image(name="legacy", checksum=legacy))["checksum"] == legacy
+    assert S.base_image_dict(Image(name="blank", checksum=""))["checksum"] == ""
+
+
+def test_base_image_create_and_edit_persist_normalized_checksum_atomically():
+    """The real route handlers must normalize good input and leave no partial bad edit."""
+    suffix = os.urandom(4).hex()
+    valid_create = "A" * 64
+    valid_edit = "B" * 96
+    invalid = "sha256:" + ("c" * 64)
+
+    with session_scope() as session:
+        admin = User(
+            email=f"wave39-checksum-{suffix}@example.com",
+            name="Wave 39 checksum admin",
+            password_hash="test-only",
+            role="admin",
+        )
+        session.add(admin)
+        session.flush()
+        admin_id = admin.id
+        before_count = len(session.exec(select(Image)).all())
+
+    original_validate_image_url = api.validate_image_url
+    api.validate_image_url = lambda value: value.strip()
+    try:
+        with Session(engine) as session:
+            api.add_base_image(
+                api.BaseImageBody(
+                    name=f"wave39-checksum-{suffix}",
+                    source_url="https://example.com/wave39.img",
+                    checksum="  " + valid_create + "\n",
+                ),
+                user=session.get(User, admin_id),
+                session=session,
+            )
+
+        with session_scope() as session:
+            created = session.exec(select(Image).where(
+                Image.name == f"wave39-checksum-{suffix}",
+            )).one()
+            image_id = created.id
+            assert created.checksum == valid_create.lower()
+            assert len(session.exec(select(Image)).all()) == before_count + 1
+
+        with Session(engine) as session:
+            api.edit_image(
+                image_id,
+                api.BaseImageEditBody(checksum="\t" + valid_edit + "  "),
+                user=session.get(User, admin_id),
+                session=session,
+            )
+
+        with session_scope() as session:
+            edited = session.get(Image, image_id)
+            assert edited.checksum == valid_edit.lower()
+            original_name = edited.name
+
+        with Session(engine) as session:
+            loaded = session.get(Image, image_id)
+            try:
+                api.edit_image(
+                    image_id,
+                    api.BaseImageEditBody(name="must-not-persist", checksum=invalid),
+                    user=session.get(User, admin_id),
+                    session=session,
+                )
+            except HTTPException as exc:
+                assert exc.status_code == 400
+                assert invalid not in str(exc.detail)
+                assert loaded.name == original_name
+                assert loaded.checksum == valid_edit.lower()
+            else:
+                raise AssertionError("prefixed checksum must reject the edit")
+
+        with Session(engine) as session:
+            try:
+                api.add_base_image(
+                    api.BaseImageBody(
+                        name=f"must-not-create-{suffix}",
+                        source_url="https://example.com/rejected.img",
+                        checksum=invalid,
+                    ),
+                    user=session.get(User, admin_id),
+                    session=session,
+                )
+            except HTTPException as exc:
+                assert exc.status_code == 400
+                assert invalid not in str(exc.detail)
+            else:
+                raise AssertionError("prefixed checksum must reject image creation")
+
+        with session_scope() as session:
+            assert session.get(Image, image_id).name == original_name
+            assert not session.exec(select(Image).where(
+                Image.name == f"must-not-create-{suffix}",
+            )).first()
+            assert len(session.exec(select(Image)).all()) == before_count + 1
+    finally:
+        api.validate_image_url = original_validate_image_url
+
+
 if __name__ == "__main__":
     test_sri_rejects_local_vendor_resource_without_integrity()
     test_sri_rejects_local_vendor_resource_with_sha256_only()
@@ -437,4 +570,6 @@ if __name__ == "__main__":
     test_sri_reports_exact_pre_fix_six_crlf_mismatches()
     test_local_sri_resources_match_exact_working_tree_bytes()
     test_connection_admin_round_trip_and_public_redaction()
+    test_checksum_validation_normalizes_supported_digests_without_legacy_regression()
+    test_base_image_create_and_edit_persist_normalized_checksum_atomically()
     print("\nALL WAVE 39 UNIT TESTS PASSED")

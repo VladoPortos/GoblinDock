@@ -6,6 +6,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 
 const source = fs.readFileSync(path.join(__dirname, '..', 'web', 'manage.js'), 'utf8');
+const imagesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'images.js'), 'utf8');
 const uiSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'ui.js'), 'utf8');
 const stylesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'styles.css'), 'utf8');
 let nextId = 0;
@@ -37,6 +38,7 @@ vm.runInNewContext(uiSource, {
   document: { addEventListener() {}, removeEventListener() {} },
 }, { filename: 'web/ui.js' });
 vm.runInNewContext(source, { React, window }, { filename: 'web/manage.js' });
+vm.runInNewContext(imagesSource, { React, window }, { filename: 'web/images.js' });
 
 function textOf(node) {
   if (node == null || node === false) return '';
@@ -49,6 +51,13 @@ function findAll(node, predicate, found = []) {
   if (predicate(node)) found.push(node);
   for (const child of node.children || []) findAll(child, predicate, found);
   return found;
+}
+
+function controlForLabel(node, labelText) {
+  const label = findAll(node, (candidate) => candidate.type === 'label'
+    && textOf(candidate) === labelText)[0];
+  assert.ok(label && label.props.htmlFor, `missing labelled ${labelText} control`);
+  return findAll(node, (candidate) => candidate.props.id === label.props.htmlFor)[0];
 }
 
 function resolveTree(node) {
@@ -207,4 +216,183 @@ assert.ok(source.includes("placeholder: '/run/secrets/pve_key'"),
 assert.ok(source.includes('0 = unlimited'));
 assert.equal(source.includes('0 = inherit global'), false);
 
-console.log('ALL WAVE 39 UI TESTS PASSED');
+assert.ok(window.ImageUI, 'images.js must export window.ImageUI');
+const { checksumMeta } = window.ImageUI;
+assert.equal(typeof checksumMeta, 'function');
+
+assert.deepEqual(JSON.parse(JSON.stringify(checksumMeta('  '))), {
+  normalized: '', valid: true, algorithm: 'Optional', message: 'Optional',
+});
+for (const [length, algorithm] of [
+  [32, 'MD5'], [40, 'SHA-1'], [64, 'SHA-256'], [96, 'SHA-384'], [128, 'SHA-512'],
+]) {
+  const meta = JSON.parse(JSON.stringify(checksumMeta(`  ${'A'.repeat(length)}\t`)));
+  assert.equal(meta.normalized, 'a'.repeat(length));
+  assert.equal(meta.valid, true);
+  assert.equal(meta.algorithm, algorithm);
+  assert.match(meta.message, new RegExp(algorithm.replace('-', '[-]?')));
+}
+for (const malformed of [
+  'f'.repeat(31),
+  'g'.repeat(32),
+  `${'a'.repeat(16)} ${'a'.repeat(16)}`,
+  `sha256:${'a'.repeat(64)}`,
+]) {
+  const meta = checksumMeta(malformed);
+  assert.equal(meta.valid, false, `${malformed.slice(0, 16)} must be invalid`);
+  assert.match(meta.message, /hexadecimal/i);
+  assert.match(meta.message, /32.*40.*64.*96.*128/);
+}
+
+function imageModalHarness(img) {
+  const state = [];
+  let cursor = 0;
+  let generatedId = 0;
+  const apiCalls = [];
+  const toasts = [];
+  const ModalReact = {
+    createElement: React.createElement,
+    useState(initial) {
+      const index = cursor++;
+      if (!Object.hasOwn(state, index)) {
+        state[index] = typeof initial === 'function' ? initial() : initial;
+      }
+      return [state[index], (value) => {
+        state[index] = typeof value === 'function' ? value(state[index]) : value;
+      }];
+    },
+    useId() {
+      const index = cursor++;
+      if (!Object.hasOwn(state, index)) state[index] = `:image-${generatedId++}:`;
+      return state[index];
+    },
+    useRef(initial) { return { current: initial }; },
+    useEffect() {},
+  };
+  const modalWindow = {
+    React: ModalReact,
+    Icon() {},
+    GD: {},
+    GDStore: {
+      refresh() { return Promise.resolve(); },
+      toast(message, tone) { toasts.push({ message, tone }); },
+    },
+    API: {
+      addBaseImage(payload) { apiCalls.push({ action: 'add', payload }); return Promise.resolve(); },
+      editImage(id, payload) { apiCalls.push({ action: 'edit', id, payload }); return Promise.resolve(); },
+    },
+    UI: {
+      OSGlyph() {}, Menu() {}, ConfirmModal() {},
+      FormModal(props) {
+        return ModalReact.createElement('form', {
+          onSubmit: props.onSubmit, busy: props.busy, 'aria-label': props.title,
+        }, props.children);
+      },
+      Field(props) {
+        return ModalReact.createElement('input', {
+          'aria-label': props.label,
+          value: props.value,
+          onChange: (event) => props.onChange(event.target.value),
+        });
+      },
+      SelectField(props) {
+        return ModalReact.createElement('select', {
+          'aria-label': props.label,
+          value: props.value,
+          onChange: (event) => props.onChange(event.target.value),
+        });
+      },
+      useFetched() { return { online: false, cached: {} }; },
+    },
+  };
+  vm.runInNewContext(imagesSource, { React: ModalReact, window: modalWindow }, {
+    filename: 'web/images.js',
+  });
+
+  function render() {
+    cursor = 0;
+    return resolveTree(modalWindow.ImageUI.IsoModal({
+      img,
+      onClose() {},
+      onDone() {},
+    }));
+  }
+
+  function renderIsos() {
+    cursor = 0;
+    return resolveTree(modalWindow.Isos({ go() {} }));
+  }
+
+  return { render, renderIsos, gd: modalWindow.GD, apiCalls, toasts };
+}
+
+const cardHarness = imageModalHarness(null);
+Object.assign(cardHarness.gd, {
+  me: { isAdmin: false },
+  BASE_IMAGES: [{
+    id: 'img-legacy', imgId: 391, name: 'Legacy image', os: 'generic', size: '',
+    source_url: '', checksum: '',
+  }],
+  CONNECTIONS: [],
+  JOBS: [],
+});
+const legacyImageCard = cardHarness.renderIsos();
+const legacySource = findAll(legacyImageCard,
+  (node) => node.props.className === 'copy mono')[0];
+assert.equal(textOf(legacySource), 'Not provided',
+  'the UI, rather than the serializer, must own friendly empty source copy');
+
+async function testIsoModalChecksumSubmission() {
+  const validHarness = imageModalHarness(null);
+  let tree = validHarness.render();
+  const byLabel = (label) => findAll(tree, (node) => node.props['aria-label'] === label)[0];
+  byLabel('Name').props.onChange({ target: { value: 'Checksum image' } });
+  byLabel('Cloud image URL (.img/.qcow2)').props.onChange({
+    target: { value: 'https://example.com/base.img' },
+  });
+  controlForLabel(tree, 'Checksum (optional)').props.onChange({
+    target: { value: `  ${'A'.repeat(64)}\t` },
+  });
+  tree = validHarness.render();
+  const checksumInput = controlForLabel(tree, 'Checksum (optional)');
+  const checksumLabel = findAll(tree, (node) => node.type === 'label'
+    && textOf(node) === 'Checksum (optional)')[0];
+  const feedback = findAll(tree, (node) => node.props.id === checksumInput.props['aria-describedby'])[0];
+  assert.ok(checksumInput.props.id, 'checksum control needs a stable id');
+  assert.equal(checksumLabel.props.htmlFor, checksumInput.props.id);
+  assert.equal(checksumInput.props['aria-invalid'], false);
+  assert.ok(feedback, 'checksum input must reference nearby feedback');
+  assert.equal(feedback.props['aria-live'], 'polite');
+  assert.match(textOf(feedback), /SHA-256/);
+  const validForm = findAll(tree, (node) => node.type === 'form')[0];
+  await validForm.props.onSubmit();
+  assert.equal(validHarness.apiCalls.length, 1);
+  assert.equal(validHarness.apiCalls[0].action, 'add');
+  assert.equal(validHarness.apiCalls[0].payload.checksum, 'a'.repeat(64));
+
+  const invalidHarness = imageModalHarness({
+    imgId: 39,
+    name: 'Existing image',
+    os: 'ubuntu',
+    source_url: 'https://example.com/existing.img',
+    checksum: `sha256:${'b'.repeat(64)}`,
+  });
+  const invalidTree = invalidHarness.render();
+  const invalidInput = controlForLabel(invalidTree, 'Checksum (optional)');
+  const invalidFeedback = findAll(invalidTree,
+    (node) => node.props.id === invalidInput.props['aria-describedby'])[0];
+  assert.equal(invalidInput.props.value, `sha256:${'b'.repeat(64)}`,
+    'edit state must preserve the stored checksum for correction');
+  assert.equal(invalidInput.props['aria-invalid'], true);
+  assert.match(textOf(invalidFeedback), /hexadecimal/i);
+  await findAll(invalidTree, (node) => node.type === 'form')[0].props.onSubmit();
+  assert.equal(invalidHarness.apiCalls.length, 0,
+    'known-invalid checksum must return before calling the API');
+}
+
+testIsoModalChecksumSubmission().then(() => {
+  console.log('ALL WAVE 39 UI TESTS PASSED');
+}).catch((error) => {
+  console.error(error);
+  process.exitCode = 1;
+});
