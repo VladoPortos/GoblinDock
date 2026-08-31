@@ -149,8 +149,9 @@ def validate_public_sensitive_inputs(
     ``schemas_by_ref`` contains immutable schema lists keyed by block reference. During
     cross-owner admission, a sensitive ask-on-deploy field must have an answer at its
     exact placement address; the merged recipe value is then deployer-supplied and may
-    be literal. Non-ask sensitive values may only be blank or a deployer-scoped secret
-    reference. Error messages intentionally contain block/field names only.
+    be literal. A stored sensitive value may be blank only when that exact field is
+    ask-on-deploy; otherwise it must be a deployer-scoped secret reference. Error
+    messages intentionally contain block/field names only.
     """
     schemas_by_ref = schemas_by_ref if isinstance(schemas_by_ref, dict) else {}
     deploy_inputs = deploy_inputs if isinstance(deploy_inputs, dict) else {}
@@ -199,7 +200,9 @@ def validate_public_sensitive_inputs(
                         )
                     continue
                 value = inputs.get(name)
-                if value in (None, "") or is_deployer_secret_ref(value):
+                if is_deployer_secret_ref(value):
+                    continue
+                if value in (None, "") and name in asks:
                     continue
                 raise ValueError(
                     f"block {ref!r} field {name!r} must use ask-on-deploy "
@@ -422,6 +425,38 @@ _ALLOWED_INPUT_TYPES = {
 _INPUT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def input_schema_problems(schema, *, require_type=False) -> list[str]:
+    """Return authoritative structural/name/type problems for one input schema."""
+    if not isinstance(schema, list):
+        return ["input schema must be a list of fields"]
+    problems: list[str] = []
+    seen: set[str] = set()
+    for i, field in enumerate(schema):
+        if not isinstance(field, dict):
+            problems.append(f"input field #{i + 1} must be an object")
+            continue
+        name = field.get("name")
+        if not isinstance(name, str) or not name.strip():
+            problems.append(f"input field #{i + 1} is missing a name")
+            continue
+        if not _INPUT_NAME_RE.fullmatch(name):
+            problems.append(
+                f"input name {name!r} must start with a letter/underscore and use "
+                "only letters, digits or underscores"
+            )
+        if name in seen:
+            problems.append(f"duplicate input name {name!r}")
+        seen.add(name)
+        field_type = field.get("type")
+        if field_type is None and require_type:
+            problems.append(f"input {name!r} is missing a type")
+        elif field_type is not None and (not isinstance(field_type, str) or not field_type):
+            problems.append(f"input {name!r} has an invalid type")
+        elif field_type is not None and field_type not in _ALLOWED_INPUT_TYPES:
+            problems.append(f"input {name!r} has unknown type {field_type!r}")
+    return problems
+
+
 def _lint_sample(field: dict):
     """A representative sample value for a schema field, used only to render the
     template during a dry-run (never executed)."""
@@ -461,25 +496,7 @@ def lint_block(phase: str, input_schema, ansible_template: str,
     if not isinstance(schema, list):
         return ["input schema must be a list of fields"]
 
-    seen: set[str] = set()
-    for i, f in enumerate(schema):
-        if not isinstance(f, dict):
-            problems.append(f"input field #{i + 1} must be an object")
-            continue
-        name = f.get("name")
-        if not isinstance(name, str) or not name.strip():
-            problems.append(f"input field #{i + 1} is missing a name")
-            continue
-        if not _INPUT_NAME_RE.fullmatch(name):
-            problems.append(
-                f"input name {name!r} must start with a letter/underscore and use "
-                "only letters, digits or underscores")
-        if name in seen:
-            problems.append(f"duplicate input name {name!r}")
-        seen.add(name)
-        t = f.get("type")
-        if t is not None and t not in _ALLOWED_INPUT_TYPES:
-            problems.append(f"input {name!r} has unknown type {t!r}")
+    problems.extend(input_schema_problems(schema))
 
     phase = "cloudinit" if phase == "cloudinit" else "ansible"
     active_tmpl = cloudinit_template if phase == "cloudinit" else ansible_template

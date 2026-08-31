@@ -237,7 +237,11 @@ def _row_counts(session):
 def test_public_literal_is_rejected_without_echo():
     fixture = _sensitive_fixture()
     for field, value in (("password", "DO-NOT-ECHO"), ("token", "TOKEN-NOT-ECHO")):
-        inputs = {"password": "", "token": "", "note": "public"}
+        inputs = {
+            "password": "{{ secrets.DEPLOY_PASSWORD }}",
+            "token": "{{ secrets.DEPLOY_TOKEN }}",
+            "note": "public",
+        }
         inputs[field] = value
         exc = _expect_http(400, lambda inputs=inputs: _save(
             fixture, public=True,
@@ -270,6 +274,46 @@ def test_public_ask_and_exact_deployer_secret_references_are_allowed():
     ))
     assert "password" in str(exc.detail)
     assert "DEPLOY_KEY" not in str(exc.detail)
+
+
+def test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit():
+    fixture = _sensitive_fixture()
+    for field in ("password", "token"):
+        values = {
+            "password": "{{ secrets.DEPLOY_PASSWORD }}",
+            "token": "{{ secrets.DEPLOY_TOKEN }}",
+        }
+        values[field] = ""
+        exc = _expect_http(400, lambda values=values: _save(
+            fixture, public=True,
+            recipe=_recipe(fixture["block"], **values),
+        ))
+        assert field in str(exc.detail)
+        assert "DEPLOY_" not in str(exc.detail)
+
+    safe_recipe = _recipe(
+        fixture["block"], password="", token="{{ secrets.DEPLOY_TOKEN }}",
+        ask=["password"],
+    )
+    assert _save(fixture, public=True, recipe=safe_recipe)["ok"]
+    with session_scope() as s:
+        template = s.exec(select(Template).where(
+            Template.owner_id == fixture["author"],
+            Template.name == "w38-sensitive-template",
+        ).order_by(Template.id.desc())).first()
+        exc = _expect_http(400, lambda: api.edit_template_ep(
+            template.id,
+            _body(
+                fixture, public=True,
+                recipe=_recipe(
+                    fixture["block"], password="",
+                    token="{{ secrets.DEPLOY_TOKEN }}",
+                ),
+            ),
+            user=s.get(User, fixture["author"]), session=s,
+        ))
+        assert "password" in str(exc.detail)
+        assert "DEPLOY_TOKEN" not in str(exc.detail)
 
 
 def test_public_edit_rejects_literal_but_private_and_owner_paths_remain_allowed():
@@ -335,6 +379,56 @@ def test_cross_owner_imported_literal_is_rejected_before_any_rows_are_inserted()
         assert _row_counts(s) == before
 
 
+def test_cross_owner_blank_sensitive_without_ask_is_rejected_before_persistence():
+    fixture = _sensitive_fixture()
+    template_id = _insert_template(
+        fixture,
+        _recipe(
+            fixture["block"], password="", token="{{ secrets.DEPLOY_TOKEN }}",
+        ),
+    )
+    with Session(engine) as s:
+        before = _row_counts(s)
+        exc = _expect_http(409, lambda: api.deploy(
+            api.DeployBody(templateId=template_id, name="w38-blank-no-ask"),
+            user=s.get(User, fixture["deployer"]), session=s,
+        ))
+        assert "password" in str(exc.detail)
+        assert "DEPLOY_TOKEN" not in str(exc.detail)
+        assert _row_counts(s) == before
+
+
+def test_cross_owner_malformed_snapshot_schemas_fail_before_persistence():
+    malformed_schemas = (
+        [{"name": "credential", "type": "secrett"}],
+        [{"type": "secret"}],
+        [{"name": "bad-name", "type": "secret"}],
+        [{"name": "credential"}],
+        [{"name": "credential", "type": ["secret"]}],
+    )
+    for schema in malformed_schemas:
+        fixture = _sensitive_fixture()
+        with session_scope() as s:
+            block = s.exec(select(Block).where(Block.key == fixture["block"])).one()
+            block.input_schema_json = json.dumps(schema)
+            s.add(block)
+        sentinel = "MALFORMED-SCHEMA-MUST-NOT-RUN"
+        template_id = _insert_template(
+            fixture,
+            [{"blocks": [{
+                "ref": fixture["block"], "inputs": {"credential": sentinel},
+            }]}],
+        )
+        with Session(engine) as s:
+            before = _row_counts(s)
+            exc = _expect_http(409, lambda: api.deploy(
+                api.DeployBody(templateId=template_id, name="w38-malformed-schema"),
+                user=s.get(User, fixture["deployer"]), session=s,
+            ))
+            assert sentinel not in str(exc.detail)
+            assert _row_counts(s) == before
+
+
 def test_cross_owner_unknown_block_is_rejected_before_any_rows_are_inserted():
     fixture = _sensitive_fixture()
     unknown_value = "UNKNOWN-BLOCK-PRIVATE-VALUE"
@@ -383,14 +477,42 @@ def test_unknown_legacy_block_masks_all_nonempty_inputs():
         }
 
 
+def test_unknown_ref_less_block_masks_all_nonempty_inputs():
+    for placed in (
+        {"inputs": {"token": "literal", "empty": ""}},
+        {"ref": "", "inputs": {"token": "literal", "empty": ""}},
+    ):
+        fixture = _sensitive_fixture()
+        recipe = [{"blocks": [placed]}]
+        template_id = _insert_template(fixture, recipe)
+        with Session(engine) as s:
+            template = s.get(Template, template_id)
+            masked = S.template_dict(
+                s, template, viewer=s.get(User, fixture["deployer"]),
+            )["recipe"]
+            owner_recipe = S.template_dict(
+                s, template, viewer=s.get(User, fixture["author"]),
+            )["recipe"]
+        assert masked[0]["blocks"][0]["inputs"] == {
+            "token": "********", "empty": "",
+        }
+        assert owner_recipe[0]["blocks"][0]["inputs"] == {
+            "token": "literal", "empty": "",
+        }
+
+
 if __name__ == "__main__":
     test_seed_migrates_b_ssh_before_pruning()
     test_public_literal_is_rejected_without_echo()
     test_public_ask_and_exact_deployer_secret_references_are_allowed()
+    test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit()
     test_public_edit_rejects_literal_but_private_and_owner_paths_remain_allowed()
     test_cross_owner_missing_sensitive_ask_answer_cannot_fallback_to_author_value()
     test_cross_owner_imported_literal_is_rejected_before_any_rows_are_inserted()
+    test_cross_owner_blank_sensitive_without_ask_is_rejected_before_persistence()
+    test_cross_owner_malformed_snapshot_schemas_fail_before_persistence()
     test_cross_owner_unknown_block_is_rejected_before_any_rows_are_inserted()
     test_cross_owner_sensitive_ask_answer_and_exact_ref_deploy()
     test_unknown_legacy_block_masks_all_nonempty_inputs()
+    test_unknown_ref_less_block_masks_all_nonempty_inputs()
     print("\nALL WAVE 38 UNIT TESTS PASSED")

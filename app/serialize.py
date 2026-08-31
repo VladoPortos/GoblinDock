@@ -278,9 +278,8 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
     which redacts both types from job logs."""
     refs = {b.get("ref") for sec in recipe if isinstance(sec, dict)
             for b in (sec.get("blocks") or []) if isinstance(b, dict) and b.get("ref")}
-    if not refs:
-        return recipe
-    blocks = {b.key: b for b in session.exec(select(Block).where(Block.key.in_(refs))).all()}
+    blocks = ({b.key: b for b in session.exec(
+        select(Block).where(Block.key.in_(refs))).all()} if refs else {})
     masked = json.loads(json.dumps(recipe))
     for sec in masked:
         for b in (sec.get("blocks") or []) if isinstance(sec, dict) else []:

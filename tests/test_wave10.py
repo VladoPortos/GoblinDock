@@ -482,7 +482,8 @@ def test_password_input_type():
     rec2 = [{"id": "s-conf", "name": "Configure", "blocks": [
         {"ref": "b-user", "name": "Create User",
          "inputs": {"user": "deploy", "groups": ["sudo"], "shell": "/bin/bash",
-                    "password": "", "ssh_password_login": False}, "ask": ["password"]},
+                    "password": "", "public_key": "{{ secrets.SSH_PUBLIC_KEY }}",
+                    "ssh_password_login": False}, "ask": ["password"]},
     ]}]
     with session_scope() as s:
         t = Template(name="t10-pw-" + os.urandom(2).hex(), recipe_json=json.dumps(rec2),

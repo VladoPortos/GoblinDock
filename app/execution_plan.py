@@ -12,7 +12,7 @@ from typing import Optional
 from sqlmodel import Session, select
 
 from .models import Block, Template
-from .recipes import load_recipe, merge_deploy_inputs
+from .recipes import input_schema_problems, load_recipe, merge_deploy_inputs
 from .security import decrypt, encrypt
 
 
@@ -94,7 +94,7 @@ def _validate_plan(plan: object) -> dict:
             schema = json.loads(snapshot["input_schema_json"] or "[]")
         except (json.JSONDecodeError, TypeError):
             _invalid()
-        if not isinstance(schema, list) or not all(isinstance(field, dict) for field in schema):
+        if input_schema_problems(schema, require_type=True):
             _invalid()
         derived_sensitive[key] = sorted({
             field.get("name") for field in schema

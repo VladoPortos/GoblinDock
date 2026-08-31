@@ -59,7 +59,10 @@ def _mk_plan_fixture(command: str) -> tuple[int, int, str]:
         s.add(Block(
             key=block_key, kind="custom", builtin=False, owner_id=user.id,
             name="mutable block", phase="ansible",
-            input_schema_json='[{"name":"command"},{"name":"hostname"}]',
+            input_schema_json=(
+                '[{"name":"command","type":"text"},'
+                '{"name":"hostname","type":"text"}]'
+            ),
             ansible_template=f"- name: {command}\\n  ansible.builtin.debug: {{ msg: {{{{ command }}}} }}",
         ))
         s.flush()

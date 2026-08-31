@@ -46,6 +46,7 @@ from .proxmox import Proxmox, base_disk_filename
 from .recipes import (
     ask_map,
     compile_playbook,
+    input_schema_problems,
     lint_block,
     load_recipe,
     validate_public_sensitive_inputs,
@@ -716,7 +717,7 @@ def _validate_cross_owner_execution_plan(plan: dict) -> None:
     try:
         for ref, snapshot in plan["blocks"].items():
             schema = json.loads(snapshot["input_schema_json"] or "[]")
-            if not isinstance(schema, list):
+            if input_schema_problems(schema, require_type=True):
                 raise ValueError
             schemas_by_ref[ref] = schema
     except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
@@ -1545,7 +1546,7 @@ def _validate_public_recipe_sensitive_inputs(session: Session, recipe: list) -> 
             schema = json.loads(block.input_schema_json or "[]")
         except (json.JSONDecodeError, TypeError):
             continue
-        if isinstance(schema, list):
+        if not input_schema_problems(schema, require_type=True):
             schemas_by_ref[block.key] = schema
     try:
         validate_public_sensitive_inputs(
