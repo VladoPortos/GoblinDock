@@ -126,6 +126,32 @@ def test_job_detail_does_not_disclose_execution_plan_or_captured_command():
     assert "private-command" not in rendered
 
 
+def test_cleanup_pending_serialization_preserves_owned_identity_and_error():
+    """Cleanup ownership must stay visible and must not be overwritten by a live status probe."""
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        user = User(email=f"cleanup-{suffix}@example.com", name="cleanup",
+                    password_hash=hash_password("StrongPass12!"))
+        conn = Connection(name=f"cleanup-{suffix}", host="pve", token_id="u@pve!token", node="pve")
+        s.add(user); s.add(conn); s.flush()
+        dep = Deployment(name=f"cleanup-{suffix}", owner_id=user.id, connection_id=conn.id,
+                         node="pve", vmid=8370, ip="10.37.0.70", status="cleanup_pending",
+                         error="cleanup not confirmed")
+        s.add(dep); s.flush()
+
+        class _Px:
+            def vm_current(self, vmid, node):
+                raise AssertionError("cleanup_pending must not be live-probed")
+
+        out = S.vm_dict(s, dep, user, {conn.id: _Px()}, {user.id: user}, {conn.id: conn},
+                        active_jobs={})
+
+    assert out["status"] == "cleanup_pending"
+    assert out["vmid"] == 8370
+    assert out["ip"] == "10.37.0.70"
+    assert out["err"] == "cleanup not confirmed"
+
+
 def test_legacy_queued_job_persists_execution_plan_once():
     """A pre-snapshot queued job must be upgraded to a persisted plan before execution."""
     uid, template_id, block_key = _mk_plan_fixture(command="legacy-command")
@@ -414,6 +440,7 @@ if __name__ == "__main__":
     test_execution_plan_is_encrypted_and_immutable()
     test_execution_plan_rejects_malformed_ciphertext()
     test_job_detail_does_not_disclose_execution_plan_or_captured_command()
+    test_cleanup_pending_serialization_preserves_owned_identity_and_error()
     test_legacy_queued_job_persists_execution_plan_once()
     test_recipe_without_ssh_key_fails_before_vm_creation()
     test_recipe_free_deployment_uses_native_ciuser_without_snippet()

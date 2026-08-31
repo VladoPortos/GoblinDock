@@ -13,7 +13,7 @@ import threading
 import time
 import traceback
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlmodel import select
@@ -40,6 +40,7 @@ from .models import (
     Secret,
     User,
     Variable,
+    ensure_utc,
     utcnow,
 )
 from .proxmox import (
@@ -800,6 +801,9 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
             if isinstance(e, JobCancelled) or _vm_exists(px, dep.vmid, node):
                 raise
             ctx.log(f"[{_ts()}] {dep.name} (vmid {dep.vmid}) already absent — treating as destroyed", "l-warn")
+    presence, detail = _probe_vm_presence(px, dep.vmid, node)
+    if presence != VM_ABSENT:
+        raise RuntimeError(f"destroy cleanup requires confirmed VM absence: {detail}")
     ctx.log(f"[{_ts()}] ✓ destroyed {dep.name}", "l-ok")
     ctx.finish_step(st, t)
 
@@ -919,13 +923,32 @@ def _execute(job_id: int) -> None:
         traceback.print_exc()
 
 
-def _vm_exists(px: Proxmox, vmid: int, node: Optional[str]) -> bool:
-    """Is `vmid` still present on the node? On a listing failure assume it EXISTS
-    (fail safe) — a rebuild must never recreate over a possibly-live VM."""
+VM_PRESENT = "present"
+VM_ABSENT = "absent"
+VM_UNKNOWN = "unknown"
+
+
+def _probe_vm_presence(
+    px: Optional[Proxmox], vmid: Optional[int], node: Optional[str]
+) -> tuple[str, str]:
+    """Return tri-state Proxmox inventory truth without collapsing errors to absence."""
+    if vmid is None:
+        return VM_ABSENT, "VM ID was never assigned"
+    if px is None:
+        return VM_UNKNOWN, "Proxmox client unavailable"
     try:
-        return vmid in {int(v["vmid"]) for v in px.list_qemu(node)}
-    except Exception:  # noqa: BLE001
-        return True
+        present = vmid in {int(v["vmid"]) for v in px.list_qemu(node)}
+    except Exception as exc:  # noqa: BLE001
+        return VM_UNKNOWN, f"Proxmox inventory probe failed: {exc}"
+    if present:
+        return VM_PRESENT, f"VM {vmid} is present in Proxmox inventory"
+    return VM_ABSENT, f"VM {vmid} is absent from Proxmox inventory"
+
+
+def _vm_exists(px: Proxmox, vmid: int, node: Optional[str]) -> bool:
+    """Fail-safe compatibility helper used by rebuild's post-destroy check."""
+    state, _detail = _probe_vm_presence(px, vmid, node)
+    return state != VM_ABSENT
 
 
 def _px_for_conn(conn_id: Optional[int]) -> Optional[Proxmox]:
@@ -952,10 +975,27 @@ def _drop_deployment(dep_id: int) -> None:
             s.delete(d)
 
 
-def _set_dep_status(dep_id: int, status: str, error: str = "") -> None:
+def _drop_deployment_if_matches(
+    dep_id: int, vmid: Optional[int], required_status: Optional[str] = None
+) -> None:
+    """Drop only the same ownership record that was externally proven absent."""
     with session_scope() as s:
         d = s.get(Deployment, dep_id)
-        if d:
+        if not d or d.vmid != vmid or (required_status and d.status != required_status):
+            return
+        for allocation in s.exec(
+            select(IpAllocation).where(IpAllocation.deployment_id == dep_id)
+        ).all():
+            s.delete(allocation)
+        s.delete(d)
+
+
+def _set_dep_status(
+    dep_id: int, status: str, error: str, expected_vmid: Optional[int]
+) -> None:
+    with session_scope() as s:
+        d = s.get(Deployment, dep_id)
+        if d and d.vmid == expected_vmid:
             d.status = status
             d.error = error[:300] if error else ""
             s.add(d)
@@ -1017,24 +1057,7 @@ def _effective_disk_gb(resize_ok: bool, requested: int, actual: Optional[int]) -
 
 
 def _reconcile_canceled_job(job_id: Optional[int]) -> None:
-    """Leave a cancelled job's deployment consistent — reconciled against the VM's
-    ACTUAL Proxmox state, because a cancel can land after the (irreversible) destroy
-    task was already submitted, so we must never just assume the VM survived.
-
-    deploy  → nothing should survive: best-effort destroy any half-built VM, free the
-              IP reservation, and delete the deployment row ("undo").
-    rebuild
-    destroy → probe the VM:
-              • still present  → keep it + its IP; take the deployment out of "working"
-                so /state live-probes its real run state again (serialize.vm_dict skips
-                the probe while status == "working").
-              • gone, destroy  → the destroy effectively completed: free the IP and
-                delete the deployment row.
-              • gone, rebuild  → the old VM was removed before the recreate was
-                cancelled: mark the deployment "error" (rebuild again to recreate) and
-                KEEP its IP reservation so the retry reuses the same address.
-              If the VM's state can't be determined, fail safe = assume present (keep).
-    """
+    """Reconcile cancellation without releasing ownership on ambiguous inventory."""
     if not job_id:
         return
     with session_scope() as s:
@@ -1047,32 +1070,47 @@ def _reconcile_canceled_job(job_id: Optional[int]) -> None:
         job_type = job.type
         vmid, node, conn_id, dep_id = dep.vmid, dep.node, dep.connection_id, dep.id
 
-    if job_type == "deploy":
+    if job_type == "deploy" and vmid is not None:
         _best_effort_destroy(conn_id, vmid, node)
+
+    px = _px_for_conn(conn_id) if vmid is not None else None
+    presence, detail = _probe_vm_presence(px, vmid, node)
+
+    if presence == VM_ABSENT:
         _best_effort_delete_snippet(conn_id, vmid)
-        _drop_deployment(dep_id)
+        if job_type in ("deploy", "destroy"):
+            _drop_deployment_if_matches(dep_id, vmid)
+        else:
+            _set_dep_status(
+                dep_id,
+                "error",
+                "rebuild canceled after the old VM was removed — rebuild again to recreate",
+                expected_vmid=vmid,
+            )
         return
 
-    # rebuild / destroy: reconcile against ground truth
-    if vmid:
-        px = _px_for_conn(conn_id)
-        vm_present = _vm_exists(px, vmid, node) if px is not None else True
-    else:
-        vm_present = False   # nothing was ever provisioned
+    if presence == VM_PRESENT and job_type in ("rebuild", "destroy"):
+        _set_dep_status(dep_id, "stopped", "", expected_vmid=vmid)
+        return
 
-    if vm_present:
-        _set_dep_status(dep_id, "stopped")           # un-stick; live-probe corrects it
-    elif job_type == "destroy":
-        _drop_deployment(dep_id)                     # destroy effectively completed
-    else:  # rebuild whose old VM is gone, recreate cancelled
-        _set_dep_status(dep_id, "error",
-                        "rebuild canceled after the old VM was removed — rebuild again to recreate")
+    if job_type in ("deploy", "destroy"):
+        _set_dep_status(
+            dep_id,
+            "cleanup_pending",
+            f"canceled {job_type} cleanup not confirmed: {detail}",
+            expected_vmid=vmid,
+        )
+    else:
+        _set_dep_status(
+            dep_id,
+            "error",
+            f"rebuild canceled while VM presence is unknown: {detail}",
+            expected_vmid=vmid,
+        )
 
 
 def _reconcile_failed_job(job_id: int) -> None:
-    """Mark a failed job's deployment as errored. Only a failed DEPLOY produced no
-    surviving VM, so only it releases the IP reservation; a failed rebuild/destroy
-    leaves the existing VM (and therefore its reserved IP) in place."""
+    """Mark a failure visible while releasing ownership only on proven absence."""
     with session_scope() as s:
         job = s.get(Job, job_id)
         if not job or not job.deployment_id:
@@ -1080,12 +1118,73 @@ def _reconcile_failed_job(job_id: int) -> None:
         dep = s.get(Deployment, job.deployment_id)
         if not dep:
             return
+        job_type, job_error = job.type, job.error or ""
+        dep_id, conn_id, vmid, node = dep.id, dep.connection_id, dep.vmid, dep.node
+
+    px = _px_for_conn(conn_id) if vmid is not None else None
+    presence, _detail = _probe_vm_presence(px, vmid, node)
+
+    if presence == VM_ABSENT:
+        _best_effort_delete_snippet(conn_id, vmid)
+        if job_type == "destroy":
+            _drop_deployment_if_matches(dep_id, vmid)
+            return
+
+    with session_scope() as s:
+        dep = s.get(Deployment, dep_id)
+        if not dep or dep.vmid != vmid:
+            return
         dep.status = "error"
-        dep.error = (job.error or "")[:300]
+        dep.error = job_error[:300]
         s.add(dep)
-        if job.type == "deploy":
-            for a in s.exec(select(IpAllocation).where(IpAllocation.deployment_id == dep.id)).all():
-                s.delete(a)
+        if job_type == "deploy" and presence == VM_ABSENT:
+            for allocation in s.exec(
+                select(IpAllocation).where(IpAllocation.deployment_id == dep.id)
+            ).all():
+                s.delete(allocation)
+
+
+def _retry_cleanup_pending(now: Optional[datetime] = None) -> None:
+    """Retry ambiguous cleanup at most once per minute, outside DB transactions."""
+    attempt_at = ensure_utc(now) or utcnow()
+    cutoff = attempt_at - timedelta(seconds=60)
+    targets = []
+    with session_scope() as s:
+        deployments = s.exec(
+            select(Deployment).where(Deployment.status == "cleanup_pending")
+        ).all()
+        for dep in deployments:
+            last_attempt = ensure_utc(dep.cleanup_last_attempt_at)
+            if last_attempt is not None and last_attempt > cutoff:
+                continue
+            latest_job = s.exec(
+                select(Job).where(
+                    Job.deployment_id == dep.id, Job.status == "canceled"
+                ).order_by(Job.id.desc())
+            ).first()
+            dep.cleanup_last_attempt_at = attempt_at
+            s.add(dep)
+            targets.append(
+                (dep.id, dep.connection_id, dep.vmid, dep.node, latest_job.type if latest_job else "")
+            )
+
+    for dep_id, conn_id, vmid, node, job_type in targets:
+        if job_type == "deploy" and vmid is not None:
+            _best_effort_destroy(conn_id, vmid, node)
+        px = _px_for_conn(conn_id) if vmid is not None else None
+        presence, detail = _probe_vm_presence(px, vmid, node)
+        if presence == VM_ABSENT:
+            _best_effort_delete_snippet(conn_id, vmid)
+            _drop_deployment_if_matches(dep_id, vmid, required_status="cleanup_pending")
+        elif presence == VM_PRESENT and job_type == "destroy":
+            _set_dep_status(dep_id, "stopped", "", expected_vmid=vmid)
+        else:
+            _set_dep_status(
+                dep_id,
+                "cleanup_pending",
+                f"cleanup not confirmed: {detail}",
+                expected_vmid=vmid,
+            )
 
 
 def _reconcile_ips() -> None:
@@ -1115,6 +1214,7 @@ def _recover_orphans() -> None:
     """Crash recovery: a job left 'running' by a previous process is dead. Fail it AND
     reconcile the resource it was mutating — otherwise the deployment stays "working"
     forever (serialize skips live-polling 'working') and the image stays "building"."""
+    deployment_job_ids = []
     with session_scope() as s:
         for job in s.exec(select(Job).where(Job.status == "running")).all():
             job.status = "failed"
@@ -1122,24 +1222,15 @@ def _recover_orphans() -> None:
             job.finished_at = utcnow()
             s.add(job)
             if job.deployment_id:
-                dep = s.get(Deployment, job.deployment_id)
-                if dep and dep.status == "working":
-                    dep.status = "error"
-                    dep.error = "interrupted by restart"
-                    s.add(dep)
-                    # Only an interrupted initial deploy produced no stable VM identity.
-                    # Rebuild/destroy recovery keeps the live VM's reservation so it
-                    # cannot be handed to another deployment after a process restart.
-                    if job.type == "deploy":
-                        for a in s.exec(select(IpAllocation).where(
-                                IpAllocation.deployment_id == dep.id)).all():
-                            s.delete(a)
+                deployment_job_ids.append(job.id)
             if job.image_id:
                 img = s.get(Image, job.image_id)
                 if img and img.build_status == "building":
                     # keep template_vmid so an admin can identify and manually clean up the ghost on the node
                     img.build_status = "failed"
                     s.add(img)
+    for job_id in deployment_job_ids:
+        _reconcile_failed_job(job_id)
 
 
 def _loop() -> None:
@@ -1152,6 +1243,7 @@ def _loop() -> None:
                 idle += 1
                 if idle % 15 == 0:  # ~ every 15s while idle
                     _reconcile_ips()
+                    _retry_cleanup_pending()
                 time.sleep(1.0)
                 continue
             idle = 0

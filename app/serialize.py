@@ -120,7 +120,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     cpu_pct = 0
     ram_pct = 0
     uptime = "—"
-    if conn and dep.vmid and dep.status not in ("working", "error"):
+    if conn and dep.vmid and dep.status not in ("working", "error", "cleanup_pending"):
         px = px_cache.get(conn.id)
         if px:
             live = _live_status(px, dep.vmid, dep.node or conn.node)
@@ -151,6 +151,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     return {
         "id": f"vm-{dep.id}",
         "depId": dep.id,
+        "vmid": dep.vmid,
         "name": dep.name,
         "status": status,
         "ip": dep.ip or "—",
@@ -167,7 +168,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         "tags": dep.tags or "",
         "notes": dep.notes or "",
         **({"job": job_chip} if job_chip else {}),
-        **({"err": dep.error} if dep.status == "error" and dep.error else {}),
+        **({"err": dep.error} if dep.status in ("error", "cleanup_pending") and dep.error else {}),
     }
 
 

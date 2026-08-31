@@ -106,6 +106,82 @@ def _stub_px(record=None, present=()):
     return _Px
 
 
+def test_probe_vm_presence_distinguishes_present_absent_and_unknown():
+    """Inventory success may prove presence/absence; client and inventory failures may not."""
+    class _Px:
+        def __init__(self, inventory=None, error=None):
+            self.inventory = inventory
+            self.error = error
+
+        def list_qemu(self, node=None):
+            if self.error:
+                raise self.error
+            return [{"vmid": vmid} for vmid in self.inventory]
+
+    assert worker._probe_vm_presence(_Px([8101]), 8101, "pve")[0] == worker.VM_PRESENT
+    assert worker._probe_vm_presence(_Px([8100]), 8101, "pve")[0] == worker.VM_ABSENT
+    assert worker._probe_vm_presence(None, 8101, "pve")[0] == worker.VM_UNKNOWN
+    state, detail = worker._probe_vm_presence(_Px(error=RuntimeError("inventory down")), 8101, "pve")
+    assert state == worker.VM_UNKNOWN
+    assert "inventory down" in detail
+    assert worker._probe_vm_presence(None, None, "pve")[0] == worker.VM_ABSENT
+
+
+def test_failed_cancellation_keeps_ambiguous_vm_identity():
+    """A canceled deploy with unprovable cleanup must retain its VMID and allocation."""
+    cid = _mk_conn(); nid = _mk_net(cid)
+    did = _mk_dep_with_alloc(cid, nid, vmid=8102, status="working")
+    with session_scope() as s:
+        job = Job(type="deploy", status="canceled", deployment_id=did, connection_id=cid)
+        s.add(job); s.flush(); jid = job.id
+
+    class _UnknownPx:
+        node = "pve"
+        def __init__(self, conn): pass
+        def destroy(self, vmid, node=None): raise RuntimeError("destroy unavailable")
+        def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
+
+    saved = worker.Proxmox
+    worker.Proxmox = _UnknownPx
+    try:
+        worker._reconcile_canceled_job(jid)
+    finally:
+        worker.Proxmox = saved
+
+    with session_scope() as s:
+        dep = s.get(Deployment, did)
+        assert dep.status == "cleanup_pending"
+        assert dep.vmid == 8102
+    assert len(_allocs(did)) == 1
+
+
+def test_canceled_destroy_with_unknown_inventory_becomes_cleanup_pending():
+    """Destroy cancellation cannot claim the VM survived when inventory is unavailable."""
+    cid = _mk_conn(); nid = _mk_net(cid)
+    did = _mk_dep_with_alloc(cid, nid, vmid=8103, status="working")
+    with session_scope() as s:
+        job = Job(type="destroy", status="canceled", deployment_id=did, connection_id=cid)
+        s.add(job); s.flush(); jid = job.id
+
+    class _UnknownPx:
+        node = "pve"
+        def __init__(self, conn): pass
+        def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
+
+    saved = worker.Proxmox
+    worker.Proxmox = _UnknownPx
+    try:
+        worker._reconcile_canceled_job(jid)
+    finally:
+        worker.Proxmox = saved
+
+    with session_scope() as s:
+        dep = s.get(Deployment, did)
+        assert dep.status == "cleanup_pending"
+        assert dep.vmid == 8103
+    assert len(_allocs(did)) == 1
+
+
 # --------------------------------------------------------------------------- #
 # Finding 1 — cancellation reconciliation (HIGH)                               #
 # --------------------------------------------------------------------------- #
@@ -325,6 +401,37 @@ def test_run_destroy_idempotent_when_vm_already_gone():
     print("test_run_destroy_idempotent_when_vm_already_gone OK")
 
 
+def test_destroy_wait_success_retains_ownership_when_absence_is_unknown():
+    """A successful task wait is not inventory proof and must not release VM/IP ownership."""
+    cid = _mk_conn(); nid = _mk_net(cid)
+    did = _mk_dep_with_alloc(cid, nid, vmid=9404, status="working")
+    with session_scope() as s:
+        job = Job(type="destroy", status="running", deployment_id=did, connection_id=cid)
+        s.add(job); s.flush(); jid = job.id
+
+    class _Px:
+        node = "pve"
+        def __init__(self, conn): pass
+        def stop(self, vmid, node=None): return "UPID:stop"
+        def destroy(self, vmid, node=None): return "UPID:destroy"
+        def wait_task(self, *args, **kwargs): return None
+        def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
+
+    saved_px, saved_sleep = worker.Proxmox, worker.time.sleep
+    worker.Proxmox = _Px
+    worker.time.sleep = lambda *_args, **_kwargs: None
+    try:
+        worker._execute(jid)
+    finally:
+        worker.Proxmox, worker.time.sleep = saved_px, saved_sleep
+
+    with session_scope() as s:
+        assert s.get(Job, jid).status == "failed"
+        dep = s.get(Deployment, did)
+        assert dep is not None and dep.status == "error" and dep.vmid == 9404
+    assert len(_allocs(did)) == 1
+
+
 def test_execute_failure_deploy_frees_ip():
     """A FAILED (not cancelled) deploy produced no surviving VM → mark error + free IP
     (preserves existing behaviour)."""
@@ -499,6 +606,9 @@ def test_widget_summary_excludes_other_users_private_templates():
 
 
 if __name__ == "__main__":
+    test_probe_vm_presence_distinguishes_present_absent_and_unknown()
+    test_failed_cancellation_keeps_ambiguous_vm_identity()
+    test_canceled_destroy_with_unknown_inventory_becomes_cleanup_pending()
     test_cancel_queued_deploy_deletes_deployment()
     test_cancel_queued_rebuild_keeps_vm_and_ip()
     test_cancel_queued_destroy_keeps_vm_and_ip()
@@ -508,6 +618,7 @@ if __name__ == "__main__":
     test_execute_cancel_destroy_vm_gone_completes()
     test_execute_cancel_rebuild_vm_gone_errors()
     test_run_destroy_idempotent_when_vm_already_gone()
+    test_destroy_wait_success_retains_ownership_when_absence_is_unknown()
     test_execute_failure_deploy_frees_ip()
     test_execute_failure_rebuild_keeps_ip()
     test_vm_exists_helper()

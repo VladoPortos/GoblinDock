@@ -8,6 +8,7 @@ import sys
 import tempfile
 import threading
 import json
+from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -470,7 +471,7 @@ def test_concurrent_deploy_admission_cannot_exceed_quota():
     print("test_concurrent_deploy_admission_cannot_exceed_quota OK")
 
 
-def test_orphan_recovery_keeps_rebuild_and_destroy_ip_allocations():
+def test_orphan_recovery_keeps_allocations_until_absence_is_confirmed():
     with session_scope() as s:
         for index, job_type in enumerate(("deploy", "rebuild", "destroy"), start=1):
             dep = Deployment(name=f"orphan-{job_type}", status="working", vmid=8010 + index)
@@ -489,8 +490,61 @@ def test_orphan_recovery_keeps_rebuild_and_destroy_ip_allocations():
             dep = s.get(Deployment, allocation.deployment_id)
             if dep and dep.name.startswith("orphan-"):
                 remaining.add(dep.name)
-    assert remaining == {"orphan-rebuild", "orphan-destroy"}, remaining
-    print("test_orphan_recovery_keeps_rebuild_and_destroy_ip_allocations OK")
+    assert remaining == {"orphan-deploy", "orphan-rebuild", "orphan-destroy"}, remaining
+    print("test_orphan_recovery_keeps_allocations_until_absence_is_confirmed OK")
+
+
+def test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_absence():
+    """Unknown cleanup stays owned, a sub-minute retry is skipped, and later absence releases it."""
+    now = datetime(2026, 8, 31, 12, 0, tzinfo=timezone.utc)
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        conn = Connection(name=f"cleanup-{suffix}", host="pve", token_id="u@pve!token", node="pve")
+        s.add(conn); s.flush()
+        dep = Deployment(name=f"cleanup-{suffix}", connection_id=conn.id, node="pve",
+                         vmid=8360, status="cleanup_pending", error="cleanup not confirmed")
+        s.add(dep); s.flush()
+        s.add(IpAllocation(network_id=3660, ip="10.36.6.60", deployment_id=dep.id))
+        s.add(Job(type="destroy", status="canceled", deployment_id=dep.id,
+                  connection_id=conn.id))
+        dep_id = dep.id
+
+    attempts = []
+
+    class _Px:
+        node = "pve"
+        def __init__(self, conn): pass
+        def list_qemu(self, node=None):
+            with session_scope() as s:
+                stamped = s.get(Deployment, dep_id).cleanup_last_attempt_at
+                assert stamped is not None, "attempt timestamp must commit before Proxmox work"
+                attempts.append(stamped)
+            if len(attempts) == 1:
+                raise RuntimeError("inventory unavailable")
+            return []
+
+    saved = worker.Proxmox
+    worker.Proxmox = _Px
+    try:
+        worker._retry_cleanup_pending(now=now)
+        with session_scope() as s:
+            dep = s.get(Deployment, dep_id)
+            assert dep is not None and dep.status == "cleanup_pending"
+            assert len(s.exec(select(IpAllocation).where(
+                IpAllocation.deployment_id == dep_id)).all()) == 1
+
+        worker._retry_cleanup_pending(now=now + timedelta(seconds=59))
+        assert len(attempts) == 1, "cleanup newer than 60 seconds must be throttled"
+
+        worker._retry_cleanup_pending(now=now + timedelta(seconds=60))
+    finally:
+        worker.Proxmox = saved
+
+    assert len(attempts) == 2
+    with session_scope() as s:
+        assert s.get(Deployment, dep_id) is None
+        assert s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep_id)).all() == []
 
 
 def test_rebuild_admission_uses_deploy_allocation_lock():
@@ -771,7 +825,8 @@ if __name__ == "__main__":
     test_ansible_startup_exception_fails_phase()
     test_exhausted_static_pool_leaves_no_partial_deployment_or_job()
     test_concurrent_deploy_admission_cannot_exceed_quota()
-    test_orphan_recovery_keeps_rebuild_and_destroy_ip_allocations()
+    test_orphan_recovery_keeps_allocations_until_absence_is_confirmed()
+    test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_absence()
     test_rebuild_admission_uses_deploy_allocation_lock()
     test_template_write_rejects_malformed_recipe_shape()
     test_template_write_rejects_private_block_from_another_user()
