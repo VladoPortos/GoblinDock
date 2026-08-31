@@ -10,6 +10,7 @@ import re
 import socket
 import threading
 import time
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -1181,11 +1182,64 @@ def _ws_origin_ok(ws: WebSocket) -> bool:
     return origin.rstrip("/").lower() in allow
 
 
-async def _pump_ws(websocket: WebSocket, pve, prefer_bytes: bool) -> None:
+_CONSOLE_AUTH_INTERVAL_S = 3.0
+
+
+@dataclass(frozen=True)
+class _ConsoleGrant:
+    """Detached handshake authorization used by a live console bridge."""
+
+    conn: Connection
+    deployment: Deployment
+    user_id: int
+    session_epoch: int
+
+
+def _console_grant_still_valid(grant: _ConsoleGrant) -> bool:
+    """Re-read every mutable authorization input in a fresh DB session."""
+    try:
+        with Session(engine) as session:
+            user = session.get(User, grant.user_id)
+            dep = session.get(Deployment, grant.deployment.id)
+            return bool(
+                user
+                and not user.disabled
+                and user.session_epoch == grant.session_epoch
+                and dep
+                and (dep.owner_id == user.id or user.role == "admin")
+            )
+    except Exception:  # noqa: BLE001 -- authorization storage errors fail closed
+        return False
+
+
+async def _close_console_pair(websocket: WebSocket, pve, browser_code: int = 1000) -> None:
+    """Best-effort, repeat-safe close of both sides of a console bridge."""
+
+    async def close_browser():
+        try:
+            await websocket.close(code=browser_code)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def close_pve():
+        try:
+            await pve.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    await asyncio.gather(close_browser(), close_pve())
+
+
+async def _pump_ws(
+    websocket: WebSocket, pve, prefer_bytes: bool, grant: _ConsoleGrant,
+) -> None:
     """Pipe frames both ways between the browser WS and the Proxmox WS until either
     side closes. `prefer_bytes` picks which field of a Starlette message wins when
     both are present (the serial console is text-first, VNC is binary-first).
-    Shared by vm_console and vm_vnc."""
+    Authorization is periodically re-read and any task completing terminates the
+    whole bridge. Shared by vm_console and vm_vnc."""
+    stopping = asyncio.Event()
+    browser_close_code = 1000
 
     async def browser_to_pve():
         first, second = ("bytes", "text") if prefer_bytes else ("text", "bytes")
@@ -1193,39 +1247,71 @@ async def _pump_ws(websocket: WebSocket, pve, prefer_bytes: bool) -> None:
             while True:
                 m = await websocket.receive()
                 if m.get("type") == "websocket.disconnect":
-                    break
+                    return
                 payload = m.get(first) if m.get(first) is not None else m.get(second)
                 if payload is not None:
+                    if stopping.is_set():
+                        return
                     await pve.send(payload)
         except Exception:  # noqa: BLE001
             pass
         finally:
-            try:
-                await pve.close()
-            except Exception:  # noqa: BLE001
-                pass
+            stopping.set()
 
     async def pve_to_browser():
         try:
             async for data in pve:
+                if stopping.is_set():
+                    return
                 if isinstance(data, (bytes, bytearray)):
                     await websocket.send_bytes(bytes(data))
                 else:
                     await websocket.send_text(data)
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            stopping.set()
 
-    await asyncio.gather(browser_to_pve(), pve_to_browser())
+    async def monitor_authorization():
+        nonlocal browser_close_code
+        while not stopping.is_set():
+            try:
+                await asyncio.wait_for(
+                    stopping.wait(), timeout=_CONSOLE_AUTH_INTERVAL_S,
+                )
+                return
+            except TimeoutError:
+                if _console_grant_still_valid(grant):
+                    continue
+                browser_close_code = 4403
+                stopping.set()
+                await _close_console_pair(websocket, pve, browser_code=4403)
+                return
+
+    tasks = {
+        asyncio.create_task(browser_to_pve()),
+        asyncio.create_task(pve_to_browser()),
+        asyncio.create_task(monitor_authorization()),
+    }
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stopping.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _close_console_pair(websocket, pve, browser_code=browser_close_code)
 
 
 async def _ws_authorized_dep(websocket: WebSocket, dep_id: int):
     """Shared console-WS handshake guard: origin check + session auth + deployment
     ownership, all BEFORE accepting the upgrade — an unauthorized or cross-site peer
     is rejected at the HTTP layer and never completes the upgrade. Returns a detached
-    (conn, dep) pair, or (None, None) after closing the socket."""
+    frozen detached grant, or None after closing the socket."""
     if not _ws_origin_ok(websocket):
         await websocket.close(code=4403)
-        return None, None
+        return None
     uid = websocket.session.get("uid")
     with Session(engine) as s:
         user = s.get(User, uid) if uid else None
@@ -1233,14 +1319,18 @@ async def _ws_authorized_dep(websocket: WebSocket, dep_id: int):
         if (not user or user.disabled or websocket.session.get("sv", 0) != user.session_epoch
                 or not dep or (dep.owner_id != user.id and user.role != "admin")):
             await websocket.close(code=4403)
-            return None, None
+            return None
         c = s.get(Connection, dep.connection_id)
         conn = Connection(**c.model_dump()) if c else None
         dep = Deployment(**dep.model_dump())
+        grant = _ConsoleGrant(
+            conn=conn, deployment=dep, user_id=user.id,
+            session_epoch=user.session_epoch,
+        ) if conn else None
     if not conn:
         await websocket.close(code=4404)
-        return None, None
-    return conn, dep
+        return None
+    return grant
 
 
 async def _accept_binary(websocket: WebSocket) -> None:
@@ -1264,9 +1354,10 @@ async def vm_console(websocket: WebSocket, dep_id: int):
     """Bridge the browser's xterm to the VM's serial console. We open a Proxmox
     termproxy (authenticated with our API token, kept server-side) and pipe bytes;
     the browser only ever talks to GoblinDock."""
-    conn, dep = await _ws_authorized_dep(websocket, dep_id)
-    if not conn:
+    grant = await _ws_authorized_dep(websocket, dep_id)
+    if not grant:
         return
+    conn, dep = grant.conn, grant.deployment
     if not dep.vmid:
         await websocket.close(code=4403)
         return
@@ -1285,7 +1376,7 @@ async def vm_console(websocket: WebSocket, dep_id: int):
             px.console_ws_url(vmid, node, port, ticket), **_pve_ws_kwargs(px, conn),
         ) as pve:
             await pve.send(f"{puser}:{ticket}\n")
-            await _pump_ws(websocket, pve, prefer_bytes=False)
+            await _pump_ws(websocket, pve, prefer_bytes=False, grant=grant)
     except Exception as e:  # noqa: BLE001
         try:
             await websocket.send_text(f"\r\n[goblindock] console unavailable: {e}\r\n")
@@ -1363,9 +1454,10 @@ async def vm_vnc(websocket: WebSocket, dep_id: int):
     tok = websocket.query_params.get("t")
     sess = _VNC_SESS.pop(tok, None) if tok else None
     _sweep_vnc_sessions()   # clean any other abandoned tokens on each connect
-    conn, _dep = await _ws_authorized_dep(websocket, dep_id)
-    if not conn:
+    grant = await _ws_authorized_dep(websocket, dep_id)
+    if not grant:
         return
+    conn = grant.conn
     if not sess or sess.get("dep_id") != dep_id or sess.get("exp", 0) < time.time():
         await websocket.close(code=4403)
         return
@@ -1379,7 +1471,7 @@ async def vm_vnc(websocket: WebSocket, dep_id: int):
             px.console_ws_url(sess["vmid"], sess["node"], sess["port"], sess["ticket"]),
             **_pve_ws_kwargs(px, conn),
         ) as pve:
-            await _pump_ws(websocket, pve, prefer_bytes=True)
+            await _pump_ws(websocket, pve, prefer_bytes=True, grant=grant)
     except Exception:  # noqa: BLE001
         pass
     finally:

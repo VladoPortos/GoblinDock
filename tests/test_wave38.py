@@ -1,4 +1,5 @@
-"""Wave 38 — migrate persisted legacy b-ssh placements before block pruning."""
+"""Wave 38 — data-integrity and live-console revocation regressions."""
+import asyncio
 import json
 import os
 import sys
@@ -593,6 +594,304 @@ def test_unknown_ref_less_block_masks_all_nonempty_inputs():
         }
 
 
+# --------------------------------------------------------------------------- #
+# Live console authorization + coordinated pump shutdown                       #
+# --------------------------------------------------------------------------- #
+_CONSOLE_END = object()
+
+
+class _ConsoleBrowser:
+    """Starlette-WebSocket-shaped peer with observable close and relay effects."""
+
+    def __init__(self, *, late_on_cancel=False):
+        self._incoming = asyncio.Queue()
+        self._late_on_cancel = late_on_cancel
+        self._late_returned = False
+        self.receive_started = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.close_codes = []
+        self.sent = []
+
+    async def receive(self):
+        self.receive_started.set()
+        try:
+            return await self._incoming.get()
+        except asyncio.CancelledError:
+            # Model a real receive that wins the cancellation race and surfaces one
+            # already-buffered frame. The pump's stopping check must still suppress it.
+            if self._late_on_cancel and not self._late_returned:
+                self._late_returned = True
+                return {"type": "websocket.receive", "text": "late-browser-frame"}
+            raise
+
+    async def send_bytes(self, data):
+        self.sent.append(("bytes", data))
+
+    async def send_text(self, data):
+        self.sent.append(("text", data))
+
+    async def close(self, code=1000):
+        self.close_codes.append(code)
+        self.closed.set()
+
+    async def disconnect(self):
+        await self._incoming.put({"type": "websocket.disconnect"})
+
+
+class _ConsolePve:
+    """websockets-client-shaped peer with a controllable async iterator."""
+
+    def __init__(self, *, late_on_cancel=False):
+        self._incoming = asyncio.Queue()
+        self._late_on_cancel = late_on_cancel
+        self._late_returned = False
+        self.iter_started = asyncio.Event()
+        self.closed = asyncio.Event()
+        self.sent = []
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        self.iter_started.set()
+        try:
+            item = await self._incoming.get()
+        except asyncio.CancelledError:
+            if self._late_on_cancel and not self._late_returned:
+                self._late_returned = True
+                return b"late-pve-frame"
+            raise
+        if item is _CONSOLE_END:
+            raise StopAsyncIteration
+        return item
+
+    async def send(self, data):
+        self.sent.append(data)
+
+    async def close(self):
+        self.closed.set()
+
+    async def end(self):
+        await self._incoming.put(_CONSOLE_END)
+
+
+def _live_console_fixture(*, role="user", owns_deployment=True):
+    suffix = os.urandom(5).hex()
+    with session_scope() as s:
+        user = User(
+            email=f"w38-console-{suffix}@example.com", name="Console user",
+            password_hash=hash_password("StrongPass12!"), role=role, session_epoch=7,
+        )
+        other = User(
+            email=f"w38-console-other-{suffix}@example.com", name="Other owner",
+            password_hash=hash_password("StrongPass12!"),
+        )
+        s.add(user)
+        s.add(other)
+        s.flush()
+        conn = Connection(
+            name=f"w38-console-{suffix}", host="pve.example",
+            token_id="goblin@pve!console", node="pve",
+        )
+        s.add(conn)
+        s.flush()
+        dep = Deployment(
+            name=f"w38-console-vm-{suffix}",
+            owner_id=user.id if owns_deployment else other.id,
+            connection_id=conn.id, vmid=700, node="pve", status="running",
+        )
+        s.add(dep)
+        s.flush()
+        snapshot = {
+            "conn": Connection(**conn.model_dump()),
+            "deployment": Deployment(**dep.model_dump()),
+            "user_id": user.id,
+            "session_epoch": user.session_epoch,
+        }
+        fixture = {
+            "user_id": user.id, "other_id": other.id, "deployment_id": dep.id,
+        }
+
+    return api._ConsoleGrant(**snapshot), fixture
+
+
+def _pump_task(browser, pve, prefer_bytes, grant):
+    return asyncio.create_task(api._pump_ws(browser, pve, prefer_bytes, grant))
+
+
+async def _bounded_event(event, timeout):
+    waiter = asyncio.create_task(event.wait())
+    done, _pending = await asyncio.wait({waiter}, timeout=timeout)
+    if waiter not in done:
+        waiter.cancel()
+        await asyncio.gather(waiter, return_exceptions=True)
+        return False
+    return True
+
+
+async def _cleanup_console_task(task, browser, pve):
+    """Make a failed pre-fix pump settle without weakening its bounded assertion."""
+    if not task.done():
+        browser._late_on_cancel = False
+        pve._late_on_cancel = False
+        await browser.disconnect()
+        await pve.end()
+        done, _pending = await asyncio.wait({task}, timeout=0.2)
+        if task not in done:
+            task.cancel()
+            await asyncio.wait({task}, timeout=0.2)
+    if task.done():
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def _assert_revoked(mutate, prefer_bytes, *, role="user", owns_deployment=True):
+    grant, fixture = _live_console_fixture(
+        role=role, owns_deployment=owns_deployment,
+    )
+    browser = _ConsoleBrowser(late_on_cancel=True)
+    pve = _ConsolePve(late_on_cancel=True)
+    had_interval = hasattr(api, "_CONSOLE_AUTH_INTERVAL_S")
+    old_interval = getattr(api, "_CONSOLE_AUTH_INTERVAL_S", None)
+    api._CONSOLE_AUTH_INTERVAL_S = 0.01
+    task = _pump_task(browser, pve, prefer_bytes, grant)
+    try:
+        assert await _bounded_event(browser.receive_started, 0.2), "browser pump did not start"
+        assert await _bounded_event(pve.iter_started, 0.2), "PVE pump did not start"
+        mutate(fixture)
+        revoked_closed = await _bounded_event(browser.closed, 0.5)
+        done, _pending = await asyncio.wait({task}, timeout=0.5)
+        pump_stopped = task in done
+    finally:
+        await _cleanup_console_task(task, browser, pve)
+        if had_interval:
+            api._CONSOLE_AUTH_INTERVAL_S = old_interval
+        else:
+            del api._CONSOLE_AUTH_INTERVAL_S
+
+    assert revoked_closed, "revoked live console was not closed within 0.5s"
+    assert pump_stopped, "revoked live console pump did not terminate within 0.5s"
+    assert 4403 in browser.close_codes, browser.close_codes
+    assert pve.closed.is_set(), "revocation must close the Proxmox socket too"
+    assert browser.sent == [], "a PVE frame relayed after revocation began"
+    assert pve.sent == [], "a browser frame relayed after revocation began"
+
+
+def _for_serial_and_vnc(assertion):
+    for prefer_bytes in (False, True):
+        asyncio.run(assertion(prefer_bytes))
+
+
+def test_disabled_user_revokes_live_serial_and_vnc():
+    def mutate(fixture):
+        with session_scope() as s:
+            user = s.get(User, fixture["user_id"])
+            user.disabled = True
+            s.add(user)
+
+    _for_serial_and_vnc(lambda prefer: _assert_revoked(mutate, prefer))
+
+
+def test_deleted_user_revokes_live_serial_and_vnc():
+    def mutate(fixture):
+        with session_scope() as s:
+            s.delete(s.get(User, fixture["user_id"]))
+
+    _for_serial_and_vnc(lambda prefer: _assert_revoked(mutate, prefer))
+
+
+def test_epoch_change_revokes_live_serial_and_vnc():
+    def mutate(fixture):
+        with session_scope() as s:
+            user = s.get(User, fixture["user_id"])
+            user.session_epoch += 1
+            s.add(user)
+
+    _for_serial_and_vnc(lambda prefer: _assert_revoked(mutate, prefer))
+
+
+def test_admin_demotion_revokes_non_owner_live_serial_and_vnc():
+    def mutate(fixture):
+        with session_scope() as s:
+            user = s.get(User, fixture["user_id"])
+            user.role = "user"
+            s.add(user)
+
+    def assertion(prefer):
+        return _assert_revoked(
+            mutate, prefer, role="admin", owns_deployment=False,
+        )
+
+    _for_serial_and_vnc(assertion)
+
+
+def test_ownership_transfer_revokes_live_serial_and_vnc():
+    def mutate(fixture):
+        with session_scope() as s:
+            dep = s.get(Deployment, fixture["deployment_id"])
+            dep.owner_id = fixture["other_id"]
+            s.add(dep)
+
+    _for_serial_and_vnc(lambda prefer: _assert_revoked(mutate, prefer))
+
+
+def test_console_authorization_db_error_fails_closed():
+    def broken_session(*_args, **_kwargs):
+        raise RuntimeError("database unavailable")
+
+    original = api.Session
+    try:
+        api.Session = broken_session
+        _for_serial_and_vnc(
+            lambda prefer: _assert_revoked(lambda _fixture: None, prefer)
+        )
+    finally:
+        api.Session = original
+
+
+async def _assert_first_completion(prefer_bytes, first):
+    grant, _fixture = _live_console_fixture()
+    browser = _ConsoleBrowser()
+    pve = _ConsolePve()
+    task = _pump_task(browser, pve, prefer_bytes, grant)
+    try:
+        assert await _bounded_event(browser.receive_started, 0.2), "browser pump did not start"
+        assert await _bounded_event(pve.iter_started, 0.2), "PVE pump did not start"
+        if first == "pve":
+            await pve.end()
+        else:
+            await browser.disconnect()
+        done, _pending = await asyncio.wait({task}, timeout=0.5)
+        stopped = task in done
+        browser_closed = await _bounded_event(browser.closed, 0.1)
+        pve_closed = await _bounded_event(pve.closed, 0.1)
+    finally:
+        await _cleanup_console_task(task, browser, pve)
+
+    assert stopped, f"{first} first-completion left the opposite pump blocked"
+    assert browser_closed and pve_closed, "first completion must close both sockets"
+
+
+def test_pve_iterator_ending_first_terminates_serial_and_vnc():
+    _for_serial_and_vnc(
+        lambda prefer: _assert_first_completion(prefer, "pve")
+    )
+
+
+def test_browser_disconnect_ending_first_terminates_serial_and_vnc():
+    _for_serial_and_vnc(
+        lambda prefer: _assert_first_completion(prefer, "browser")
+    )
+
+
+def test_console_grant_is_a_frozen_snapshot():
+    grant, _fixture = _live_console_fixture()
+    try:
+        grant.user_id = -1
+    except (AttributeError, TypeError):
+        return
+    raise AssertionError("console grant snapshot must be frozen")
+
+
 if __name__ == "__main__":
     test_seed_migrates_b_ssh_before_pruning()
     test_custom_block_create_and_edit_canonicalize_omitted_type()
@@ -610,4 +909,13 @@ if __name__ == "__main__":
     test_cross_owner_sensitive_ask_answer_and_exact_ref_deploy()
     test_unknown_legacy_block_masks_all_nonempty_inputs()
     test_unknown_ref_less_block_masks_all_nonempty_inputs()
+    test_disabled_user_revokes_live_serial_and_vnc()
+    test_deleted_user_revokes_live_serial_and_vnc()
+    test_epoch_change_revokes_live_serial_and_vnc()
+    test_admin_demotion_revokes_non_owner_live_serial_and_vnc()
+    test_ownership_transfer_revokes_live_serial_and_vnc()
+    test_console_authorization_db_error_fails_closed()
+    test_pve_iterator_ending_first_terminates_serial_and_vnc()
+    test_browser_disconnect_ending_first_terminates_serial_and_vnc()
+    test_console_grant_is_a_frozen_snapshot()
     print("\nALL WAVE 38 UNIT TESTS PASSED")
