@@ -22,7 +22,7 @@ os.environ.setdefault("GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(),
 
 from sqlmodel import select                            # noqa: E402
 from app.db import init_db, session_scope             # noqa: E402
-from app import worker                                 # noqa: E402
+from app import api, worker                            # noqa: E402
 from app.models import (                               # noqa: E402
     Connection, Deployment, Image, IpAllocation, Job, Network, Template, User)
 from app.security import hash_password                 # noqa: E402
@@ -81,6 +81,48 @@ def _expect_http(code, fn):
         assert e.status_code == code, (e.status_code, e.detail)
         return e
     raise AssertionError(f"expected HTTPException {code}")
+
+
+def test_legacy_static_allocator_skips_reserved_ipv4_addresses():
+    """Legacy rows may contain network/gateway/broadcast slots; none are allocatable."""
+    cid = _mk_conn()
+    with session_scope() as s:
+        net = Network(
+            connection_id=cid, name="legacy-reserved-v4", mode="static",
+            subnet_cidr="10.0.50.0/24", gateway="10.0.50.1",
+            range_start="10.0.50.0", range_end="10.0.50.2",
+        )
+        dep = Deployment(name="legacy-reserved-v4", connection_id=cid)
+        s.add(net)
+        s.add(dep)
+        s.flush()
+        assert api.allocate_ip(s, net, dep.id) == "10.0.50.2"
+        allocations = s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep.id,
+        )).all()
+        assert [allocation.ip for allocation in allocations] == ["10.0.50.2"]
+    print("test_legacy_static_allocator_skips_reserved_ipv4_addresses OK")
+
+
+def test_ipv6_last_address_is_usable_and_static_reservation_is_reused():
+    """IPv6 has no broadcast slot, and rebuild-style calls keep the same reservation."""
+    cid = _mk_conn()
+    with session_scope() as s:
+        net = Network(
+            connection_id=cid, name="legacy-v6-tail", mode="static",
+            subnet_cidr="2001:db8:15::/120", gateway="2001:db8:15::1",
+            range_start="2001:db8:15::ff", range_end="2001:db8:15::ff",
+        )
+        dep = Deployment(name="legacy-v6-tail", connection_id=cid)
+        s.add(net)
+        s.add(dep)
+        s.flush()
+        assert api.allocate_ip(s, net, dep.id) == "2001:db8:15::ff"
+        assert api.allocate_ip(s, net, dep.id) == "2001:db8:15::ff"
+        assert len(s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep.id,
+        )).all()) == 1
+    print("test_ipv6_last_address_is_usable_and_static_reservation_is_reused OK")
 
 
 def _net_body(**kw):
@@ -608,6 +650,8 @@ def test_widget_summary_excludes_other_users_private_templates():
 
 
 if __name__ == "__main__":
+    test_legacy_static_allocator_skips_reserved_ipv4_addresses()
+    test_ipv6_last_address_is_usable_and_static_reservation_is_reused()
     test_probe_vm_presence_distinguishes_present_absent_and_unknown()
     test_failed_cancellation_keeps_ambiguous_vm_identity()
     test_canceled_destroy_with_unknown_inventory_becomes_cleanup_pending()

@@ -76,6 +76,55 @@ def _expect_raises(exc_type, fn):
     raise AssertionError(f"expected {exc_type.__name__}")
 
 
+def test_static_pool_parser_defensively_counts_and_skips_reserved_slots():
+    try:
+        from app import network_pool
+    except ImportError:
+        network_pool = None
+    assert network_pool is not None, "the static-pool parser module is missing"
+    pool = network_pool.parse_static_pool(
+        "2001:db8:38::/64", "2001:db8:38::", "2001:db8:38:0:ffff:ffff:ffff:ffff",
+        "2001:db8:38::1",
+    )
+    assert pool.usable_total == (1 << 64) - 2
+    usable = pool.iter_usable()
+    assert str(next(usable)) == "2001:db8:38::2"
+    assert pool.is_reserved(pool.network.network_address)
+    assert not pool.is_reserved(pool.network.broadcast_address), \
+        "IPv6's numerically last address is not a broadcast address"
+    _expect_raises(AttributeError, lambda: setattr(pool, "start", pool.end))
+
+
+def test_gatewayless_network_context_is_exact_and_static_capacity_fails_closed():
+    with Session(engine) as s:
+        network = Network(
+            connection_id=1, name="w38-gatewayless", mode="static",
+            subnet_cidr="10.38.50.0/24", gateway="",
+            range_start="10.38.50.10", range_end="10.38.50.10",
+        )
+        deployment = Deployment(name="w38-gatewayless")
+        s.add(network)
+        s.add(deployment)
+        s.flush()
+        ctx = api._network_ctx(s, network, deployment.id)
+        assert ctx["ipconfig0"] == "ip=10.38.50.10/24"
+        assert "gw=" not in ctx["ipconfig0"]
+
+    assert S._pool_total(Network(mode="dhcp")) == 254
+    assert S._pool_total(Network(
+        mode="static", subnet_cidr="10.38.60.0/24",
+        range_start="", range_end="",
+    )) == 0
+    assert S._pool_total(Network(
+        mode="static", subnet_cidr="not-a-subnet",
+        range_start="10.38.60.10", range_end="10.38.60.20",
+    )) == 0
+    assert S._pool_total(Network(
+        mode="static", subnet_cidr="10.38.60.0/24", gateway="10.38.60.1",
+        range_start="10.38.60.0", range_end="10.38.60.255",
+    )) == 253
+
+
 def _assert_valid_sqlite_backup(path):
     con = sqlite3.connect(str(path))
     try:
@@ -1082,6 +1131,8 @@ def test_console_grant_is_a_frozen_snapshot():
 
 
 if __name__ == "__main__":
+    test_static_pool_parser_defensively_counts_and_skips_reserved_slots()
+    test_gatewayless_network_context_is_exact_and_static_capacity_fails_closed()
     test_backup_verification_failure_preserves_published_listing_and_rotation()
     test_backup_replace_failure_preserves_published_listing_and_rotation()
     test_successful_backup_is_valid_secure_and_rotated_to_requested_count()

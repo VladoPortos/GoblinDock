@@ -26,6 +26,7 @@ from .db import engine, get_session
 from .execution_plan import build_execution_plan, seal_execution_plan
 from .deps import current_user, require_admin, widget_key_user
 from .netutil import client_ip, current_request_ip
+from .network_pool import StaticPool, StaticPoolError, parse_static_pool
 from .models import (
     Audit,
     Block,
@@ -221,10 +222,20 @@ def default_network_for(session: Session, conn: Connection, user_id) -> Network:
 _ip_alloc_lock = threading.Lock()
 
 
+def _static_pool(net: Network) -> StaticPool:
+    try:
+        return parse_static_pool(
+            net.subnet_cidr, net.range_start, net.range_end, net.gateway,
+        )
+    except StaticPoolError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 def allocate_ip(session: Session, net: Network, deployment_id: int) -> Optional[str]:
     """Static-pool allocation: next free IP in range, remembered on the deployment."""
-    if net.mode != "static" or not net.range_start:
+    if net.mode != "static":
         return None
+    pool = _static_pool(net)
     with _ip_alloc_lock:
         # reuse an existing reservation for this deployment (rebuild keeps the IP)
         existing = session.exec(select(IpAllocation).where(
@@ -233,14 +244,8 @@ def allocate_ip(session: Session, net: Network, deployment_id: int) -> Optional[
             return existing.ip
         taken = {a.ip for a in session.exec(select(IpAllocation).where(
             IpAllocation.network_id == net.id, IpAllocation.state == "reserved")).all()}
-        try:
-            start = ipaddress.ip_address(net.range_start)
-            end = ipaddress.ip_address(net.range_end or net.range_start)
-        except ValueError:
-            return None
-        cur = start
-        while int(cur) <= int(end):
-            ip = str(cur)
+        for address in pool.iter_usable():
+            ip = str(address)
             if ip not in taken:
                 session.add(IpAllocation(network_id=net.id, ip=ip,
                                          deployment_id=deployment_id, state="reserved"))
@@ -250,7 +255,6 @@ def allocate_ip(session: Session, net: Network, deployment_id: int) -> Optional[
                 # single-process runtime.
                 session.flush()
                 return ip
-            cur = cur + 1
         raise HTTPException(409, "static IP pool exhausted")
 
 
@@ -262,11 +266,13 @@ def _network_ctx(session: Session, net: Network, dep_id: int) -> dict:
     re-acquires the same address."""
     ctx: dict = {"network_mode": net.mode}
     if net.mode == "static":
-        ip = allocate_ip(session, net, dep_id)   # commits the reservation internally
-        if ip:
-            ctx["static_ip"] = ip
-            cidr = net.subnet_cidr.split("/")[-1] if "/" in (net.subnet_cidr or "") else "24"
-            ctx["ipconfig0"] = f"ip={ip}/{cidr},gw={net.gateway}"
+        pool = _static_pool(net)
+        ip = allocate_ip(session, net, dep_id)
+        ctx["static_ip"] = ip
+        ipconfig0 = f"ip={ip}/{pool.network.prefixlen}"
+        if pool.gateway is not None:
+            ipconfig0 += f",gw={pool.gateway}"
+        ctx["ipconfig0"] = ipconfig0
     if net.vlan:
         ctx["vlan"] = net.vlan
     if net.bridge:
@@ -2653,17 +2659,19 @@ def _validate_network_body(body: NetworkBody) -> None:
     if body.mode != "static":
         return
     try:
-        net = ipaddress.ip_network(body.subnet_cidr, strict=False)
-    except ValueError:
-        raise HTTPException(400, "a static network needs a valid subnet_cidr (e.g. 10.0.50.0/24)")
-    if body.gateway and _ip("gateway", body.gateway) not in net:
-        raise HTTPException(400, "gateway is outside the subnet")
-    if body.range_start or body.range_end:
-        start, end = _ip("range_start", body.range_start), _ip("range_end", body.range_end)
-        if start > end:
-            raise HTTPException(400, "range_start must be <= range_end")
-        if start not in net or end not in net:
-            raise HTTPException(400, "the IP range is outside the subnet")
+        pool = parse_static_pool(
+            body.subnet_cidr, body.range_start, body.range_end, body.gateway,
+        )
+    except StaticPoolError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    reserved = {pool.network.network_address}
+    if isinstance(pool.network, ipaddress.IPv4Network):
+        reserved.add(pool.network.broadcast_address)
+    if pool.gateway is not None:
+        reserved.add(pool.gateway)
+    if any(pool.start <= address <= pool.end for address in reserved):
+        raise HTTPException(400, "the static IP range contains a reserved address")
 
 
 @router.post("/networks")

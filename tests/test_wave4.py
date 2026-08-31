@@ -61,20 +61,38 @@ def _nb(**kw):
 def test_validate_network_body():
     api._validate_network_body(_nb())                       # valid → no raise
     api._validate_network_body(_nb(mode="dhcp", subnet_cidr=""))  # dhcp skips checks
+    api._validate_network_body(_nb(gateway=""))             # gateway is optional
+    api._validate_network_body(_nb(
+        subnet_cidr="2001:db8:50::/64", gateway="",
+        range_start="2001:db8:50::10", range_end="2001:db8:50::ffff",
+    ))
     bad = [
         _nb(subnet_cidr="not-a-cidr"),
         _nb(gateway="10.0.99.1"),                # outside subnet
+        _nb(gateway="2001:db8::1"),              # gateway family mismatch
+        _nb(range_start="", range_end=""),       # static needs a complete pool
+        _nb(range_start="10.0.50.10", range_end=""),
+        _nb(range_start="", range_end="10.0.50.20"),
+        _nb(range_start="2001:db8::10", range_end="2001:db8::20"),
         _nb(range_start="10.0.50.20", range_end="10.0.50.10"),   # reversed
         _nb(range_end="10.0.99.20"),             # range outside subnet
+        _nb(range_start="10.0.50.0", range_end="10.0.50.10"),    # network address
+        _nb(range_start="10.0.50.1", range_end="10.0.50.10"),    # gateway
+        _nb(range_start="10.0.50.250", range_end="10.0.50.255"), # IPv4 broadcast
         _nb(vlan=5000),                          # vlan out of range
         _nb(dns="1.1.1.1, notanip"),
     ]
+    failures = []
     for b in bad:
         try:
             api._validate_network_body(b)
-            assert False, f"expected reject for {b}"
         except HTTPException as e:
             assert e.status_code == 400
+        except Exception as exc:  # parser failures must cross the API as HTTP 400
+            failures.append(f"{b}: raised {type(exc).__name__}")
+        else:
+            failures.append(f"{b}: accepted")
+    assert not failures, "static validation failures:\n" + "\n".join(failures)
     print("test_validate_network_body OK")
 
 

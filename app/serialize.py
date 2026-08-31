@@ -28,6 +28,7 @@ from .models import (
     User,
     ensure_utc,
 )
+from .network_pool import StaticPoolError, parse_static_pool
 from .proxmox import Proxmox
 from .recipes import recipe_block_chips
 from .security import mask
@@ -437,13 +438,14 @@ def connection_public_dict(session: Session, c: Connection, status: Optional[dic
 
 
 def _pool_total(n: Network) -> int:
-    import ipaddress
-    if n.mode != "static" or not n.range_start:
+    if n.mode != "static":
         return 254
     try:
-        return int(ipaddress.ip_address(n.range_end or n.range_start)) - int(ipaddress.ip_address(n.range_start)) + 1
-    except ValueError:
-        return 254
+        return parse_static_pool(
+            n.subnet_cidr, n.range_start, n.range_end, n.gateway,
+        ).usable_total
+    except StaticPoolError:
+        return 0
 
 
 def network_dict(session: Session, n: Network, conn_name: dict, public: bool = False) -> dict:

@@ -426,6 +426,51 @@ def test_exhausted_static_pool_leaves_no_partial_deployment_or_job():
     print("test_exhausted_static_pool_leaves_no_partial_deployment_or_job OK")
 
 
+def _assert_bad_static_pool_admission_rolls_back(*, start, end, gateway, code):
+    uid = _mk_user("w36-bad-pool-" + os.urandom(3).hex() + "@example.com")
+    template_id, network_id = _mk_deployable_template(uid, static=True)
+    with session_scope() as s:
+        network = s.get(Network, network_id)
+        network.range_start = start
+        network.range_end = end
+        network.gateway = gateway
+        s.add(network)
+        before = tuple(len(s.exec(select(model)).all()) for model in (
+            Deployment, Job, IpAllocation,
+        ))
+
+    with Session(engine) as s:
+        exc = _expect_http(code, lambda: api.deploy(
+            api.DeployBody(templateId=template_id, name="bad-static-must-rollback"),
+            user=s.get(User, uid), session=s,
+        ))
+        if code == 409:
+            assert "exhausted" in str(exc.detail)
+
+    with session_scope() as s:
+        after = tuple(len(s.exec(select(model)).all()) for model in (
+            Deployment, Job, IpAllocation,
+        ))
+        assert after == before, (before, after)
+        assert not s.exec(select(Deployment).where(
+            Deployment.name == "bad-static-must-rollback",
+        )).first()
+
+
+def test_incomplete_static_pool_admission_is_400_and_rolls_back_every_row():
+    _assert_bad_static_pool_admission_rolls_back(
+        start="10.36.0.10", end="", gateway="10.36.0.1", code=400,
+    )
+    print("test_incomplete_static_pool_admission_is_400_and_rolls_back_every_row OK")
+
+
+def test_zero_usable_legacy_static_pool_is_409_and_rolls_back_every_row():
+    _assert_bad_static_pool_admission_rolls_back(
+        start="10.36.0.0", end="10.36.0.1", gateway="10.36.0.1", code=409,
+    )
+    print("test_zero_usable_legacy_static_pool_is_409_and_rolls_back_every_row OK")
+
+
 def test_concurrent_deploy_admission_cannot_exceed_quota():
     uid = _mk_user("w36-quota@example.com")
     template_id, _network_id = _mk_deployable_template(uid)
@@ -1005,6 +1050,8 @@ if __name__ == "__main__":
     test_worker_resource_clamp_honors_nonzero_limit()
     test_ansible_startup_exception_fails_phase()
     test_exhausted_static_pool_leaves_no_partial_deployment_or_job()
+    test_incomplete_static_pool_admission_is_400_and_rolls_back_every_row()
+    test_zero_usable_legacy_static_pool_is_409_and_rolls_back_every_row()
     test_concurrent_deploy_admission_cannot_exceed_quota()
     test_orphan_recovery_keeps_allocations_until_absence_is_confirmed()
     test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_absence()
