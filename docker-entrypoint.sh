@@ -1,4 +1,5 @@
 #!/bin/sh
+# Keep this POSIX entrypoint LF-only; .gitattributes enforces it on Windows too.
 # GoblinDock container entrypoint.
 #
 # The container runs non-root with a uid chosen by the operator at runtime

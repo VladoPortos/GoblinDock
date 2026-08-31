@@ -888,7 +888,7 @@ def test_waiting_poll_does_not_starve_ready_job_behind_missing_ip():
 
 
 def test_waiting_poll_times_out_oldest_and_resumes_later_ready_job():
-    """An exact-deadline wait must fail without consuming the whole poll."""
+    """An exact-deadline wait gets one last probe before failing."""
     oldest_id, oldest_dep_id, _conn_id, _block_key = _mk_captured_waiting_job()
     ready_id, ready_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
         retire_existing=False,
@@ -913,7 +913,7 @@ def test_waiting_poll_times_out_oldest_and_resumes_later_ready_job():
     ):
         assert worker._poll_waiting_jobs(now=boundary) is True
 
-    assert probed == [vmids[ready_id]], "the expired wait must not make another IP probe"
+    assert probed == [vmids[oldest_id], vmids[ready_id]]
     with session_scope() as s:
         assert s.get(Job, oldest_id).status == "failed"
         assert s.get(Deployment, oldest_dep_id).status == "error"
@@ -1102,8 +1102,8 @@ def test_waiting_poll_isolates_timeout_transition_exception_from_later_job():
         assert s.get(Deployment, second_dep_id).status == "running"
 
 
-def test_waiting_poll_yields_between_rows_when_new_work_is_queued():
-    """Work queued while probing A must take priority over waiting row B."""
+def test_waiting_poll_continues_between_rows_when_new_work_is_queued():
+    """The dedicated waiting poller must not stall behind newly queued work."""
     first_id, _first_dep_id, conn_id, _block_key = _mk_captured_waiting_job(
         age=timedelta(minutes=2),
     )
@@ -1134,16 +1134,16 @@ def test_waiting_poll_yields_between_rows_when_new_work_is_queued():
     ):
         assert worker._poll_waiting_jobs() is True
 
-    assert probed == [vmids[first_id]]
+    assert probed == [vmids[first_id], vmids[second_id]]
     assert len(queued_ids) == 1
     with session_scope() as s:
         assert s.get(Job, queued_ids[0]).status == "queued"
-        assert s.get(Job, second_id).status == "waiting"
+        assert s.get(Job, second_id).status == "succeeded"
     _retire_waiting_jobs()
 
 
 def test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership():
-    """The exact wait deadline fails visibly while retaining the VM and IP allocation."""
+    """The exact wait deadline fails after one last probe and retains ownership."""
     job_id, dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
         age=timedelta(0), reserve_ip=True,
     )
@@ -1156,7 +1156,7 @@ def test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership():
     class _Px:
         def __init__(self, _conn): self.node = "pve"
         def agent_ipv4(self, *_args, **_kwargs):
-            raise AssertionError("deadline must be checked before another external poll")
+            return None
 
     with _patched_worker(Proxmox=_Px):
         assert worker._poll_waiting_jobs(now=boundary - timedelta(microseconds=1)) is True
@@ -1246,15 +1246,20 @@ def test_waiting_cancellation_uses_deployment_reconciliation():
         assert allocations == []
 
 
-def test_waiting_poll_yields_to_queued_work():
-    """The serial worker must claim queued work before touching an older IP wait."""
+def test_waiting_poll_is_independent_of_queued_work():
+    """Queued work must not prevent the dedicated poller visiting a durable wait."""
     waiting_id, _dep_id, conn_id, _block_key = _mk_captured_waiting_job()
     with session_scope() as s:
         queued = Job(type="image_sync", status="queued", connection_id=conn_id)
         s.add(queued)
         s.flush()
         queued_id = queued.id
-    assert worker._poll_waiting_jobs() is False
+    visited: list[int] = []
+    with _patched_worker(
+        _poll_waiting_job=lambda job_id, _poll_at: visited.append(job_id),
+    ):
+        assert worker._poll_waiting_jobs() is True
+    assert visited == [waiting_id]
     with session_scope() as s:
         assert s.get(Job, waiting_id).status == "waiting"
         assert s.get(Job, queued_id).status == "queued"
@@ -1685,11 +1690,11 @@ if __name__ == "__main__":
     test_waiting_poll_isolates_resume_failure_from_later_ready_job()
     test_waiting_poll_isolates_ip_probe_exception_from_later_ready_job()
     test_waiting_poll_isolates_timeout_transition_exception_from_later_job()
-    test_waiting_poll_yields_between_rows_when_new_work_is_queued()
+    test_waiting_poll_continues_between_rows_when_new_work_is_queued()
     test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership()
     test_timeout_rechecks_committed_cancellation_before_failing()
     test_waiting_cancellation_uses_deployment_reconciliation()
-    test_waiting_poll_yields_to_queued_work()
+    test_waiting_poll_is_independent_of_queued_work()
     test_restart_recovery_leaves_durable_wait_untouched()
     test_waiting_is_active_in_state_widget_and_serialization()
     test_waiting_can_cancel_but_cannot_be_dismissed_purged_or_retained_as_terminal()

@@ -61,6 +61,7 @@ from .appsettings import auto_root_password_enabled
 from . import statebus
 
 _worker_thread: Optional[threading.Thread] = None
+_waiting_thread: Optional[threading.Thread] = None
 _stop = threading.Event()
 WAITING_TIMEOUT = timedelta(minutes=30)
 
@@ -1422,11 +1423,6 @@ def _poll_waiting_job(job_id: int, poll_at: datetime) -> None:
         _finish_waiting_error(job.id, JobCancelled())
         return
 
-    waiting_since = ensure_utc(job.waiting_since) or ensure_utc(job.started_at) or ensure_utc(job.created_at)
-    if waiting_since is not None and poll_at >= waiting_since + WAITING_TIMEOUT:
-        _timeout_waiting_job(job.id)
-        return
-
     if not dep or not conn or dep.vmid is None:
         _finish_waiting_error(job.id, RuntimeError("waiting job target is missing"))
         return
@@ -1435,6 +1431,13 @@ def _poll_waiting_job(job_id: int, poll_at: datetime) -> None:
     except Exception:  # noqa: BLE001
         ip = None
     if not ip:
+        waiting_since = (
+            ensure_utc(job.waiting_since)
+            or ensure_utc(job.started_at)
+            or ensure_utc(job.created_at)
+        )
+        if waiting_since is not None and poll_at >= waiting_since + WAITING_TIMEOUT:
+            _timeout_waiting_job(job.id)
         return
     try:
         _resume_waiting_ansible(job.id, ip)
@@ -1443,11 +1446,9 @@ def _poll_waiting_job(job_id: int, poll_at: datetime) -> None:
 
 
 def _poll_waiting_jobs(now: Optional[datetime] = None) -> bool:
-    """Poll an ordered snapshot of waits only when no queued work is available."""
+    """Poll an ordered snapshot of durable waits independently of queued work."""
     poll_at = ensure_utc(now) or utcnow()
     with session_scope() as s:
-        if s.exec(select(Job.id).where(Job.status == "queued").limit(1)).first() is not None:
-            return False
         waiting_ids = s.exec(
             select(Job.id).where(Job.status == "waiting")
             .order_by(Job.waiting_since, Job.id)
@@ -1455,13 +1456,7 @@ def _poll_waiting_jobs(now: Optional[datetime] = None) -> bool:
     if not waiting_ids:
         return False
 
-    for index, job_id in enumerate(waiting_ids):
-        if index:
-            with session_scope() as s:
-                if s.exec(
-                    select(Job.id).where(Job.status == "queued").limit(1)
-                ).first() is not None:
-                    break
+    for job_id in waiting_ids:
         try:
             _poll_waiting_job(job_id, poll_at)
         except Exception:  # noqa: BLE001
@@ -1499,7 +1494,6 @@ def _loop() -> None:
         try:
             job_id = _claim_next_job()
             if job_id is None:
-                _poll_waiting_jobs()
                 idle += 1
                 if idle % 15 == 0:  # ~ every 15s while idle
                     _reconcile_ips()
@@ -1513,16 +1507,32 @@ def _loop() -> None:
             time.sleep(2.0)
 
 
+def _waiting_loop() -> None:
+    """Keep durable guest-IP waits moving while the main worker is busy."""
+    while not _stop.is_set():
+        try:
+            _poll_waiting_jobs()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        _stop.wait(1.0)
+
+
 def start_worker() -> None:
-    global _worker_thread
-    if _worker_thread and _worker_thread.is_alive():
-        return
+    global _worker_thread, _waiting_thread
     _stop.clear()
-    _worker_thread = threading.Thread(target=_loop, name="gd-worker", daemon=True)
-    _worker_thread.start()
+    if not _worker_thread or not _worker_thread.is_alive():
+        _worker_thread = threading.Thread(target=_loop, name="gd-worker", daemon=True)
+        _worker_thread.start()
+    if not _waiting_thread or not _waiting_thread.is_alive():
+        _waiting_thread = threading.Thread(
+            target=_waiting_loop, name="gd-waiting-worker", daemon=True,
+        )
+        _waiting_thread.start()
 
 
 def stop_worker(join_timeout: float = 30) -> None:
     _stop.set()
     if _worker_thread and _worker_thread.is_alive():
         _worker_thread.join(timeout=join_timeout)
+    if _waiting_thread and _waiting_thread.is_alive():
+        _waiting_thread.join(timeout=join_timeout)

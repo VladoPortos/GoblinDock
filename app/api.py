@@ -310,9 +310,11 @@ def _network_ctx(session: Session, net: Network, dep_id: int) -> dict:
         pool = _static_pool(net)
         ip = allocate_ip(session, net, dep_id)
         ctx["static_ip"] = ip
-        ipconfig0 = f"ip={ip}/{pool.network.prefixlen}"
+        ip_key = "ip6" if pool.network.version == 6 else "ip"
+        gateway_key = "gw6" if pool.network.version == 6 else "gw"
+        ipconfig0 = f"{ip_key}={ip}/{pool.network.prefixlen}"
         if pool.gateway is not None:
-            ipconfig0 += f",gw={pool.gateway}"
+            ipconfig0 += f",{gateway_key}={pool.gateway}"
         ctx["ipconfig0"] = ipconfig0
     if net.vlan:
         ctx["vlan"] = net.vlan
