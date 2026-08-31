@@ -802,6 +802,265 @@ def test_concurrent_duplicate_destroy_returns_one_active_job():
     print("test_concurrent_duplicate_destroy_returns_one_active_job OK")
 
 
+def test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission():
+    """Same-VM lifecycle admission must wait until a direct power task fully finishes."""
+    uid = _mk_user("w36-power-before-lifecycle@example.com")
+    dep_id = _mk_lifecycle_deployment(uid)
+    power_waiting = threading.Event()
+    release_power = threading.Event()
+    attempted = {name: threading.Event() for name in ("rebuild", "destroy")}
+    at_deployment_lock = {name: threading.Event() for name in ("rebuild", "destroy")}
+    finished = {name: threading.Event() for name in ("rebuild", "destroy")}
+    results = {}
+
+    class _Px:
+        def __init__(self, _conn): pass
+        def start(self, _vmid, node=None): return "UPID:start"
+        def wait_task(self, _upid, node=None, timeout=None):
+            power_waiting.set()
+            if not release_power.wait(timeout=3):
+                raise AssertionError("test did not release the blocked power task")
+
+    def run_power():
+        with Session(engine) as s:
+            try:
+                results["power"] = api.vm_action(
+                    dep_id, api.ActionBody(action="start"),
+                    user=s.get(User, uid), session=s,
+                )
+            except Exception as exc:  # captured for deterministic parent assertions
+                results["power"] = exc
+
+    def run_lifecycle(name):
+        attempted[name].set()
+        with Session(engine) as s:
+            try:
+                operation = api.vm_rebuild if name == "rebuild" else api.vm_destroy
+                results[name] = operation(dep_id, user=s.get(User, uid), session=s)
+            except Exception as exc:  # one of the sequential contenders must conflict
+                results[name] = exc
+            finally:
+                finished[name].set()
+
+    saved_px = api.Proxmox
+    saved_operation_lock = api._deployment_operation_lock
+
+    def observed_operation_lock(deployment_id):
+        event = at_deployment_lock.get(threading.current_thread().name)
+        if event is not None:
+            event.set()
+        return saved_operation_lock(deployment_id)
+
+    api.Proxmox = _Px
+    api._deployment_operation_lock = observed_operation_lock
+    threads = []
+    try:
+        power = threading.Thread(target=run_power, name="power")
+        power.start()
+        threads.append(power)
+        assert power_waiting.wait(timeout=2), "power action never reached wait_task"
+
+        for name in ("rebuild", "destroy"):
+            thread = threading.Thread(target=run_lifecycle, args=(name,), name=name)
+            thread.start()
+            threads.append(thread)
+        assert all(event.wait(timeout=2) for event in attempted.values())
+        assert all(event.wait(timeout=2) for event in at_deployment_lock.values()), \
+            "same-VM lifecycle contender did not reach the deployment lock"
+        assert not any(event.is_set() for event in finished.values()), \
+            "same-VM lifecycle admission completed while power wait still owned the VM"
+        with session_scope() as s:
+            assert s.exec(select(Job).where(
+                Job.deployment_id == dep_id,
+                Job.type.in_(("rebuild", "destroy")),
+            )).all() == []
+
+        release_power.set()
+        for thread in threads:
+            thread.join(timeout=3)
+        assert all(not thread.is_alive() for thread in threads)
+    finally:
+        release_power.set()
+        for thread in threads:
+            thread.join(timeout=3)
+        api.Proxmox = saved_px
+        api._deployment_operation_lock = saved_operation_lock
+
+    assert results["power"] == {"ok": True}, results
+    lifecycle_results = [results["rebuild"], results["destroy"]]
+    assert sum(isinstance(result, dict) for result in lifecycle_results) == 1, results
+    conflicts = [result for result in lifecycle_results if isinstance(result, HTTPException)]
+    assert len(conflicts) == 1 and conflicts[0].status_code == 409, results
+    with session_scope() as s:
+        jobs = s.exec(select(Job).where(
+            Job.deployment_id == dep_id,
+            Job.type.in_(("rebuild", "destroy")),
+        )).all()
+        assert len(jobs) == 1, [(job.type, job.status) for job in jobs]
+    with api._deployment_operation_locks_guard:
+        assert dep_id not in api._deployment_operation_locks, \
+            "idle per-deployment lock entries must be reclaimed"
+    print("test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission OK")
+
+
+def test_lifecycle_commit_before_power_makes_power_observe_active_job():
+    """Reverse ordering must keep power behind admission and return 409 after commit."""
+    for operation_name in ("rebuild", "destroy"):
+        uid = _mk_user(f"w36-{operation_name}-before-power@example.com")
+        dep_id = _mk_lifecycle_deployment(uid)
+        before_commit = threading.Event()
+        release_commit = threading.Event()
+        power_submitted = threading.Event()
+        power_at_deployment_lock = threading.Event()
+        results = {}
+        saved_audit = api.record_audit
+        saved_px = api.Proxmox
+        saved_operation_lock = api._deployment_operation_lock
+
+        def blocking_audit(session, user, action, target_type, target_id, detail=""):
+            if action == f"vm.{operation_name}":
+                before_commit.set()
+                if not release_commit.wait(timeout=3):
+                    raise AssertionError("test did not release lifecycle commit")
+            return saved_audit(session, user, action, target_type, target_id, detail)
+
+        class _Px:
+            def __init__(self, _conn): pass
+            def start(self, _vmid, node=None):
+                power_submitted.set()
+                return "UPID:start"
+            def wait_task(self, *_args, **_kwargs): return None
+
+        def observed_operation_lock(deployment_id):
+            if threading.current_thread().name == "power":
+                power_at_deployment_lock.set()
+            return saved_operation_lock(deployment_id)
+
+        def run_lifecycle():
+            with Session(engine) as s:
+                try:
+                    operation = api.vm_rebuild if operation_name == "rebuild" else api.vm_destroy
+                    results["lifecycle"] = operation(
+                        dep_id, user=s.get(User, uid), session=s,
+                    )
+                except Exception as exc:
+                    results["lifecycle"] = exc
+
+        def run_power():
+            with Session(engine) as s:
+                try:
+                    results["power"] = api.vm_action(
+                        dep_id, api.ActionBody(action="start"),
+                        user=s.get(User, uid), session=s,
+                    )
+                except Exception as exc:
+                    results["power"] = exc
+
+        api.record_audit = blocking_audit
+        api.Proxmox = _Px
+        api._deployment_operation_lock = observed_operation_lock
+        lifecycle = threading.Thread(target=run_lifecycle, name=operation_name)
+        power = threading.Thread(target=run_power, name="power")
+        try:
+            lifecycle.start()
+            assert before_commit.wait(timeout=2), f"{operation_name} never reached commit boundary"
+            power.start()
+            assert power_at_deployment_lock.wait(timeout=2), \
+                f"power never reached the lock behind {operation_name}"
+            assert not power_submitted.is_set(), \
+                f"power submitted while {operation_name} admission was uncommitted"
+            release_commit.set()
+            lifecycle.join(timeout=3)
+            power.join(timeout=3)
+            assert not lifecycle.is_alive() and not power.is_alive()
+        finally:
+            release_commit.set()
+            lifecycle.join(timeout=3)
+            if power.ident is not None:
+                power.join(timeout=3)
+            api.record_audit = saved_audit
+            api.Proxmox = saved_px
+            api._deployment_operation_lock = saved_operation_lock
+
+        assert isinstance(results["lifecycle"], dict), (operation_name, results)
+        assert isinstance(results["power"], HTTPException), (operation_name, results)
+        assert results["power"].status_code == 409, (operation_name, results["power"])
+        assert operation_name in str(results["power"].detail), results["power"].detail
+        assert not power_submitted.is_set(), operation_name
+    print("test_lifecycle_commit_before_power_makes_power_observe_active_job OK")
+
+
+def test_power_wait_does_not_block_other_deployment_lifecycle_admission():
+    """A long power task may serialize its own VM only, never unrelated VM IDs."""
+    uid = _mk_user("w36-power-independent@example.com")
+    power_dep_id = _mk_lifecycle_deployment(uid)
+    other_dep_id = _mk_lifecycle_deployment(uid)
+    power_waiting = threading.Event()
+    release_power = threading.Event()
+    lifecycle_finished = threading.Event()
+    results = {}
+
+    class _Px:
+        def __init__(self, _conn): pass
+        def start(self, _vmid, node=None): return "UPID:start"
+        def wait_task(self, _upid, node=None, timeout=None):
+            power_waiting.set()
+            if not release_power.wait(timeout=3):
+                raise AssertionError("test did not release independent power task")
+
+    def run_power():
+        with Session(engine) as s:
+            try:
+                results["power"] = api.vm_action(
+                    power_dep_id, api.ActionBody(action="start"),
+                    user=s.get(User, uid), session=s,
+                )
+            except Exception as exc:
+                results["power"] = exc
+
+    def run_other_rebuild():
+        with Session(engine) as s:
+            try:
+                results["lifecycle"] = api.vm_rebuild(
+                    other_dep_id, user=s.get(User, uid), session=s,
+                )
+            except Exception as exc:
+                results["lifecycle"] = exc
+            finally:
+                lifecycle_finished.set()
+
+    saved_px = api.Proxmox
+    api.Proxmox = _Px
+    power = threading.Thread(target=run_power)
+    lifecycle = threading.Thread(target=run_other_rebuild)
+    try:
+        power.start()
+        assert power_waiting.wait(timeout=2)
+        lifecycle.start()
+        assert lifecycle_finished.wait(timeout=2), \
+            "unrelated deployment admission was blocked by another VM's power wait"
+        assert isinstance(results["lifecycle"], dict), results
+        release_power.set()
+        power.join(timeout=3)
+        lifecycle.join(timeout=3)
+        assert not power.is_alive() and not lifecycle.is_alive()
+    finally:
+        release_power.set()
+        power.join(timeout=3)
+        if lifecycle.ident is not None:
+            lifecycle.join(timeout=3)
+        api.Proxmox = saved_px
+
+    assert results["power"] == {"ok": True}, results
+    with session_scope() as s:
+        job = s.get(Job, results["lifecycle"]["jobId"])
+        assert job.deployment_id == other_dep_id and job.type == "rebuild"
+    with api._deployment_operation_locks_guard:
+        assert power_dep_id not in api._deployment_operation_locks
+        assert other_dep_id not in api._deployment_operation_locks
+    print("test_power_wait_does_not_block_other_deployment_lifecycle_admission OK")
+
+
 def test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status():
     """Queued, running, and waiting work must all block incompatible lifecycle jobs."""
     uid = _mk_user("w36-lifecycle-conflicts@example.com")
@@ -1139,6 +1398,9 @@ if __name__ == "__main__":
     test_rebuild_replaces_invalid_legacy_reservation_in_job_context()
     test_sequential_duplicate_destroy_returns_one_active_job()
     test_concurrent_duplicate_destroy_returns_one_active_job()
+    test_power_wait_serializes_same_deployment_rebuild_and_destroy_admission()
+    test_lifecycle_commit_before_power_makes_power_observe_active_job()
+    test_power_wait_does_not_block_other_deployment_lifecycle_admission()
     test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status()
     test_active_lifecycle_jobs_reject_direct_actions_before_proxmox_prerequisites()
     test_cleanup_pending_rejects_every_vm_lifecycle_operation()

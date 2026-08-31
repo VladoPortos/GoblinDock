@@ -2,6 +2,52 @@
 
 Base: `7b984685f101350e229b69065410f511e9c72c1a` (clean tracked linked worktree)
 
+Reviewer round 1 baseline: `c8b87b7c05726a7ecddc87f733aa6f0133e15ad6`
+
+## Reviewer round 1 — power/lifecycle admission serialization
+
+- A bounded, reference-counted per-deployment lock registry now gives direct power
+  actions and rebuild/destroy admission one synchronization boundary. Idle entries are
+  reclaimed, and the registry guard is never held while acquiring or owning a
+  deployment lock, so unrelated deployment IDs proceed independently.
+- Start/stop/restart retain the ownership lookup before locking, end that initial read
+  transaction, then re-read ownership and lifecycle state under the deployment lock.
+  The lock remains held across Proxmox request submission, task completion, audit,
+  commit, state notification, and response construction.
+- Rebuild/destroy retain the ownership lookup before locking, then hold the same
+  deployment lock across the active-job check and committed job admission. They acquire
+  the existing global lifecycle admission lock only after the deployment lock. A
+  lifecycle request waiting on a power action therefore cannot hold the global lock and
+  stall a different deployment, while the existing quota/IP allocation serialization
+  remains intact.
+- The required order is ownership lookup, deployment lock, then (for lifecycle
+  admission only) global lifecycle lock. Direct power actions never acquire the global
+  lifecycle lock, and deploy admission never acquires a deployment lock, leaving no
+  reverse-order cycle.
+
+### Round 1 strict TDD evidence
+
+- RED: the new deterministic Wave 36 barrier test failed because both same-deployment
+  lifecycle contenders could complete while a power request was blocked in
+  `wait_task`; the database could already contain lifecycle work before the power
+  boundary released.
+- GREEN: while a power action owns its deployment lock, concurrent rebuild and destroy
+  remain uncommitted. After release they observe sequential state: exactly one admits
+  and the other returns HTTP 409. The reverse-order rebuild and destroy cases commit
+  first and force the waiting power action to return HTTP 409 without submitting to
+  Proxmox. A lifecycle admission for a different deployment completes during the
+  blocked power wait, and registry-entry reclamation is asserted after each scenario.
+- Focused Wave 10, Wave 36, Wave 37, and Wave 39 Python suites passed. Both rendered UI
+  suites passed unchanged.
+- Fresh verification passed all `39/39` Python wave scripts in separate interpreter
+  processes, both `2/2` UI behavior suites, all `20/20` JavaScript syntax checks, and
+  Python compilation. `git diff --check` passed apart from informational repository
+  LF-to-CRLF notices.
+- Setup and disclosure scans passed: setup fields remain exactly `email`, `name`, and
+  `password`; setup-token and disclosure regression sentinels are absent from authored
+  application/UI code. The full Wave 39 run also exercised real token-free first-admin
+  setup and authenticated non-admin state redaction.
+
 ## Scope and outcome
 
 - Direct start, stop, and restart now perform the existing ownership lookup first,
@@ -24,8 +70,7 @@ Base: `7b984685f101350e229b69065410f511e9c72c1a` (clean tracked linked worktree)
   that are currently unlocked; execution re-filters a mixed/stale selection.
 - Existing responsive structural classes, native Delete naming, normal navigation,
   job navigation, benign detail/configuration presentation, and Task 5/6 behavior were
-  retained. No deployment-specific lock, schema change, migration, or unrelated
-  refactor was introduced.
+  retained. No schema change, migration, or unrelated refactor was introduced.
 
 ## TDD evidence
 
@@ -74,10 +119,14 @@ Base: `7b984685f101350e229b69065410f511e9c72c1a` (clean tracked linked worktree)
 
 - No browser, server, page, screenshot, Playwright, CUA, or in-app navigation tooling
   was used. Rendered component/state/event tests were the required acceptance path.
-- The implementation intentionally uses the existing lifecycle admission model and
-  active-job query. It does not add per-deployment locks or change the supported worker
-  architecture.
+- The implementation intentionally preserves the existing lifecycle admission model,
+  global admission semantics, and active-job query. The new in-process per-deployment
+  serialization matches the supported single-worker architecture and does not claim a
+  cross-process distributed lock.
 - No known functional, test, syntax, compilation, setup, disclosure, whitespace, or
   scope residual remains within this fix.
 
-Requested commit message: `fix: lock VM actions during lifecycle work`.
+Initial requested commit message: `fix: lock VM actions during lifecycle work`.
+
+Reviewer round 1 requested commit message:
+`fix: serialize VM power and lifecycle admission`.

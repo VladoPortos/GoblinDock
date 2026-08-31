@@ -10,6 +10,7 @@ import re
 import socket
 import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional
@@ -850,6 +851,43 @@ _ACTIVE_LIFECYCLE_STATUSES = ("queued", "running", "waiting")
 _LIFECYCLE_TYPES = ("deploy", "rebuild", "destroy")
 
 
+@dataclass
+class _DeploymentOperationLock:
+    lock: threading.Lock
+    users: int = 0
+
+
+_deployment_operation_locks_guard = threading.Lock()
+_deployment_operation_locks: dict[int, _DeploymentOperationLock] = {}
+
+
+@contextmanager
+def _deployment_operation_lock(deployment_id: int):
+    """Serialize power work and lifecycle admission for one deployment.
+
+    The registry guard is held only while acquiring or releasing an entry reference;
+    it is never held while waiting for a deployment lock. Entries therefore exist
+    only while an operation owns or waits for them, without serializing unrelated
+    deployments.
+    """
+    with _deployment_operation_locks_guard:
+        entry = _deployment_operation_locks.get(deployment_id)
+        if entry is None:
+            entry = _DeploymentOperationLock(lock=threading.Lock())
+            _deployment_operation_locks[deployment_id] = entry
+        entry.users += 1
+
+    entry.lock.acquire()
+    try:
+        yield
+    finally:
+        entry.lock.release()
+        with _deployment_operation_locks_guard:
+            entry.users -= 1
+            if entry.users == 0 and _deployment_operation_locks.get(deployment_id) is entry:
+                del _deployment_operation_locks[deployment_id]
+
+
 def _active_lifecycle_job(session: Session, deployment_id: int) -> Optional[Job]:
     return session.exec(select(Job).where(
         Job.deployment_id == deployment_id,
@@ -943,42 +981,53 @@ class ActionBody(BaseModel):
 @router.post("/deployments/{dep_id}/action")
 def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
               session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    _reject_cleanup_pending(dep)
-    active = _active_lifecycle_job(session, dep.id)
-    if active:
-        raise HTTPException(409, f"{active.type} job already active for this deployment")
-    conn = session.get(Connection, dep.connection_id)
-    if not conn or not dep.vmid:
-        raise HTTPException(400, "VM not provisioned")
-    px = Proxmox(conn)
-    node = dep.node or conn.node
-    try:
-        if body.action == "start":
-            upid = px.start(dep.vmid, node)
-        elif body.action == "stop":
-            upid = px.stop(dep.vmid, node)
-        elif body.action == "restart":
-            upid = px.reboot(dep.vmid, node)
-        else:
-            raise HTTPException(400, "unknown action")
-        px.wait_task(upid, node=node, timeout=120)
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, f"vm.{body.action}", "deployment", dep.id, dep.name)
-    session.commit()
-    statebus.bump()
-    return {"ok": True}
+    # Preserve the authorization boundary before entering any lock. End this read
+    # transaction before waiting so the guarded re-read observes a lifecycle job
+    # committed by an operation that won the lock first.
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep = _owned_deployment(session, dep_id, user)
+        _reject_cleanup_pending(dep)
+        active = _active_lifecycle_job(session, dep.id)
+        if active:
+            raise HTTPException(409, f"{active.type} job already active for this deployment")
+        conn = session.get(Connection, dep.connection_id)
+        if not conn or not dep.vmid:
+            raise HTTPException(400, "VM not provisioned")
+        px = Proxmox(conn)
+        node = dep.node or conn.node
+        try:
+            if body.action == "start":
+                upid = px.start(dep.vmid, node)
+            elif body.action == "stop":
+                upid = px.stop(dep.vmid, node)
+            elif body.action == "restart":
+                upid = px.reboot(dep.vmid, node)
+            else:
+                raise HTTPException(400, "unknown action")
+            px.wait_task(upid, node=node, timeout=120)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        record_audit(session, user, f"vm.{body.action}", "deployment", dep.id, dep.name)
+        session.commit()
+        statebus.bump()
+        return {"ok": True}
 
 
 @router.post("/deployments/{dep_id}/rebuild")
 def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
     # Rebuild may need to recreate a missing legacy/static allocation. Keep its flush
-    # and final commit inside the same lock used by new deployment admission.
-    with _lifecycle_admission_lock:
-        return _vm_rebuild_transaction(dep_id, user, session)
+    # and final commit inside the same lock used by new deployment admission. Always
+    # acquire the deployment lock first so waiting on one VM cannot hold the global
+    # admission lock and stall lifecycle admission for a different VM.
+    with _deployment_operation_lock(dep_id):
+        with _lifecycle_admission_lock:
+            return _vm_rebuild_transaction(dep_id, user, session)
 
 
 def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
@@ -1019,8 +1068,11 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
 
 @router.delete("/deployments/{dep_id}")
 def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
-    with _lifecycle_admission_lock:
-        return _vm_destroy_transaction(dep_id, user, session)
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        with _lifecycle_admission_lock:
+            return _vm_destroy_transaction(dep_id, user, session)
 
 
 def _vm_destroy_transaction(dep_id: int, user: User, session: Session):
