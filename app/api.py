@@ -584,9 +584,32 @@ def state(request: Request, user: User = Depends(current_user), session: Session
                               Job.status.in_(["queued", "running", "waiting"])).order_by(Job.id.desc())
         ).all():
             active_by_dep.setdefault(j.deployment_id, j)
+    # Prime live VM status once per connection/node. An unavailable Proxmox target now
+    # costs one bounded connection probe, not one full timeout for every VM in /state.
+    conn_statuses: dict[int, dict] = {}
+    status_groups: dict[tuple[int, str], list[int]] = {}
+    for dep in deps:
+        if dep.vmid and dep.status not in ("working", "error", "cleanup_pending"):
+            conn = conns.get(dep.connection_id)
+            if conn:
+                status_groups.setdefault(
+                    (conn.id, dep.node or conn.node), [],
+                ).append(dep.vmid)
+    for (conn_id, node), vmids in status_groups.items():
+        px = px_cache.get(conn_id)
+        status = _conn_status(px, conn_id) if px else {"status": "unknown"}
+        conn_statuses[conn_id] = status
+        S.prime_live_statuses(
+            px, conn_id, node, vmids, online=status.get("status") == "online",
+        )
+
     vms = [S.vm_dict(session, d, user, px_cache, users, conns, active_by_dep) for d in deps]
 
-    base = [S.base_image_dict(i) for i in session.exec(select(Image).where(Image.kind == "base")).all()]
+    is_admin = user.role == "admin"
+    base = [
+        S.base_image_dict(i, include_source_url=is_admin)
+        for i in session.exec(select(Image).where(Image.kind == "base")).all()
+    ]
     tpls = session.exec(select(Template).order_by(Template.id)).all()
     if user.role != "admin":
         tpls = [t for t in tpls if t.public or t.owner_id == user.id]
@@ -608,11 +631,12 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     variables = [S.variable_dict(v, users) for v in variables_q]
 
     conn_list = list(conns.values())
-    is_admin = user.role == "admin"
     connections = []
     for c in conn_list:
         px = px_cache.get(c.id)
-        st = _conn_status(px, c.id) if px else None
+        st = conn_statuses.get(c.id)
+        if st is None:
+            st = _conn_status(px, c.id) if px else {"status": "unknown"}
         # Non-admins get a REDACTED connection (target name + node + sizing only) — never
         # the Proxmox host / token id / SSH paths / storage backends, which are admin-only
         # config. They still need this much to pick a build/deploy target and size a VM.
@@ -952,7 +976,9 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
 
     net = session.get(Network, tpl.network_id) if tpl.network_id else None
     if net and net.connection_id != conn.id:
-        net = None
+        raise HTTPException(400, "template network does not belong to its connection — edit the template")
+    if tpl.network_id and not net:
+        raise HTTPException(400, "template network is missing — edit the template")
     if not net:
         net = default_network_for(session, conn, user.id)
 
@@ -1168,7 +1194,9 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
                 out["agent"] = {"os": px.agent_osinfo(dep.vmid, node),
                                 "interfaces": _iface_summary(px.agent_interfaces(dep.vmid, node))}
         except Exception:  # noqa: BLE001
-            pass
+            out["live"] = {"status": "unknown"}
+            out["liveError"] = "Live VM status is unavailable"
+            out["consoleReady"] = False
     return out
 
 
@@ -2111,7 +2139,7 @@ def del_variable(var_id: int, user: User = Depends(current_user), session: Sessi
 class ConnBody(BaseModel):
     name: str
     host: str
-    port: int = 8006
+    port: int = Field(default=8006, ge=1, le=65535)
     token_id: str
     token_secret: str
     verify_tls: bool = True   # verify the Proxmox TLS cert by default; opt out for self-signed
@@ -2123,9 +2151,9 @@ class ConnBody(BaseModel):
     ssh_host: str = ""
     ssh_user: str = "root"
     ssh_key_path: str = ""
-    max_cores: int = 0       # per-VM ceilings for this target (0 = unlimited)
-    max_ram_gb: int = 0
-    max_disk_gb: int = 0
+    max_cores: int = Field(default=0, ge=0, le=256)       # 0 = unlimited
+    max_ram_gb: int = Field(default=0, ge=0, le=1024)
+    max_disk_gb: int = Field(default=0, ge=0, le=16384)
 
 
 @router.post("/connections")
@@ -2717,7 +2745,7 @@ def revoke_widget_key(user: User = Depends(current_user),
 class ConnEditBody(BaseModel):
     name: Optional[str] = None
     host: Optional[str] = None
-    port: Optional[int] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
     token_id: Optional[str] = None
     token_secret: Optional[str] = None
     verify_tls: Optional[bool] = None
@@ -2729,9 +2757,9 @@ class ConnEditBody(BaseModel):
     ssh_host: Optional[str] = None
     ssh_user: Optional[str] = None
     ssh_key_path: Optional[str] = None
-    max_cores: Optional[int] = None
-    max_ram_gb: Optional[int] = None
-    max_disk_gb: Optional[int] = None
+    max_cores: Optional[int] = Field(default=None, ge=0, le=256)
+    max_ram_gb: Optional[int] = Field(default=None, ge=0, le=1024)
+    max_disk_gb: Optional[int] = Field(default=None, ge=0, le=16384)
 
 
 @router.put("/connections/{conn_id}")
@@ -2863,6 +2891,8 @@ def edit_network(net_id: int, body: NetworkBody, user: User = Depends(require_ad
             raise HTTPException(400, "unknown connection")
         if session.exec(select(Deployment).where(Deployment.network_id == net_id)).first():
             raise HTTPException(409, "network is in use by a deployment — can't move it to another connection")
+        if session.exec(select(Template).where(Template.network_id == net_id)).first():
+            raise HTTPException(409, "network is referenced by a template — update the template first")
         n.connection_id = body.connectionId
     n.name = body.name.strip()
     n.mode = "static" if body.mode == "static" else "dhcp"

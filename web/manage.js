@@ -273,10 +273,11 @@
   }
 
   function connectionPayload(draft, editing) {
+    const portText = String(draft.port == null ? '' : draft.port).trim();
     const payload = {
       name: draft.name,
       host: draft.host,
-      port: finiteNumber(draft.port, 8006),
+      port: portText ? finiteNumber(draft.port, 8006) : 8006,
       token_id: draft.token_id,
       verify_tls: draft.verify_tls,
       node: draft.node,

@@ -11,6 +11,7 @@
   // flight (store sets vm._act + status='working') — gives immediate visual feedback
   // instead of the cell sitting at '—'/'offline' until the real Proxmox status lands.
   const _actLabel = (a) => ({ start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…' }[a] || 'Working…');
+  const vmActionable = (vm) => !isVmLifecycleLocked(vm) && vm.status !== 'unknown';
 
   const VIEWS_KEY = 'gd.savedViews';
   function parseTags(s) { return (s || '').split(',').map((t) => t.trim()).filter(Boolean); }
@@ -50,7 +51,7 @@
   }
 
   function ActionCluster({ vm, onAct }) {
-    if (isVmLifecycleLocked(vm)) return null;
+    if (!vmActionable(vm)) return null;
     const running = vm.status === 'running';
     return h('div', { className: 'row', style: { gap: 2, justifyContent: 'flex-end' } },
       running
@@ -99,7 +100,7 @@
               h('th', { key: i, style: i === 0 ? { width: 36 } : null }, hh)))),
           h('tbody', null, vms.map(vm =>
             h('tr', { key: vm.id, style: { cursor: 'pointer' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
-              h('td', { onClick: (e) => e.stopPropagation() }, !isVmLifecycleLocked(vm)
+              h('td', { onClick: (e) => e.stopPropagation() }, vmActionable(vm)
                 && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
               h('td', null, h('span', { className: 'dot ' + vm.status, title: vm.status })),
               h('td', null,
@@ -131,7 +132,7 @@
                   ? h('span', { style: { color: 'var(--accent)' } },
                       h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
                   : vm.uptime),
-              h('td', null, !isVmLifecycleLocked(vm) && h(ActionCluster, { vm, onAct }))
+              h('td', null, vmActionable(vm) && h(ActionCluster, { vm, onAct }))
             )))
         )
       )
@@ -140,9 +141,9 @@
 
   function CardView({ vms, go, onAct, sel, toggleSel }) {
     return h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(310px, 1fr))', gap: 14 } },
-      vms.map(vm => h('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: !isVmLifecycleLocked(vm) && sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
+      vms.map(vm => h('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: vmActionable(vm) && sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
         h('div', { className: 'row' },
-          !isVmLifecycleLocked(vm) && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
+          vmActionable(vm) && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
           h('span', { className: 'dot ' + vm.status }),
           h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 15 } }, vm.name),
           h('div', { style: { marginLeft: 'auto' } }, h(StatusBadge, { status: vm.status }))
@@ -168,8 +169,8 @@
           vm.status === 'working'
             ? h('span', { className: 'hint mono', style: { fontSize: 11, color: 'var(--accent)' } },
                 h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
-            : h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
-          h('div', { style: { marginLeft: 'auto' } }, !isVmLifecycleLocked(vm) && h(ActionCluster, { vm, onAct }))
+            : h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : vm.status === 'unknown' ? 'status unavailable' : 'offline'),
+          h('div', { style: { marginLeft: 'auto' } }, vmActionable(vm) && h(ActionCluster, { vm, onAct }))
         )
       ))
     );
@@ -254,12 +255,12 @@
     const toggleSel = (depId) => setSel((prev) => {
       const n = new Set(prev);
       const vm = GD.VMS.find((candidate) => candidate.depId === depId);
-      if (n.has(depId) || isVmLifecycleLocked(vm)) n.delete(depId);
+      if (n.has(depId) || !vmActionable(vm)) n.delete(depId);
       else if (vm) n.add(depId);
       return n;
     });
     const clearSel = () => setSel(new Set());
-    const eligibleVms = vms.filter((vm) => !isVmLifecycleLocked(vm));
+    const eligibleVms = vms.filter(vmActionable);
     const allSel = eligibleVms.length > 0 && eligibleVms.every(v => sel.has(v.depId));
     const toggleAll = () => setSel((prev) => {
       const n = new Set(prev);
@@ -267,11 +268,11 @@
       else eligibleVms.forEach(v => n.add(v.depId));
       return n;
     });
-    const selectedVms = () => GD.VMS.filter(v => sel.has(v.depId) && !isVmLifecycleLocked(v));
+    const selectedVms = () => GD.VMS.filter(v => sel.has(v.depId) && vmActionable(v));
     const selectedCount = selectedVms().length;
 
     const onAct = async (action, vm) => {
-      if (isVmLifecycleLocked(vm)) return;
+      if (!vmActionable(vm)) return;
       if (action === 'delete' || action === 'rebuild') { setConfirm({ action, vm }); return; }
       if (action === 'edit') { setEdit(vm); return; }
       if (action === 'start' || action === 'stop' || action === 'restart') {

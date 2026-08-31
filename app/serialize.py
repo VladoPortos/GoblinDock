@@ -59,6 +59,20 @@ def _fmt_uptime(seconds: int) -> str:
     return f"{m}m"
 
 
+def _unknown_live_status() -> dict:
+    return {"status": "unknown", "cpu_pct": 0, "mem": 0, "maxmem": 1, "uptime": 0}
+
+
+def _live_status_from_current(cur: dict) -> dict:
+    return {
+        "status": cur.get("status", "unknown"),
+        "cpu_pct": round(float(cur.get("cpu", 0)) * 100),
+        "mem": cur.get("mem", 0),
+        "maxmem": cur.get("maxmem", 1) or 1,
+        "uptime": cur.get("uptime", 0),
+    }
+
+
 def _rel(dt: Optional[datetime]) -> str:
     if not dt:
         return "never"
@@ -90,17 +104,46 @@ def _live_status(px: Proxmox, vmid: int, node: str) -> dict:
         return cached[1]
     try:
         cur = px.vm_current(vmid, node)
-        out = {
-            "status": cur.get("status", "unknown"),
-            "cpu_pct": round(float(cur.get("cpu", 0)) * 100),
-            "mem": cur.get("mem", 0),
-            "maxmem": cur.get("maxmem", 1) or 1,
-            "uptime": cur.get("uptime", 0),
-        }
+        out = _live_status_from_current(cur)
     except Exception:  # noqa: BLE001
-        out = {"status": "unknown", "cpu_pct": 0, "mem": 0, "maxmem": 1, "uptime": 0}
+        out = _unknown_live_status()
     _status_cache[key] = (now, out)
     return out
+
+
+def prime_live_statuses(px: Optional[Proxmox], conn_id: int, node: str,
+                        vmids: list[int], online: bool) -> None:
+    """Prime one connection/node's VM status cache with one inventory request.
+
+    `/state` may contain many VMs on the same node. Fetching `status/current` for each
+    makes an offline node cost N full network timeouts. A node inventory contains the
+    dashboard fields we need, so use it once and explicitly cache `unknown` on failure.
+    """
+    now = time.time()
+    wanted = list(dict.fromkeys(int(vmid) for vmid in vmids))
+    if not wanted:
+        return
+    keys = [(conn_id, node, vmid) for vmid in wanted]
+    if all((cached := _status_cache.get(key)) and now - cached[0] < _STATUS_TTL
+           for key in keys):
+        return
+    if not online or px is None:
+        for key in keys:
+            _status_cache[key] = (now, _unknown_live_status())
+        return
+    try:
+        inventory = px.list_qemu(node)
+        by_vmid = {
+            int(item["vmid"]): item for item in (inventory or [])
+            if isinstance(item, dict) and item.get("vmid") is not None
+        }
+    except Exception:  # noqa: BLE001
+        by_vmid = {}
+    for key, vmid in zip(keys, wanted):
+        cur = by_vmid.get(vmid)
+        _status_cache[key] = (
+            now, _live_status_from_current(cur) if cur else _unknown_live_status(),
+        )
 
 
 def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: dict,
@@ -127,7 +170,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         px = px_cache.get(conn.id)
         if px:
             live = _live_status(px, dep.vmid, dep.node or conn.node)
-            status = "running" if live["status"] == "running" else "stopped"
+            status = live["status"] if live["status"] in ("running", "stopped") else "unknown"
             cpu_pct = live["cpu_pct"]
             ram_pct = round(live["mem"] / max(1, live["maxmem"]) * 100)
             uptime = _fmt_uptime(live["uptime"]) if status == "running" else "—"
@@ -258,16 +301,18 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
     }
 
 
-def base_image_dict(img: Image) -> dict:
-    return {
+def base_image_dict(img: Image, include_source_url: bool = False) -> dict:
+    out = {
         "id": f"img-{img.id}",
         "imgId": img.id,
         "name": img.name,
         "os": img.os_family,
         "size": img.size or "—",
         "checksum": img.checksum or "",
-        "source_url": img.source_url,
     }
+    if include_source_url:
+        out["source_url"] = img.source_url
+    return out
 
 
 def _mask_recipe_passwords(session: Session, recipe: list) -> list:
@@ -326,6 +371,10 @@ def template_dict(session: Session, t: Template, viewer: Optional["User"] = None
     if base and base.kind != "base":
         base = None
     conn = session.get(Connection, t.connection_id) if t.connection_id else None
+    network = session.get(Network, t.network_id) if t.network_id else None
+    network_matches = not t.network_id or bool(
+        network and conn and network.connection_id == conn.id
+    )
     return {
         "id": f"t-{t.id}",
         "templateId": t.id,
@@ -345,7 +394,7 @@ def template_dict(session: Session, t: Template, viewer: Optional["User"] = None
         "connectionId": t.connection_id,
         "networkId": t.network_id,
         "base": base.name if base else None,
-        "deployable": bool(base and conn),
+        "deployable": bool(base and conn and network_matches),
         "location": ((conn.name + (" · " + conn.node if conn.node else "")) if conn else None),
     }
 
@@ -394,11 +443,12 @@ def variable_dict(v: Variable, users: dict) -> dict:
 
 def connection_dict(session: Session, c: Connection, status: Optional[dict] = None) -> dict:
     vms = session.exec(select(Deployment).where(Deployment.connection_id == c.id)).all()
+    safe_port = c.port if 1 <= c.port <= 65535 else 8006
     return {
         "id": f"c-{c.id}",
         "connId": c.id,
         "name": c.name,
-        "url": f"https://{c.host}:{c.port}",
+        "url": f"https://{c.host}:{safe_port}",
         "status": (status or {}).get("status", "unknown"),
         "version": (status or {}).get("version", "—"),
         "storage": c.storage or "—",
@@ -407,7 +457,7 @@ def connection_dict(session: Session, c: Connection, status: Optional[dict] = No
         "node": c.node,
         # round-trippable config for the admin edit form (token secret is NEVER sent)
         "host": c.host,
-        "port": c.port,
+        "port": safe_port,
         "tokenId": c.token_id,
         "verifyTls": c.verify_tls,
         "isoStorage": c.iso_storage,
@@ -416,9 +466,9 @@ def connection_dict(session: Session, c: Connection, status: Optional[dict] = No
         "sshUser": c.ssh_user,
         "sshKeyPath": c.ssh_key_path,
         # per-target VM ceilings — authoritative; 0 = unlimited (no per-VM cap)
-        "maxCores": c.max_cores,
-        "maxRamGb": c.max_ram_mb // 1024,
-        "maxDiskGb": c.max_disk_gb,
+        "maxCores": min(max(0, c.max_cores), 256),
+        "maxRamGb": min(max(0, c.max_ram_mb // 1024), 1024),
+        "maxDiskGb": min(max(0, c.max_disk_gb), 16384),
     }
 
 
@@ -437,9 +487,9 @@ def connection_public_dict(session: Session, c: Connection, status: Optional[dic
         "node": c.node,
         "vms": len(vms),
         # per-target VM ceilings (used to size the deploy/build sliders); 0 = unlimited
-        "maxCores": c.max_cores,
-        "maxRamGb": c.max_ram_mb // 1024,
-        "maxDiskGb": c.max_disk_gb,
+        "maxCores": min(max(0, c.max_cores), 256),
+        "maxRamGb": min(max(0, c.max_ram_mb // 1024), 1024),
+        "maxDiskGb": min(max(0, c.max_disk_gb), 16384),
     }
 
 

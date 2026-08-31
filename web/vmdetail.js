@@ -302,7 +302,7 @@
     useEffect(() => {
       if (!pending) return;
       const st = (d && d.live && d.live.status) || (d && d.status);
-      if (pending === 'stop' ? st !== 'running' : st === 'running') setPending('');
+      if (pending === 'stop' ? st === 'stopped' : st === 'running') setPending('');
     }, [d, pending]);
 
     const act = async (action) => {
@@ -331,9 +331,11 @@
     const live = d.live || {};
     const cfg = d.config || {};
     const running = live.status === 'running';
+    const powerUnavailable = live.status === 'unknown';
     const locked = isVmLifecycleLocked(d);
     const statusTone = running ? 'running' : (d.status === 'working') ? 'working'
-      : (d.status === 'error' || d.status === 'cleanup_pending') ? 'error' : 'stopped';
+      : (d.status === 'error' || d.status === 'cleanup_pending') ? 'error'
+        : powerUnavailable ? 'unknown' : 'stopped';
     const memPct = live.memMax ? Math.round(live.memUsed / live.memMax * 100) : null;
     const diskPct = live.diskMax ? Math.round(live.diskUsed / live.diskMax * 100) : null;
 
@@ -347,13 +349,14 @@
             h('h1', { className: 'page-title' }, d.name),
             h('span', { className: 'badge ' + statusTone }, h('span', { className: 'dot ' + statusTone }),
               d.status === 'working' ? 'Working' : d.status === 'cleanup_pending' ? 'Cleanup pending'
-                : d.status === 'error' ? 'Error' : running ? 'Running' : 'Stopped')),
+                : d.status === 'error' ? 'Error' : running ? 'Running'
+                  : powerUnavailable ? 'Unknown' : 'Stopped')),
           h('div', { className: 'page-sub mono' }, 'vmid ', d.vmid || '—', ' · ', d.node, d.ip ? ' · ' + d.ip : '')),
         h('div', { className: 'spacer' }),
         h('div', { className: 'row vm-detail-actions', style: { gap: 8 } },
           !locked && (running
-            ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
-            : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy }, h(Icon, { name: 'play', size: 14 }), 'Start')),
+            ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy || powerUnavailable }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
+            : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy || powerUnavailable }, h(Icon, { name: 'play', size: 14 }), 'Start')),
           !locked && h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
           !locked && h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
           !locked && h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
@@ -365,6 +368,12 @@
         style: { marginBottom: 16, padding: '10px 12px', borderRadius: 9,
           color: 'var(--err)', background: 'var(--err-ghost)', fontSize: 12.5 },
       }, d.err),
+
+      d.liveError && h('div', {
+        className: 'mono', role: 'status',
+        style: { marginBottom: 16, padding: '10px 12px', borderRadius: 9,
+          color: 'var(--text-dim)', background: 'var(--surface-2)', fontSize: 12.5 },
+      }, d.liveError, '. Power controls are disabled until the connection recovers.'),
 
       // live metrics
       h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14, marginBottom: 16 } },
