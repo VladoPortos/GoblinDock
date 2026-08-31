@@ -9,6 +9,9 @@ const source = fs.readFileSync(path.join(__dirname, '..', 'web', 'manage.js'), '
 const imagesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'images.js'), 'utf8');
 const templatesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'extra.js'), 'utf8');
 const uiSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'ui.js'), 'utf8');
+const jobSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'job.js'), 'utf8');
+const historySource = fs.readFileSync(path.join(__dirname, '..', 'web', 'history.js'), 'utf8');
+const shellSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'shell.js'), 'utf8');
 const stylesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'styles.css'), 'utf8');
 let nextId = 0;
 const React = {
@@ -472,6 +475,212 @@ const legacySource = findAll(legacyImageCard,
   (node) => node.props.className === 'copy mono')[0];
 assert.equal(textOf(legacySource), 'Not provided',
   'the UI, rather than the serializer, must own friendly empty source copy');
+
+function jobSurfaceHarness({ stateValues = [], gd = {} } = {}) {
+  let stateCursor = 0;
+  const HarnessReact = {
+    createElement: React.createElement,
+    Fragment: 'fragment',
+    useState(initial) {
+      const index = stateCursor++;
+      const value = Object.hasOwn(stateValues, index)
+        ? stateValues[index]
+        : (typeof initial === 'function' ? initial() : initial);
+      return [value, () => {}];
+    },
+    useEffect() {},
+    useRef(initial) { return { current: initial }; },
+  };
+  const harnessWindow = {
+    React: HarnessReact,
+    Icon(props) {
+      return HarnessReact.createElement('span', { 'data-icon': props.name });
+    },
+    GD: gd,
+    GDStore: {
+      nav: {},
+      refresh() { return Promise.resolve(); },
+      toast() {},
+      signOut() {},
+    },
+    API: {
+      jobsHistory() { return Promise.resolve([]); },
+      jobRetentionGet() { return Promise.resolve({ days: 0 }); },
+      deleteJob() { return Promise.resolve(); },
+      clearJobs() { return Promise.resolve(); },
+    },
+    UI: {
+      Menu() {},
+      ConfirmModal() {},
+      copyToClipboard() {},
+    },
+  };
+  vm.runInNewContext(shellSource, { React: HarnessReact, window: harnessWindow }, {
+    filename: 'web/shell.js',
+  });
+  vm.runInNewContext(jobSource, { React: HarnessReact, window: harnessWindow }, {
+    filename: 'web/job.js',
+  });
+  vm.runInNewContext(historySource, { React: HarnessReact, window: harnessWindow }, {
+    filename: 'web/history.js',
+  });
+  return {
+    window: harnessWindow,
+    render(component) {
+      stateCursor = 0;
+      return resolveTree(component());
+    },
+  };
+}
+
+function jobDetailFixture(rawStatus, status, title, error) {
+  return {
+    id: 3900,
+    title,
+    type: 'deploy',
+    rawStatus,
+    status,
+    pct: 67,
+    phase: `${title} phase`,
+    phases: ['Allocate', 'Create'],
+    elapsed: '12s',
+    error,
+    steps: [],
+    log: [],
+  };
+}
+
+function renderedJobState(rawStatus, status, title, error) {
+  const fixture = jobDetailFixture(rawStatus, status, title, error);
+  const harness = jobSurfaceHarness({ stateValues: [fixture, 'checklist', true, false] });
+  harness.window.GDStore.nav = { jobId: fixture.id };
+  const tree = harness.render(() => harness.window.JobProgress({ go() {} }));
+  return {
+    tree,
+    badge: findAll(tree, (node) => node.type === 'span'
+      && String(node.props.className || '').startsWith('badge '))[0],
+    meter: findAll(tree, (node) => node.type === 'div'
+      && String(node.props.className || '').startsWith('meter'))[0],
+    percentage: findAll(tree, (node) => node.type === 'span' && textOf(node) === '67%')[0],
+    failureBanners: findAll(tree, (node) => node.type === 'div'
+      && node.props.style && node.props.style.background === 'var(--err-ghost)'),
+  };
+}
+
+const canceledJob = renderedJobState(
+  'canceled', 'canceled', 'Canceled detail job', 'cancellation is not a failure banner',
+);
+assert.equal(textOf(canceledJob.badge), 'Canceled');
+assert.equal(canceledJob.badge.props.className, 'badge canceled');
+assert.ok(findAll(canceledJob.badge, (node) => node.props.className === 'dot stopped').length);
+assert.equal(canceledJob.meter.props.className, 'meter');
+assert.equal(canceledJob.percentage.props.style.color, 'var(--accent)');
+assert.equal(canceledJob.failureBanners.length, 0,
+  'a canceled detail must not render a failure banner even if legacy error text exists');
+
+const failedJob = renderedJobState(
+  'failed', 'error', 'Failed detail job', 'provisioning failed visibly',
+);
+assert.equal(textOf(failedJob.badge), 'Failed');
+assert.equal(failedJob.badge.props.className, 'badge error');
+assert.ok(findAll(failedJob.badge, (node) => node.props.className === 'dot error').length);
+assert.equal(failedJob.meter.props.className, 'meter err');
+assert.equal(failedJob.percentage.props.style.color, 'var(--err)');
+assert.equal(failedJob.failureBanners.length, 1);
+assert.match(textOf(failedJob.failureBanners[0]), /provisioning failed visibly/);
+
+const historyFixtures = [
+  {
+    id: 'j-canceled-history', jobId: 3901, title: 'Canceled history job', type: 'deploy',
+    rawStatus: 'canceled', status: 'canceled', pct: 41, phase: 'Canceled', elapsed: '7s',
+  },
+  {
+    id: 'j-failed-history', jobId: 3902, title: 'Failed history job', type: 'deploy',
+    rawStatus: 'failed', status: 'error', pct: 42, phase: 'Failed', elapsed: '8s',
+  },
+];
+const historyHarness = jobSurfaceHarness({
+  stateValues: [historyFixtures, null, null, null, false],
+  gd: { me: { isAdmin: false } },
+});
+const historyTree = historyHarness.render(() => historyHarness.window.History());
+function historyRow(title) {
+  return findAll(historyTree, (node) => node.type === 'div'
+    && node.props.style && node.props.style.borderBottom
+    && textOf(node).includes(title))[0];
+}
+const canceledHistory = historyRow('Canceled history job');
+assert.ok(canceledHistory);
+assert.ok(findAll(canceledHistory, (node) => node.props.className === 'dot stopped').length);
+assert.ok(findAll(canceledHistory, (node) => node.props.className === 'badge canceled'
+  && textOf(node) === 'Canceled').length);
+const failedHistory = historyRow('Failed history job');
+assert.ok(failedHistory);
+assert.ok(findAll(failedHistory, (node) => node.props.className === 'dot error').length);
+assert.ok(findAll(failedHistory, (node) => node.props.className === 'badge error'
+  && textOf(node) === 'Failed').length);
+assert.equal(findAll(canceledHistory, (node) => node.type === 'button')[0].props['aria-label'],
+  'Purge Canceled history job permanently');
+
+const activityFixtures = [
+  {
+    id: 'j-canceled-activity', jobId: 3903, title: 'Canceled activity job', type: 'deploy',
+    rawStatus: 'canceled', status: 'canceled', pct: 51, phase: 'Canceled', elapsed: '9s',
+  },
+  {
+    id: 'j-failed-activity', jobId: 3904, title: 'Failed activity job', type: 'deploy',
+    rawStatus: 'failed', status: 'error', pct: 52, phase: 'Failed', elapsed: '10s',
+  },
+];
+const activityHarness = jobSurfaceHarness({ gd: { JOBS: activityFixtures } });
+const activityTree = activityHarness.render(
+  () => activityHarness.window.Shell.ActivityDrawer({ onClose() {}, go() {} }),
+);
+function activityCard(title) {
+  return findAll(activityTree, (node) => node.props.className === 'card'
+    && textOf(node).includes(title))[0];
+}
+const canceledActivity = activityCard('Canceled activity job');
+assert.ok(canceledActivity);
+assert.ok(findAll(canceledActivity, (node) => node.props.className === 'dot stopped').length);
+assert.ok(findAll(canceledActivity, (node) => node.props.className === 'badge canceled'
+  && textOf(node) === 'Canceled').length);
+assert.equal(findAll(canceledActivity, (node) => node.type === 'div'
+  && String(node.props.className || '').startsWith('meter'))[0].props.className, 'meter');
+const canceledDismiss = findAll(canceledActivity, (node) => node.type === 'button')[0];
+assert.equal(canceledDismiss.props['aria-label'], 'Dismiss Canceled activity job');
+
+const failedActivity = activityCard('Failed activity job');
+assert.ok(failedActivity);
+assert.ok(findAll(failedActivity, (node) => node.props.className === 'dot error').length);
+assert.ok(findAll(failedActivity, (node) => node.props.className === 'badge error'
+  && textOf(node) === 'Failed').length);
+assert.equal(findAll(failedActivity, (node) => node.type === 'div'
+  && String(node.props.className || '').startsWith('meter'))[0].props.className, 'meter err');
+
+assert.equal(typeof activityHarness.window.UI.jobPresentation, 'function');
+const presentation = (rawStatus) => JSON.parse(JSON.stringify(
+  activityHarness.window.UI.jobPresentation(rawStatus),
+));
+assert.deepEqual(presentation('canceled'), {
+  label: 'Canceled', badgeClass: 'canceled', dotClass: 'stopped', failure: false,
+});
+assert.deepEqual(presentation('failed'), {
+  label: 'Failed', badgeClass: 'error', dotClass: 'error', failure: true,
+});
+assert.deepEqual(presentation('succeeded'), {
+  label: 'Done', badgeClass: 'running', dotClass: 'running', failure: false,
+});
+for (const rawStatus of ['queued', 'running', 'waiting']) {
+  assert.deepEqual(presentation(rawStatus), {
+    label: 'Working', badgeClass: 'working', dotClass: 'working', failure: false,
+  });
+}
+const canceledBadgeCss = cssRule('.badge.canceled');
+assert.match(canceledBadgeCss, /background\s*:\s*var\(--surface-2\)\s*;/);
+assert.match(canceledBadgeCss, /color\s*:\s*var\(--text-faint\)\s*;/);
+assert.equal(/--err|--warn|gradient|animation/.test(canceledBadgeCss), false,
+  'the canceled badge must remain subdued and static');
 
 async function testIsoModalChecksumSubmission() {
   const validHarness = imageModalHarness(null);

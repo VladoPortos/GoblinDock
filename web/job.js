@@ -5,6 +5,19 @@
   const GD = window.GD;
   const h = React.createElement;
 
+  function jobPresentation(rawStatus) {
+    if (rawStatus === 'canceled') {
+      return { label: 'Canceled', badgeClass: 'canceled', dotClass: 'stopped', failure: false };
+    }
+    if (rawStatus === 'failed') {
+      return { label: 'Failed', badgeClass: 'error', dotClass: 'error', failure: true };
+    }
+    if (rawStatus === 'succeeded') {
+      return { label: 'Done', badgeClass: 'running', dotClass: 'running', failure: false };
+    }
+    return { label: 'Working', badgeClass: 'working', dotClass: 'working', failure: false };
+  }
+
   const STEP_ICON = { done: 'check', running: 'clock', pending: 'box', failed: 'x', skipped: 'skip' };
   const STEP_TONE = { done: 'var(--ok)', running: 'var(--warn)', pending: 'var(--text-faint)', failed: 'var(--err)', skipped: 'var(--text-faint)' };
   const LIVE_JOB_STATUSES = new Set(['queued', 'running', 'waiting']);
@@ -127,7 +140,7 @@
     const total = steps.length || 1;
     const pct = job.pct;
     const live = isLiveJobStatus(job.rawStatus);
-    const statusBadge = job.status; // working | done | error
+    const presentation = jobPresentation(job.rawStatus);
     const pIdx = phaseIndex(job);
 
     return h('div', { className: 'page fadein', style: { maxWidth: 1180 } },
@@ -137,9 +150,9 @@
         h('div', null,
           h('div', { className: 'row', style: { gap: 10 } },
             h('h1', { className: 'page-title' }, job.title),
-            h('span', { className: 'badge ' + statusBadge },
-              h('span', { className: 'dot ' + (statusBadge === 'done' ? 'running' : statusBadge === 'error' ? 'error' : 'working') }),
-              statusBadge === 'done' ? 'Done' : statusBadge === 'error' ? 'Failed' : 'Working')),
+            h('span', { className: 'badge ' + presentation.badgeClass },
+              h('span', { className: 'dot ' + presentation.dotClass }),
+              presentation.label)),
           h('div', { className: 'page-sub mono' }, job.type),
           job.rawStatus === 'queued' && job.waitingFor && h('div', { className: 'hint mono', style: { fontSize: 12, marginTop: 6 } },
             'queued — waiting for "', job.waitingFor, '" to finish')),
@@ -152,7 +165,7 @@
           !live && h('button', { className: 'btn primary', onClick: () => go('dashboard') },
             h(Icon, { name: 'arrowRight', size: 15 }), 'Go to VMs'))),
 
-      job.status === 'error' && job.error && h('div', { className: 'card', style: { padding: 14, marginBottom: 16, background: 'var(--err-ghost)', borderColor: 'transparent', display: 'flex', gap: 10, alignItems: 'center' } },
+      presentation.failure && job.error && h('div', { className: 'card', style: { padding: 14, marginBottom: 16, background: 'var(--err-ghost)', borderColor: 'transparent', display: 'flex', gap: 10, alignItems: 'center' } },
         h(Icon, { name: 'warn', size: 17, style: { color: 'var(--err)', flexShrink: 0 } }),
         h('span', { className: 'mono', style: { fontSize: 12.5, color: 'var(--err)' } }, job.error)),
 
@@ -160,10 +173,10 @@
         h('div', { className: 'row', style: { marginBottom: 10 } },
           h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, job.phase),
           h('div', { style: { marginLeft: 'auto', display: 'flex', alignItems: 'baseline', gap: 8 } },
-            h('span', { className: 'mono', style: { fontSize: 26, fontWeight: 800, color: statusBadge === 'error' ? 'var(--err)' : 'var(--accent)', letterSpacing: '-0.03em' } }, pct, '%'),
+            h('span', { className: 'mono', style: { fontSize: 26, fontWeight: 800, color: presentation.failure ? 'var(--err)' : 'var(--accent)', letterSpacing: '-0.03em' } }, pct, '%'),
             h('span', { className: 'hint mono' }, done, ' / ', total, ' tasks'))),
-        h('div', { className: 'meter' + (statusBadge === 'error' ? ' err' : statusBadge === 'done' ? ' ok' : ''), style: { height: 9 } },
-          h('i', { style: { width: pct + '%', background: statusBadge === 'working' ? 'linear-gradient(90deg, var(--accent-lo), var(--accent-hi))' : undefined } })),
+        h('div', { className: 'meter' + (presentation.failure ? ' err' : job.rawStatus === 'succeeded' ? ' ok' : ''), style: { height: 9 } },
+          h('i', { style: { width: pct + '%', background: live ? 'linear-gradient(90deg, var(--accent-lo), var(--accent-hi))' : undefined } })),
         h('div', { className: 'phase-row' },
           (job.phases || []).map((p, i) => h('div', { key: i, className: 'phase' + (i < pIdx ? ' done' : i === pIdx && live ? ' active' : '') },
             h('span', { className: 'dot ' + (i < pIdx ? 'running' : i === pIdx ? (live ? 'working' : 'running') : 'stopped') }), p)))),
@@ -181,5 +194,7 @@
         showLog && h(LogPane, { log: job.log || [], wrap, setWrap, live })));
   }
 
+  window.UI = window.UI || {};
+  window.UI.jobPresentation = jobPresentation;
   window.JobProgress = JobProgress;
 })();

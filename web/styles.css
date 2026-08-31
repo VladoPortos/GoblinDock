@@ -251,6 +251,7 @@ body {
 .badge.running { background: var(--ok-ghost); color: var(--ok); border-color: transparent; }
 .badge.working { background: var(--warn-ghost); color: var(--warn); border-color: transparent; }
 .badge.error   { background: var(--err-ghost); color: var(--err); border-color: transparent; }
+.badge.canceled { background: var(--surface-2); color: var(--text-faint); border-color: var(--border-soft); }
 .badge.stopped { background: var(--surface-2); color: var(--text-faint); }
 .badge.accent  { background: var(--accent-ghost); color: var(--accent); border-color: transparent; }
 .badge.info    { background: var(--info-ghost); color: var(--info); border-color: transparent; }

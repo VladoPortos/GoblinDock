@@ -31,7 +31,16 @@ os.environ.setdefault(
 
 from app import api, serialize as S  # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
-from app.models import Block, Connection, Deployment, Image, Template, User  # noqa: E402
+from app.models import (  # noqa: E402
+    Block,
+    Connection,
+    Deployment,
+    Image,
+    Job,
+    JobStep,
+    Template,
+    User,
+)
 
 init_db()
 
@@ -597,6 +606,48 @@ def test_template_capabilities_fail_safe_without_viewer_and_preserve_payload_dat
     }
 
 
+def test_job_serializers_preserve_canceled_and_raw_status_without_regressions():
+    """Canceled is neutral; failed stays error; live and successful jobs stay unchanged."""
+    expected = {
+        "canceled": "canceled",
+        "failed": "error",
+        "running": "working",
+        "queued": "working",
+        "succeeded": "done",
+    }
+    serialized = {}
+
+    with session_scope() as session:
+        for index, raw_status in enumerate(expected, start=1):
+            job = Job(
+                type="deploy",
+                title=f"Wave 39 {raw_status} job",
+                status=raw_status,
+                pct=index * 10,
+                phase=f"{raw_status.title()} phase",
+                error="provisioning failed" if raw_status == "failed" else "",
+            )
+            session.add(job)
+            session.flush()
+            session.add(JobStep(
+                job_id=job.id,
+                seq=0,
+                name="Real serializer fixture step",
+                state="done" if raw_status == "succeeded" else "pending",
+            ))
+            session.flush()
+            serialized[raw_status] = {
+                "brief": S.job_brief(session, job),
+                "detail": S.job_detail(session, job),
+            }
+
+    for raw_status, ui_status in expected.items():
+        assert serialized[raw_status]["brief"]["status"] == ui_status
+        assert serialized[raw_status]["brief"]["rawStatus"] == raw_status
+        assert serialized[raw_status]["detail"]["status"] == ui_status
+        assert serialized[raw_status]["detail"]["rawStatus"] == raw_status
+
+
 def _expect_checksum_400(value):
     try:
         api._clean_checksum(value)
@@ -745,6 +796,7 @@ if __name__ == "__main__":
     test_template_capabilities_follow_owner_and_admin_edit_authority()
     test_referenced_owned_template_stays_editable_but_cannot_be_deleted()
     test_template_capabilities_fail_safe_without_viewer_and_preserve_payload_data()
+    test_job_serializers_preserve_canceled_and_raw_status_without_regressions()
     test_checksum_validation_normalizes_supported_digests_without_legacy_regression()
     test_base_image_create_and_edit_persist_normalized_checksum_atomically()
     print("\nALL WAVE 39 UNIT TESTS PASSED")

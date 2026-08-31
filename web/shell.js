@@ -131,23 +131,27 @@
         h('div', { style: { padding: 12, overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 8 } },
           jobs.length === 0
             ? h('div', { className: 'hint', style: { textAlign: 'center', padding: 30, fontSize: 12.5 } }, 'No recent activity.')
-            : jobs.map(j => h('div', {
-                key: j.id, className: 'card', style: { padding: 13, cursor: 'pointer', position: 'relative' },
-                onClick: () => { onClose(); go('job', { jobId: j.jobId }); },
-              },
-                h('div', { className: 'row', style: { marginBottom: 9 } },
-                  h('span', { className: 'dot ' + j.status }),
-                  h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, j.title),
-                  h('span', { className: 'mono', style: { marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint)' } }, j.elapsed),
-                  j.status !== 'working' && h('button', { className: 'icon-btn sm', title: 'Dismiss', onClick: (e) => dismiss(e, j) }, h(Icon, { name: 'x', size: 13 }))
-                ),
-                h('div', { className: 'meter ' + (j.status === 'error' ? 'err' : j.status === 'done' ? 'ok' : '') },
-                  h('i', { style: { width: j.pct + '%' } })),
-                h('div', { className: 'row', style: { marginTop: 8, justifyContent: 'space-between' } },
-                  h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.phase),
-                  j.status === 'working' && h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.step, '/', j.total)
-                )
-              ))
+            : jobs.map(j => {
+                const presentation = window.UI.jobPresentation(j.rawStatus);
+                return h('div', {
+                  key: j.id, className: 'card', style: { padding: 13, cursor: 'pointer', position: 'relative' },
+                  onClick: () => { onClose(); go('job', { jobId: j.jobId }); },
+                },
+                  h('div', { className: 'row', style: { marginBottom: 9 } },
+                    h('span', { className: 'dot ' + presentation.dotClass }),
+                    h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, j.title),
+                    h('span', { className: 'badge ' + presentation.badgeClass }, presentation.label),
+                    h('span', { className: 'mono', style: { marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint)' } }, j.elapsed),
+                    j.status !== 'working' && h('button', { className: 'icon-btn sm', title: 'Dismiss', 'aria-label': 'Dismiss ' + j.title, onClick: (e) => dismiss(e, j) }, h(Icon, { name: 'x', size: 13 }))
+                  ),
+                  h('div', { className: 'meter' + (presentation.failure ? ' err' : j.rawStatus === 'succeeded' ? ' ok' : '') },
+                    h('i', { style: { width: j.pct + '%' } })),
+                  h('div', { className: 'row', style: { marginTop: 8, justifyContent: 'space-between' } },
+                    h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.phase),
+                    j.status === 'working' && h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.step, '/', j.total)
+                  )
+                );
+              })
         )
       )
     );

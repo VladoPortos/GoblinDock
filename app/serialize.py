@@ -39,10 +39,10 @@ from .security import mask
 _status_cache: dict[tuple, tuple[float, dict]] = {}
 _STATUS_TTL = 3.0
 
-# DB job status → the 3-state status vocabulary the UI renders (chips, meters).
+# DB job status → the status vocabulary the UI renders (chips, meters).
 _UI_STATUS = {
     "running": "working", "queued": "working", "waiting": "working",
-    "succeeded": "done", "failed": "error", "canceled": "error",
+    "succeeded": "done", "failed": "error", "canceled": "canceled",
 }
 
 
@@ -195,6 +195,7 @@ def job_brief(session: Session, job: Job) -> dict:
         "title": job.title,
         "type": job.type,
         "status": _UI_STATUS.get(job.status, "working"),
+        "rawStatus": job.status,
         "pct": job.pct,
         "phase": job.phase or job.status.title(),
         "elapsed": _elapsed(job.started_at, job.finished_at),
