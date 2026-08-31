@@ -22,40 +22,57 @@
     ]},
   ];
 
-  function Sidebar({ route, go, collapsed, setCollapsed }) {
-    return h('aside', { className: 'sidebar' + (collapsed ? ' collapsed' : '') },
+  function mobileNavKeydown(event, closeMobileNav) {
+    if (event.key === 'Escape') closeMobileNav(true);
+  }
+
+  function Sidebar({ route, go, collapsed, setCollapsed, mobileOpen = false }) {
+    const presentationCollapsed = collapsed && !mobileOpen;
+    return h('aside', {
+      id: 'primary-navigation',
+      'aria-label': 'Primary navigation',
+      className: 'sidebar' + (presentationCollapsed ? ' collapsed' : '') + (mobileOpen ? ' mobile-open' : ''),
+    },
       h('div', { className: 'brand' },
         h('img', { src: 'assets/goblindock-logo.png', alt: 'GoblinDock',
           style: { width: 34, height: 34, objectFit: 'contain', flexShrink: 0, filter: 'drop-shadow(0 1px 3px rgba(0,0,0,.4))' } }),
-        !collapsed && h('span', { className: 'brand-word' }, 'Goblin', h('b', null, 'Dock'))
+        !presentationCollapsed && h('span', { className: 'brand-word' }, 'Goblin', h('b', null, 'Dock'))
       ),
       h('nav', { className: 'nav' },
         NAV.map(sec => h(React.Fragment, { key: sec.group },
-          !collapsed && h('div', { className: 'nav-label' }, sec.group),
-          collapsed && h('div', { style: { height: 10 } }),
+          !presentationCollapsed && h('div', { className: 'nav-label' }, sec.group),
+          presentationCollapsed && h('div', { style: { height: 10 } }),
           sec.items.filter(it => !it.admin || (GD.me && GD.me.isAdmin)).map(it => h('button', {
             key: it.id,
             type: 'button',
             className: 'nav-item' + (route === it.id ? ' active' : ''),
             onClick: () => go(it.id),
-            title: collapsed ? it.label : null,
-            'aria-label': collapsed ? it.label : undefined,
+            title: presentationCollapsed ? it.label : null,
+            'aria-label': presentationCollapsed ? it.label : undefined,
             'aria-current': route === it.id ? 'page' : undefined,
           },
             h(Icon, { name: it.icon, size: 18 }),
-            !collapsed && h('span', null, it.label),
-            !collapsed && it.id === 'dashboard' && (GD.VMS || []).length > 0 && h('span', { className: 'badge count', style: { fontSize: 11, fontWeight: 700, fontFamily: 'system-ui, -apple-system, sans-serif' } }, GD.VMS.length)
+            !presentationCollapsed && h('span', null, it.label),
+            !presentationCollapsed && it.id === 'dashboard' && (GD.VMS || []).length > 0 && h('span', { className: 'badge count', style: { fontSize: 11, fontWeight: 700, fontFamily: 'system-ui, -apple-system, sans-serif' } }, GD.VMS.length)
           ))
         ))
       ),
       h('div', { className: 'sidebar-foot' },
         h('button', { type: 'button', className: 'nav-item', onClick: () => setCollapsed(c => !c),
-          title: collapsed ? 'Expand' : 'Collapse', 'aria-label': collapsed ? 'Expand' : 'Collapse' },
+          title: presentationCollapsed ? 'Expand' : 'Collapse', 'aria-label': presentationCollapsed ? 'Expand' : 'Collapse' },
           h(Icon, { name: 'collapse', size: 18 }),
-          !collapsed && h('span', null, 'Collapse')
+          !presentationCollapsed && h('span', null, 'Collapse')
         )
       )
     );
+  }
+
+  function SidebarScrim({ onClose }) {
+    return h('button', {
+      type: 'button', className: 'sidebar-scrim',
+      'aria-label': 'Close navigation', 'aria-controls': 'primary-navigation',
+      onClick: () => onClose(true),
+    });
   }
 
   const TITLES = {
@@ -69,9 +86,15 @@
     settings: ['Manage', 'Settings'], profile: ['Account', 'Profile'],
   };
 
-  function TopBar({ route, go, theme, setTheme, openDrawer }) {
+  function TopBar({ route, go, theme, setTheme, openDrawer, mobileNavOpen = false,
+    mobileNavToggleRef, openMobileNav }) {
     const t = TITLES[route] || ['', route];
     return h('header', { className: 'topbar' },
+      h('button', {
+        ref: mobileNavToggleRef, type: 'button', className: 'icon-btn mobile-nav-toggle',
+        onClick: openMobileNav, 'aria-label': 'Open navigation',
+        'aria-controls': 'primary-navigation', 'aria-expanded': mobileNavOpen,
+      }, h(Icon, { name: 'menu', size: 18 })),
       h('div', { className: 'crumb' },
         h('span', null, t[0]),
         h(Icon, { name: 'chevronR', size: 14 }),
@@ -161,5 +184,5 @@
     );
   }
 
-  window.Shell = { Sidebar, TopBar, ActivityDrawer };
+  window.Shell = { Sidebar, SidebarScrim, TopBar, ActivityDrawer, mobileNavKeydown };
 })();

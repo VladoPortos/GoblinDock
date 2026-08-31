@@ -346,13 +346,14 @@
               d.status === 'working' ? 'Working' : d.status === 'error' ? 'Error' : running ? 'Running' : 'Stopped')),
           h('div', { className: 'page-sub mono' }, 'vmid ', d.vmid || '—', ' · ', d.node, d.ip ? ' · ' + d.ip : '')),
         h('div', { className: 'spacer' }),
-        h('div', { className: 'row', style: { gap: 8 } },
+        h('div', { className: 'row vm-detail-actions', style: { gap: 8 } },
           running
             ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
             : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy || d.status === 'working' }, h(Icon, { name: 'play', size: 14 }), 'Start'),
           h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
           h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
-          h('button', { className: 'btn danger sm', onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 }))),
+          h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
+            onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 }))),
       ),
 
       // live metrics
@@ -376,7 +377,7 @@
             h(Icon, { name: tall ? 'collapse' : 'width', size: 14 }), tall ? 'Compact' : 'Expand')),
         conMode === 'vnc' ? h(VncConsole, { key: 'vnc', depId, tall }) : h(VmConsole, { key: 'serial', depId, tall })),
 
-      h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, alignItems: 'start' } },
+      h('div', { className: 'vm-detail-columns', style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, alignItems: 'start' } },
         // left column
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
           Card('Overview', h('div', null,

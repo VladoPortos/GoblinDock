@@ -38,6 +38,17 @@
     // background poll re-render preserves screen/modal state, while clicking a nav
     // item (even the same route) remounts it fresh.
     const [navKey, setNavKey] = useState(0);
+    const [mobileNavOpen, setMobileNavOpen] = useState(false);
+    const mobileNavToggleRef = React.useRef(null);
+
+    const closeMobileNav = (restoreFocus = false) => {
+      setMobileNavOpen(false);
+      if (!restoreFocus || !mobileNavToggleRef.current) return;
+      const restore = () => mobileNavToggleRef.current && mobileNavToggleRef.current.focus();
+      if (typeof requestAnimationFrame === 'function') requestAnimationFrame(restore);
+      else setTimeout(restore, 0);
+    };
+    const mobileNavKeydown = window.Shell.mobileNavKeydown;
 
     const setTheme = (t) => { setThemeState(t); localStorage.setItem('gd-theme', t); };
     useEffect(() => { document.documentElement.setAttribute('data-theme', theme); }, [theme]);
@@ -47,8 +58,15 @@
       window.addEventListener('gd-unauth', onUnauth);
       return () => window.removeEventListener('gd-unauth', onUnauth);
     }, []);
+    useEffect(() => {
+      if (!mobileNavOpen) return undefined;
+      const onKeyDown = (event) => mobileNavKeydown(event, closeMobileNav);
+      window.addEventListener('keydown', onKeyDown);
+      return () => window.removeEventListener('keydown', onKeyDown);
+    }, [mobileNavOpen]);
 
     const go = (r, params) => {
+      closeMobileNav(false);
       window.GDStore.nav = params || {};
       if (params && params.jobId) window.GD._jobId = params.jobId;
       setNavKey((k) => k + 1);
@@ -82,7 +100,7 @@
       return h(React.Fragment, null, h(window.Login, { go, theme, setTheme }), h(Toast));
     }
 
-    const { Sidebar, TopBar, ActivityDrawer } = window.Shell;
+    const { Sidebar, SidebarScrim, TopBar, ActivityDrawer } = window.Shell;
 
     const SCREENS = {
       dashboard: () => h(window.Dashboard, { go }),
@@ -102,9 +120,13 @@
     const fullBleed = route === 'newtemplate';
 
     return h('div', { className: 'app' },
-      h(Sidebar, { route, go, collapsed, setCollapsed }),
+      h(Sidebar, { route, go, collapsed, setCollapsed, mobileOpen: mobileNavOpen }),
+      mobileNavOpen && h(SidebarScrim, { onClose: closeMobileNav }),
       h('div', { className: 'main' },
-        h(TopBar, { route, go, theme, setTheme, openDrawer: () => setDrawer(true) }),
+        h(TopBar, {
+          route, go, theme, setTheme, openDrawer: () => setDrawer(true),
+          mobileNavOpen, mobileNavToggleRef, openMobileNav: () => setMobileNavOpen(true),
+        }),
         // key by navKey: poll re-renders keep state; navigation remounts the screen.
         h('div', { className: 'content', key: navKey, style: fullBleed ? { overflow: 'hidden' } : null }, Screen())),
       drawer && h(ActivityDrawer, { onClose: () => setDrawer(false), go }),

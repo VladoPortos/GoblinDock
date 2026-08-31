@@ -13,6 +13,10 @@ const jobSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'job.js'), '
 const historySource = fs.readFileSync(path.join(__dirname, '..', 'web', 'history.js'), 'utf8');
 const shellSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'shell.js'), 'utf8');
 const builderSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'builder.js'), 'utf8');
+const appSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'app.js'), 'utf8');
+const iconsSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'icons.js'), 'utf8');
+const dashboardSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'dashboard.js'), 'utf8');
+const vmDetailSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'vmdetail.js'), 'utf8');
 const stylesSource = fs.readFileSync(path.join(__dirname, '..', 'web', 'styles.css'), 'utf8');
 let nextId = 0;
 const React = {
@@ -80,6 +84,14 @@ function cssRule(selector) {
   const match = stylesSource.match(new RegExp(`(?:^|\\n)\\s*${escaped}\\s*\\{([^}]*)\\}`, 'm'));
   assert.ok(match, `missing ${selector} CSS rule`);
   return match[1];
+}
+
+function sourceSection(fileSource, startMarker, endMarker) {
+  const start = fileSource.indexOf(startMarker);
+  assert.notEqual(start, -1, `missing source section ${startMarker}`);
+  const end = fileSource.indexOf(endMarker, start + startMarker.length);
+  assert.notEqual(end, -1, `missing source section end ${endMarker}`);
+  return fileSource.slice(start, end);
 }
 
 function templateListHarness(templates) {
@@ -551,15 +563,25 @@ function jobDetailFixture(rawStatus, status, title, error) {
   };
 }
 
-function builderHarness() {
+function builderHarness({ persistent = false } = {}) {
   let stateCursor = 0;
+  const state = [];
   const stateChanges = [];
   const HarnessReact = {
     createElement: React.createElement,
     useState(initial) {
       const index = stateCursor++;
-      return [typeof initial === 'function' ? initial() : initial,
-        (value) => stateChanges.push({ index, value })];
+      let value;
+      if (persistent && Object.hasOwn(state, index)) value = state[index];
+      else {
+        value = typeof initial === 'function' ? initial() : initial;
+        if (persistent) state[index] = value;
+      }
+      return [value,
+        (value) => {
+          stateChanges.push({ index, value });
+          if (persistent) state[index] = typeof value === 'function' ? value(state[index]) : value;
+        }];
     },
     useEffect() {},
     useRef(initial) { return { current: initial }; },
@@ -604,6 +626,7 @@ function builderHarness() {
       return resolveTree(component());
     },
     stateChanges,
+    state,
   };
 }
 
@@ -646,6 +669,99 @@ const collapsedDashboard = findAll(collapsedSidebar, (node) => node.type === 'bu
 assert.equal(collapsedDashboard.props['aria-label'], 'Dashboard',
   'collapsed destinations must retain an accessible name');
 
+assert.match(appSource,
+  /const \[mobileNavOpen, setMobileNavOpen\] = useState\(false\)/,
+  'App must own closed-by-default mobile navigation state');
+assert.equal((appSource.match(/setMobileNavOpen\(false\)/g) || []).length, 1,
+  'all mobile navigation closes must converge on one close path');
+assert.match(appSource, /const go = \(r, params\) => \{[\s\S]*?closeMobileNav\(false\)/,
+  'every App navigation route must close the mobile drawer through that path');
+assert.match(appSource, /mobileNavKeydown\(event, closeMobileNav\)/,
+  'the App Escape listener must use the same close path');
+assert.match(appSource, /mobileNavOpen\s*&&\s*h\(SidebarScrim/,
+  'the App must render the scrim only while navigation is open');
+assert.match(appSource, /requestAnimationFrame\(restore\)/,
+  'focus restoration must wait until the closing render can expose the toggle');
+assert.match(appSource, /mobileNavToggleRef\.current\.focus\(\)/,
+  'focus-restoring closes must return keyboard focus to the top-bar toggle');
+
+assert.equal(typeof navigationHarness.window.Shell.mobileNavKeydown, 'function',
+  'shell.js must expose the Escape behavior used by App');
+let escapeCloses = 0;
+let escapeRestoreFocus;
+navigationHarness.window.Shell.mobileNavKeydown({ key: 'Escape' }, (restoreFocus) => {
+  escapeCloses += 1;
+  escapeRestoreFocus = restoreFocus;
+});
+navigationHarness.window.Shell.mobileNavKeydown({ key: 'Enter' }, () => {
+  throw new Error('non-Escape keys must not close mobile navigation');
+});
+assert.equal(escapeCloses, 1, 'Escape must invoke exactly one close');
+assert.equal(escapeRestoreFocus, true, 'Escape close must request toggle focus restoration');
+
+let mobileToggleDispatches = 0;
+const toggleRef = { current: null };
+const mobileTopBar = navigationHarness.render(() => navigationHarness.window.Shell.TopBar({
+  route: 'dashboard', go() {}, theme: 'dark', setTheme() {}, openDrawer() {},
+  mobileNavOpen: false,
+  mobileNavToggleRef: toggleRef,
+  openMobileNav() { mobileToggleDispatches += 1; },
+}));
+const mobileNavToggle = findAll(mobileTopBar, (node) => node.type === 'button'
+  && node.props.className === 'icon-btn mobile-nav-toggle')[0];
+assert.ok(mobileNavToggle, 'TopBar must render the native mobile navigation toggle');
+assert.equal(mobileNavToggle.props.type, 'button');
+assert.equal(mobileNavToggle.props['aria-label'], 'Open navigation');
+assert.equal(mobileNavToggle.props['aria-controls'], 'primary-navigation');
+assert.equal(mobileNavToggle.props['aria-expanded'], false);
+assert.equal(mobileNavToggle.props.ref, toggleRef);
+mobileNavToggle.props.onClick();
+assert.equal(mobileToggleDispatches, 1, 'the top-bar toggle must dispatch the open path once');
+const openMobileTopBar = navigationHarness.render(() => navigationHarness.window.Shell.TopBar({
+  route: 'dashboard', go() {}, theme: 'dark', setTheme() {}, openDrawer() {},
+  mobileNavOpen: true, mobileNavToggleRef: toggleRef, openMobileNav() {},
+}));
+assert.equal(findAll(openMobileTopBar, (node) => node.props.className === 'icon-btn mobile-nav-toggle')[0]
+  .props['aria-expanded'], true, 'the toggle must expose the open drawer state');
+
+function renderMobileSidebar(mobileOpen, collapsed) {
+  return navigationHarness.render(() => navigationHarness.window.Shell.Sidebar({
+    route: 'dashboard', go() {}, collapsed, setCollapsed() {}, mobileOpen,
+  }));
+}
+const closedMobileSidebar = renderMobileSidebar(false, true);
+assert.equal(closedMobileSidebar.props.id, 'primary-navigation');
+assert.equal(closedMobileSidebar.props['aria-label'], 'Primary navigation');
+assert.match(closedMobileSidebar.props.className, /\bcollapsed\b/);
+assert.doesNotMatch(closedMobileSidebar.props.className, /\bmobile-open\b/);
+const openMobileSidebar = renderMobileSidebar(true, true);
+assert.match(openMobileSidebar.props.className, /\bmobile-open\b/);
+assert.doesNotMatch(openMobileSidebar.props.className, /\bcollapsed\b/,
+  'an open mobile drawer must ignore the desktop collapsed presentation');
+assert.match(textOf(openMobileSidebar), /GoblinDock/,
+  'an open mobile drawer must render expanded branding even when desktop is collapsed');
+assert.ok(findAll(openMobileSidebar, (node) => node.type === 'div'
+  && node.props.className === 'nav-label').length,
+  'an open mobile drawer must render expanded group labels');
+
+assert.equal(typeof navigationHarness.window.Shell.SidebarScrim, 'function');
+let scrimCloses = 0;
+const scrim = navigationHarness.render(() => navigationHarness.window.Shell.SidebarScrim({
+  onClose(restoreFocus) {
+    scrimCloses += 1;
+    assert.equal(restoreFocus, true);
+  },
+}));
+assert.equal(scrim.type, 'button');
+assert.equal(scrim.props.type, 'button');
+assert.equal(scrim.props.className, 'sidebar-scrim');
+assert.equal(scrim.props['aria-label'], 'Close navigation');
+assert.equal(scrim.props['aria-controls'], 'primary-navigation');
+scrim.props.onClick();
+assert.equal(scrimCloses, 1, 'the native scrim must dispatch one focus-restoring close');
+
+assert.match(iconsSource, /menu\s*:/, 'the existing icon map must add a menu icon');
+
 const keyboardBuilder = builderHarness();
 assert.ok(keyboardBuilder.window.BuilderUI, 'builder.js must export window.BuilderUI');
 assert.equal(typeof keyboardBuilder.window.BuilderUI.activatePlacedBlock, 'function');
@@ -684,6 +800,57 @@ assert.equal(paletteItem.type, 'button', 'palette primary actions must be native
 assert.equal(paletteItem.props.type, 'button');
 assert.equal(paletteItem.props.draggable, true, 'pointer drag/drop must remain available');
 assert.equal(typeof paletteItem.props.onDragStart, 'function');
+
+const responsiveBuilder = builderHarness({ persistent: true });
+let responsiveBuilderTree = responsiveBuilder.render(
+  () => responsiveBuilder.window.Builder({ go() {} }),
+);
+function builderPanelState(tree) {
+  const switcher = findAll(tree, (node) => node.props.className === 'builder-mobile-switcher')[0];
+  assert.ok(switcher, 'builder must render the narrow panel switcher');
+  assert.equal(switcher.props.role, 'tablist');
+  assert.equal(switcher.props['aria-label'], 'Builder panels');
+  const tabs = findAll(switcher, (node) => node.type === 'button');
+  assert.deepEqual(tabs.map(textOf), ['Palette', 'Canvas', 'Inspector']);
+  for (const tab of tabs) {
+    assert.equal(tab.props.type, 'button');
+    assert.equal(tab.props.role, 'tab');
+    assert.ok(tab.props['aria-controls']);
+    assert.equal(typeof tab.props['aria-selected'], 'boolean');
+  }
+  const panes = ['builder-palette', 'builder-canvas', 'builder-inspector'].map((className) => {
+    const pane = findAll(tree, (node) => String(node.props.className || '').split(' ').includes(className))[0];
+    assert.ok(pane, `missing mounted ${className} pane`);
+    assert.equal(pane.props.role, 'tabpanel');
+    assert.ok(pane.props['aria-labelledby']);
+    return pane;
+  });
+  return { switcher, tabs, panes };
+}
+let responsivePanelState = builderPanelState(responsiveBuilderTree);
+assert.deepEqual(responsivePanelState.tabs.map((tab) => tab.props['aria-selected']),
+  [false, true, false], 'the narrow builder must start on Canvas');
+assert.deepEqual(responsivePanelState.panes.map((pane) => /\bmobile-active\b/.test(pane.props.className)),
+  [false, true, false]);
+responsivePanelState.tabs[0].props.onClick();
+responsiveBuilderTree = responsiveBuilder.render(() => responsiveBuilder.window.Builder({ go() {} }));
+responsivePanelState = builderPanelState(responsiveBuilderTree);
+assert.deepEqual(responsivePanelState.tabs.map((tab) => tab.props['aria-selected']),
+  [true, false, false], 'the Palette tab must update the shared mobilePanel state');
+assert.deepEqual(responsivePanelState.panes.map((pane) => /\bmobile-active\b/.test(pane.props.className)),
+  [true, false, false], 'all panes stay mounted while only Palette becomes active');
+const builderWorkspace = findAll(responsiveBuilderTree,
+  (node) => node.props.className === 'builder-workspace')[0];
+assert.ok(builderWorkspace, 'builder panes must share the structural workspace');
+assert.ok(findAll(responsiveBuilderTree,
+  (node) => node.props.className === 'builder-bar builder-header').length,
+  'builder header needs its responsive structural class');
+assert.ok(findAll(responsiveBuilderTree,
+  (node) => node.props.className === 'row builder-actions').length,
+  'builder actions need their responsive wrapping class');
+assert.equal(findAll(responsiveBuilderTree, (node) => node.type === 'button'
+  && /Save (template|changes)/.test(textOf(node))).length, 1,
+  'builder Save must remain rendered outside the switchable panes');
 
 const placedBlock = findAll(builderTree, (node) => String(node.props.className || '').includes('placed-block'))[0];
 assert.ok(placedBlock, 'placed builder fixture must render');
@@ -784,6 +951,173 @@ assert.match(cssRule('.placed-block:focus-visible'), /outline|box-shadow/,
   'placed blocks need a visible keyboard focus indicator');
 assert.match(cssRule('.placed-block:focus-within .pb-actions'), /opacity\s*:\s*1\s*;/,
   'nested block actions must remain visible while focus is within the block');
+
+function persistentManageHarness() {
+  const state = [];
+  let cursor = 0;
+  const HarnessReact = {
+    createElement: React.createElement,
+    Fragment: 'fragment',
+    useState(initial) {
+      const index = cursor++;
+      if (!Object.hasOwn(state, index)) state[index] = typeof initial === 'function' ? initial() : initial;
+      return [state[index], (value) => {
+        state[index] = typeof value === 'function' ? value(state[index]) : value;
+      }];
+    },
+    useEffect() {},
+  };
+  const harnessWindow = {
+    React: HarnessReact,
+    Icon(props) { return HarnessReact.createElement('span', { 'data-icon': props.name }); },
+    GD: {
+      me: { isAdmin: true }, CONNECTIONS: [], NETWORKS: [], USERS: [],
+      SECRETS: [], VARIABLES: [], PALETTE: [],
+    },
+    GDStore: { refresh() { return Promise.resolve(); }, toast() {} },
+    API: {},
+    UI: {
+      Menu() {}, ConfirmModal() {},
+      FormModal(props) {
+        return HarnessReact.createElement('form', { 'aria-label': props.title }, props.children);
+      },
+      Field(props) { return HarnessReact.createElement('input', { 'aria-label': props.label }); },
+      TextArea(props) { return HarnessReact.createElement('textarea', { 'aria-label': props.label }); },
+      SelectField(props) { return HarnessReact.createElement('select', { 'aria-label': props.label }); },
+      Toggle(props) { return HarnessReact.createElement('button', { type: 'button' }, props.label); },
+      fmtBytes(value) { return String(value); },
+      useFetched() { return null; },
+    },
+  };
+  vm.runInNewContext(source, { React: HarnessReact, window: harnessWindow }, {
+    filename: 'web/manage.js',
+  });
+  return {
+    window: harnessWindow,
+    render() {
+      cursor = 0;
+      return resolveTree(harnessWindow.Settings());
+    },
+  };
+}
+
+const settingsHarness = persistentManageHarness();
+let settingsTree = settingsHarness.render();
+let settingsSelector = findAll(settingsTree,
+  (node) => node.props.className === 'seg settings-section-selector')[0];
+assert.ok(settingsSelector, 'Settings needs one narrow-safe six-section selector');
+let settingsTabs = findAll(settingsSelector, (node) => node.type === 'button');
+assert.equal(settingsTabs.length, 6);
+assert.equal(settingsTabs[0].props.className, 'active',
+  'Settings must keep connections as its default section');
+assert.ok(findAll(settingsTree, (node) => node.type === 'button'
+  && textOf(node) === 'Add connection').length,
+  'the default Settings section must retain the easy Add connection path');
+settingsTabs.find((button) => textOf(button) === 'Networks').props.onClick();
+settingsTree = settingsHarness.render();
+settingsSelector = findAll(settingsTree,
+  (node) => node.props.className === 'seg settings-section-selector')[0];
+settingsTabs = findAll(settingsSelector, (node) => node.type === 'button');
+assert.equal(settingsTabs.find((button) => textOf(button) === 'Networks').props.className, 'active',
+  'the narrow selector must update the same Settings section state');
+assert.match(textOf(settingsTree), /Per-connection networks/);
+
+const connectionHarness = persistentManageHarness();
+let connectionTree = connectionHarness.render();
+findAll(connectionTree, (node) => node.type === 'button'
+  && textOf(node) === 'Add connection')[0].props.onClick();
+connectionTree = connectionHarness.render();
+assert.ok(findAll(connectionTree,
+  (node) => node.props.className === 'connection-form-grid').length,
+  'the connection modal main grid needs a responsive class');
+assert.ok(findAll(connectionTree,
+  (node) => node.props.className === 'connection-limit-grid').length,
+  'the connection modal limit grid needs a responsive class');
+
+const tableSections = [
+  ['Dashboard', sourceSection(dashboardSource, 'function TableView(', 'function CardView(')],
+  ['Secrets', sourceSection(source, 'function Secrets(', 'function VarModal(')],
+  ['Variables', sourceSection(source, 'function Variables(', 'function Settings(')],
+  ['Networks', sourceSection(source, 'function Networks(', 'function UserModal(')],
+  ['Users', sourceSection(source, 'function Users(', 'function AuditLog(')],
+  ['Audit', sourceSection(source, 'function AuditLog(', 'function Backups(')],
+  ['Backups', sourceSection(source, 'function Backups(', 'function Preferences(')],
+];
+for (const [name, section] of tableSections) {
+  assert.ok(section.includes("className: 'table-scroll'"),
+    `${name} table must scroll inside its card`);
+  assert.ok(section.indexOf("className: 'table-scroll'") < section.indexOf("h('table'"),
+    `${name} table-scroll must wrap, not follow, the table`);
+}
+
+const dashboardHarnessReact = {
+  createElement: React.createElement,
+  useState(initial) { return [typeof initial === 'function' ? initial() : initial, () => {}]; },
+};
+const dashboardWindow = {
+  React: dashboardHarnessReact,
+  Icon(props) { return dashboardHarnessReact.createElement('span', { 'data-icon': props.name }); },
+  GD: { VMS: [], CONNECTIONS: [], me: { isAdmin: false } },
+  GDStore: { vmHistory() { return []; }, refresh() { return Promise.resolve(); }, toast() {} },
+  API: {},
+  UI: {
+    OSGlyph() {}, StatusBadge() {}, CopyField() {}, Meter() {}, Sparkline() {}, Menu() {},
+    ConfirmModal() {}, FormModal() {}, Field() {}, useFetched() { return null; },
+  },
+};
+vm.runInNewContext(dashboardSource, {
+  React: dashboardHarnessReact,
+  window: dashboardWindow,
+  localStorage: { getItem() { return null; }, setItem() {} },
+  setTimeout() {},
+}, { filename: 'web/dashboard.js' });
+const dashboardTree = resolveTree(dashboardWindow.Dashboard({ go() {} }));
+assert.equal(findAll(dashboardTree, (node) => node.type === 'button'
+  && textOf(node) === 'Deploy VM').length, 1,
+  'Dashboard Deploy must remain rendered on the narrow-capable page');
+
+assert.match(vmDetailSource, /className:\s*'row vm-detail-actions'/,
+  'VM detail actions need their responsive structural class');
+assert.match(vmDetailSource, /className:\s*'vm-detail-columns'/,
+  'VM detail columns need their responsive structural class');
+assert.match(vmDetailSource,
+  /type:\s*'button',[^}]*className:\s*'btn danger sm'[^}]*'aria-label':\s*'Delete VM'/,
+  'Delete VM must be a named native non-submitting control');
+
+const mobileMediaMatches = [...stylesSource.matchAll(/@media\s*\(max-width:\s*760px\)/g)];
+assert.equal(mobileMediaMatches.length, 1, 'keep one effective 760px cascade');
+const mobileMediaIndex = mobileMediaMatches[0].index;
+const reducedMotionIndex = stylesSource.indexOf('@media (prefers-reduced-motion: reduce)');
+assert.ok(mobileMediaIndex > stylesSource.indexOf('.placed-block'),
+  'the 760px cascade must follow affected builder base rules');
+assert.ok(mobileMediaIndex > stylesSource.indexOf('.page-head'),
+  'the 760px cascade must follow affected page-heading base rules');
+assert.ok(reducedMotionIndex > mobileMediaIndex,
+  'reduced-motion overrides must follow the responsive and base rules');
+const mobileCss = stylesSource.slice(mobileMediaIndex, reducedMotionIndex);
+assert.match(cssRule('.table-scroll'), /overflow-x\s*:\s*auto\s*;/,
+  'tables must scroll horizontally inside their wrappers');
+assert.match(mobileCss, /\.sidebar\s*\{[^}]*display\s*:\s*none\s*;/s,
+  'closed mobile navigation must be removed from focus order with display:none');
+assert.match(mobileCss, /\.sidebar\.mobile-open\s*\{[^}]*display\s*:\s*flex\s*;/s);
+assert.doesNotMatch(mobileCss, /\.sidebar\s*\{[^}]*(?:transform|opacity)\s*:/s,
+  'mobile navigation hiding must not depend on transform or opacity');
+assert.match(mobileCss,
+  /\.builder-palette\s*,\s*\.builder-canvas\s*,\s*\.builder-inspector\s*\{[^}]*display\s*:\s*none\s*;/s,
+  'inactive mounted builder panes must use display:none on narrow screens');
+assert.match(mobileCss, /\.bpane\.mobile-active\s*\{[^}]*display\s*:\s*flex\s*;/s);
+assert.doesNotMatch(mobileCss,
+  /\.builder-palette\s*,\s*\.builder-canvas\s*,\s*\.builder-inspector\s*\{[^}]*(?:transform|opacity)\s*:/s,
+  'inactive builder panes must not rely on transform or opacity hiding');
+assert.match(mobileCss, /\.sidebar-foot\s*\{[^}]*display\s*:\s*none\s*;/s,
+  'desktop collapse footer must disappear on narrow screens');
+assert.match(mobileCss, /\.vm-detail-columns\s*\{[^}]*grid-template-columns\s*:\s*1fr/s);
+assert.match(mobileCss, /\.connection-form-grid\s*,\s*\.connection-limit-grid\s*\{[^}]*grid-template-columns\s*:\s*1fr/s);
+const reducedMotionCss = stylesSource.slice(reducedMotionIndex);
+assert.match(reducedMotionCss, /animation-duration\s*:\s*0\.01ms\s*!important\s*;/);
+assert.match(reducedMotionCss, /transition-duration\s*:\s*0\.01ms\s*!important\s*;/);
+assert.match(reducedMotionCss, /\[style\*=["']animation["']\][^{]*\{[^}]*animation\s*:\s*none\s*!important\s*;/s,
+  'reduced motion must override inline animation declarations');
 
 function renderedJobState(rawStatus, status, title, error) {
   const fixture = jobDetailFixture(rawStatus, status, title, error);

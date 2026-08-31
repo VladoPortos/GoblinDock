@@ -51,14 +51,18 @@
   }
 
   // ---------- Palette ----------
-  function Palette({ onAdd, dragRef, onNewBlock }) {
+  function Palette({ onAdd, dragRef, onNewBlock, mobileActive }) {
     const [tab, setTab] = useState('builtin');
     const [q, setQ] = useState('');
     let blocks = (GD.PALETTE || []).filter((b) => (tab === 'builtin' ? b.builtin : !b.builtin));
     if (q) blocks = blocks.filter((b) => (b.name + b.cat + b.desc).toLowerCase().includes(q.toLowerCase()));
     const cats = {};
     blocks.forEach((b) => { (cats[b.cat] = cats[b.cat] || []).push(b); });
-    return h('div', { className: 'bpane', style: { width: 256, borderRight: '1px solid var(--border-soft)' } },
+    return h('div', {
+      id: 'builder-palette-panel', role: 'tabpanel', 'aria-labelledby': 'builder-palette-tab',
+      className: 'bpane builder-palette' + (mobileActive ? ' mobile-active' : ''),
+      style: { width: 256, borderRight: '1px solid var(--border-soft)' },
+    },
       h('div', { className: 'bpane-head' },
         h('span', { className: 'panel-title' }, 'Block Palette'),
         h('button', { type: 'button', className: 'btn ghost sm', title: 'New custom block',
@@ -87,8 +91,12 @@
   }
 
   // ---------- Canvas ----------
-  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }) {
-    return h('div', { className: 'bpane', style: { flex: 1, background: 'var(--bg)' } },
+  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mobileActive }) {
+    return h('div', {
+      id: 'builder-canvas-panel', role: 'tabpanel', 'aria-labelledby': 'builder-canvas-tab',
+      className: 'bpane builder-canvas' + (mobileActive ? ' mobile-active' : ''),
+      style: { flex: 1, background: 'var(--bg)' },
+    },
       h('div', { style: { overflowY: 'auto', flex: 1, padding: '20px 24px 60px' } },
         h('div', { style: { maxWidth: 620, margin: '0 auto', display: 'flex', flexDirection: 'column' } },
           sections.map((sec, si) => h('div', { key: sec.id, className: 'canvas-section' },
@@ -243,11 +251,15 @@
   }
 
   // ---------- Inspector ----------
-  function Inspector({ sections, sel, meta, setInput, setAsk }) {
+  function Inspector({ sections, sel, meta, setInput, setAsk, mobileActive }) {
+    const paneProps = {
+      id: 'builder-inspector-panel', role: 'tabpanel', 'aria-labelledby': 'builder-inspector-tab',
+      className: 'bpane builder-inspector' + (mobileActive ? ' mobile-active' : ''),
+    };
     let block = null;
     sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; } }));
     if (!block) {
-      return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
+      return h('div', { ...paneProps, style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
         h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, 'Template')),
         h('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 14 } },
           h(SpecField, { icon: 'tag', label: 'Template name' },
@@ -271,7 +283,7 @@
             h('p', { className: 'hint', style: { fontSize: 11.5 } }, 'These blocks run on every VM you deploy with this template.'))));
     }
     const schema = paletteByKey(block.ref).schema || [];
-    return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
+    return h('div', { ...paneProps, style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
       h('div', { className: 'bpane-head' },
         h('span', { className: 'placed-ico', style: { width: 22, height: 22 } }, h(Icon, { name: refIcon(block.ref), size: 14 })),
         h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 12.5 } }, block.name)),
@@ -369,6 +381,7 @@
     const [selNetId, setSelNetId] = useState(loadedTpl ? loadedTpl.networkId : null);
     const [desc, setDesc] = useState(loadedTpl ? (loadedTpl.desc || '') : '');
     const [isPublic, setIsPublic] = useState(loadedTpl ? !!loadedTpl.public : false);
+    const [mobilePanel, setMobilePanel] = useState('canvas');
 
     const bases = GD.BASE_IMAGES || [];
     const conns = GD.CONNECTIONS || [];
@@ -457,7 +470,7 @@
     const warnCount = sections.reduce((a, s) => a + s.blocks.filter(warnOf).length, 0);
 
     return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%' } },
-      h('div', { className: 'builder-bar' },
+      h('div', { className: 'builder-bar builder-header' },
         h('div', { className: 'row', style: { gap: 10, minWidth: 0 } },
           h('button', { className: 'btn ghost sm', title: 'Back', onClick: () => go('templates') },
             h(Icon, { name: 'chevronL', size: 16 }), 'Templates'),
@@ -466,7 +479,7 @@
           h('span', { className: 'chip', style: { gap: 6 } }, h(OSGlyph, { os: meta.os, size: 14 }), meta.base),
           h('span', { className: 'hint mono', style: { fontSize: 11 } }, blockCount, ' blocks'),
           warnCount > 0 && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, h(Icon, { name: 'warn', size: 12 }), warnCount, ' need input')),
-        h('div', { className: 'row', style: { marginLeft: 'auto', gap: 8 } },
+        h('div', { className: 'row builder-actions', style: { marginLeft: 'auto', gap: 8 } },
           h('button', { className: 'btn sm' + (isPublic ? ' primary' : ''),
             title: isPublic ? 'Public — every user can see and deploy this template'
                             : 'Private — only you can see this template',
@@ -474,10 +487,16 @@
             h(Icon, { name: isPublic ? 'globe' : 'lock', size: 15 }), isPublic ? 'Public' : 'Private'),
           h('button', { className: 'btn sm', onClick: openYaml }, h(Icon, { name: 'code', size: 15 }), 'View YAML'),
           h('button', { className: 'btn primary sm', onClick: doSave, disabled: busy }, h(Icon, { name: 'check', size: 15 }), busy ? 'Working…' : (loadedTpl ? 'Save changes' : 'Save template')))),
-      h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
-        h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({}) }),
-        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),
-        h(Inspector, { sections, sel, meta, setInput, setAsk })),
+      h('div', { className: 'builder-mobile-switcher', role: 'tablist', 'aria-label': 'Builder panels' },
+        ['palette', 'canvas', 'inspector'].map((panel) => h('button', {
+          key: panel, id: 'builder-' + panel + '-tab', type: 'button', role: 'tab',
+          'aria-selected': mobilePanel === panel, 'aria-controls': 'builder-' + panel + '-panel',
+          className: mobilePanel === panel ? 'active' : '', onClick: () => setMobilePanel(panel),
+        }, panel[0].toUpperCase() + panel.slice(1)))),
+      h('div', { className: 'builder-workspace' },
+        h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({}), mobileActive: mobilePanel === 'palette' }),
+        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mobileActive: mobilePanel === 'canvas' }),
+        h(Inspector, { sections, sel, meta, setInput, setAsk, mobileActive: mobilePanel === 'inspector' })),
       yaml && h(Modal, { onClose: () => setYaml(false), width: 'min(680px, 94vw)' },
         h('div', { className: 'modal-head' },
           h(Icon, { name: 'code', size: 17, style: { color: 'var(--accent)' } }),

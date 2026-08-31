@@ -195,16 +195,10 @@ body {
 .crumb { display: flex; align-items: center; gap: 8px; color: var(--text-faint); font-size: 13px; }
 .crumb .mono { color: var(--text); font-weight: 600; }
 .topbar-right { margin-left: auto; display: flex; align-items: center; gap: 10px; }
+.mobile-nav-toggle, .sidebar-scrim { display: none; }
 
 .content { flex: 1; overflow-y: auto; overflow-x: hidden; }
 .page { padding: 26px 28px 64px; max-width: 1320px; margin: 0 auto; }
-
-/* Responsive: keep things usable down to tablet / narrow windows. */
-@media (max-width: 760px) {
-  .page { padding: 18px 14px 56px; }
-  .page-head { gap: 10px; }
-  .page-head .spacer { flex-basis: 100%; height: 0; }
-}
 
 /* ---------- Buttons ---------- */
 .btn {
@@ -331,6 +325,8 @@ body {
 .toggle.on::after { left: 18px; }
 
 /* ---------- Tables ---------- */
+.table-scroll { overflow-x: auto; overscroll-behavior-x: contain; }
+.table-scroll .tbl { width: max-content; min-width: 100%; }
 .tbl { width: 100%; border-collapse: collapse; }
 .tbl th {
   text-align: left; font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 600;
@@ -456,6 +452,8 @@ a { color: var(--accent); text-decoration: none; }
 
 /* ============ Builder (hero) ============ */
 .bpane { display: flex; flex-direction: column; min-height: 0; height: 100%; }
+.builder-workspace { display: flex; flex: 1; min-height: 0; overflow: hidden; }
+.builder-mobile-switcher { display: none; }
 .bpane-head { display: flex; align-items: center; gap: 9px; padding: 12px 14px; border-bottom: 1px solid var(--border-soft); flex-shrink: 0; min-height: 48px; }
 .builder-bar { display: flex; align-items: center; gap: 12px; padding: 0 16px; height: 56px; flex-shrink: 0;
   border-bottom: 1px solid var(--border-soft); background: color-mix(in oklab, var(--surface) 50%, transparent); backdrop-filter: blur(8px); }
@@ -521,3 +519,72 @@ a { color: var(--accent); text-decoration: none; }
 
 /* menu item disabled state */
 .menu-item:disabled { opacity: .4; cursor: not-allowed; }
+
+/* Responsive overrides follow every affected base rule so the narrow cascade wins. */
+@media (max-width: 760px) {
+  .app { grid-template-columns: minmax(0, 1fr); }
+  .sidebar {
+    display: none; position: fixed; inset: 0 auto 0 0; z-index: 70;
+    width: min(232px, calc(100vw - 48px));
+    background: var(--surface); box-shadow: var(--shadow-lg);
+  }
+  .sidebar.mobile-open { display: flex; width: min(232px, calc(100vw - 48px)); }
+  .sidebar-foot { display: none; }
+  .sidebar-scrim {
+    display: block; position: fixed; inset: 0; z-index: 65; width: 100%; height: 100%;
+    border: 0; border-radius: 0; background: oklch(0.08 0.005 80 / 0.62);
+  }
+  .mobile-nav-toggle { display: inline-grid; flex-shrink: 0; }
+  .topbar { padding: 0 12px; gap: 9px; }
+  .crumb { min-width: 0; overflow: hidden; }
+  .crumb span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .topbar-right { gap: 5px; }
+
+  .page { padding: 18px 14px 56px; min-width: 0; }
+  .page-head { gap: 10px; align-items: flex-start; }
+  .page-head .spacer { flex-basis: 100%; height: 0; }
+  .page-title { font-size: 21px; overflow-wrap: anywhere; }
+  .search { min-width: min(220px, 100%); }
+
+  .settings-section-selector {
+    display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); width: 100%;
+  }
+  .settings-section-selector button { justify-content: flex-start; min-width: 0; }
+  .connection-form-grid, .connection-limit-grid { grid-template-columns: 1fr !important; }
+
+  .builder-bar {
+    height: auto; min-height: 56px; padding: 8px 12px; flex-wrap: wrap; align-items: center;
+  }
+  .builder-header > .row:first-child { flex: 1 1 100%; flex-wrap: wrap; }
+  .builder-actions { width: 100%; margin-left: 0 !important; flex-wrap: wrap; }
+  .recipe-name { min-width: 0; flex: 1; max-width: 100%; }
+  .builder-mobile-switcher {
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr));
+    gap: 2px; padding: 5px 8px; background: var(--inset);
+    border-bottom: 1px solid var(--border-soft); flex-shrink: 0;
+  }
+  .builder-mobile-switcher button {
+    min-width: 0; padding: 7px 5px; border: 0; border-radius: 7px;
+    background: transparent; color: var(--text-faint); font: 600 11.5px 'JetBrains Mono', monospace;
+  }
+  .builder-mobile-switcher button.active { background: var(--surface-3); color: var(--text); }
+  .builder-palette, .builder-canvas, .builder-inspector {
+    display: none; width: 100% !important; border-left: 0 !important; border-right: 0 !important;
+  }
+  .bpane.mobile-active { display: flex; }
+  .placed-block { flex-wrap: wrap; align-items: flex-start; }
+  .pb-actions { margin-left: auto; opacity: 1; }
+
+  .vm-detail-actions { width: 100%; flex-wrap: wrap; }
+  .vm-detail-columns { grid-template-columns: 1fr !important; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    scroll-behavior: auto !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+  [style*="animation"] { animation: none !important; }
+}

@@ -89,7 +89,7 @@
 
   function TableView({ vms, go, onAct, sel, toggleSel, allSel, toggleAll }) {
     return h('div', { className: 'card', style: { overflow: 'hidden' } },
-      h('div', { style: { overflowX: 'auto' } },
+      h('div', { className: 'table-scroll' },
         h('table', { className: 'tbl' },
           h('thead', null, h('tr', null,
             h('th', { style: { width: 34 } }, h(SelBox, { checked: allSel, onToggle: toggleAll, title: 'Select all' })),
