@@ -1,4 +1,5 @@
 """Wave 39 — UI, accessibility, and onboarding regressions."""
+import asyncio
 import base64
 import hashlib
 import json
@@ -35,6 +36,7 @@ os.environ.setdefault(
 
 from app import api, seed, serialize as S  # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
+from app.main import app as application  # noqa: E402
 from app.models import (  # noqa: E402
     Block,
     Connection,
@@ -43,11 +45,95 @@ from app.models import (  # noqa: E402
     Job,
     JobStep,
     Network,
+    Secret,
     Template,
     User,
+    Variable,
 )
+from app.security import encrypt, hash_password  # noqa: E402
 
 init_db()
+
+
+async def _asgi_request(method, path, *, json_body=None, cookie=""):
+    """Dependency-free in-process client for the real mounted FastAPI application."""
+    body = b"" if json_body is None else json.dumps(json_body).encode("utf-8")
+    headers = [(b"host", b"testserver")]
+    if body:
+        headers.extend([
+            (b"content-type", b"application/json"),
+            (b"content-length", str(len(body)).encode("ascii")),
+        ])
+    if cookie:
+        headers.append((b"cookie", cookie.encode("latin-1")))
+
+    request_sent = False
+    wait_for_disconnect = asyncio.Event()
+
+    async def receive():
+        nonlocal request_sent
+        if not request_sent:
+            request_sent = True
+            return {"type": "http.request", "body": body, "more_body": False}
+        await wait_for_disconnect.wait()
+        return {"type": "http.disconnect"}
+
+    messages = []
+
+    async def send(message):
+        messages.append(message)
+
+    await application(
+        {
+            "type": "http",
+            "asgi": {"version": "3.0", "spec_version": "2.3"},
+            "http_version": "1.1",
+            "method": method,
+            "scheme": "http",
+            "path": path,
+            "raw_path": path.encode("ascii"),
+            "query_string": b"",
+            "root_path": "",
+            "headers": headers,
+            "client": ("127.0.0.1", 39039),
+            "server": ("testserver", 80),
+        },
+        receive,
+        send,
+    )
+    start = next(message for message in messages if message["type"] == "http.response.start")
+    response_body = b"".join(
+        message.get("body", b"")
+        for message in messages
+        if message["type"] == "http.response.body"
+    )
+    return {
+        "status": start["status"],
+        "headers": [(name.decode("latin-1"), value.decode("latin-1"))
+                    for name, value in start["headers"]],
+        "body": response_body,
+    }
+
+
+def test_ci_runs_ui_behavior_suites_and_fail_closed_syntax_checks_all_20_scripts():
+    """CI must execute both UI suites and reject any drift from the 18+2 JS set."""
+    workflow = (
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+    ).read_text(encoding="utf-8")
+
+    required_contracts = {
+        "the complete 18 web + 2 UI-test syntax-check list": (
+            "js_files=(web/*.js tests/test_wave37_ui.js tests/test_wave39_ui.js)"
+        ),
+        "the fail-closed 20-file guard": 'if [ "${#js_files[@]}" -ne 20 ]; then',
+        "the syntax-check loop": (
+            'for f in "${js_files[@]}"; do node --check "$f"; done'
+        ),
+        "the Wave 37 UI behavior suite": "node tests/test_wave37_ui.js",
+        "the Wave 39 UI behavior suite": "node tests/test_wave39_ui.js",
+    }
+    missing = [name for name, source in required_contracts.items() if source not in workflow]
+    assert not missing, f"CI workflow is missing: {', '.join(missing)}"
 
 
 def _starter_engine():
@@ -479,6 +565,278 @@ def test_connection_admin_round_trip_and_public_redaction():
     assert forbidden_public_keys.isdisjoint(public), public
     assert token_secret_sentinel not in json.dumps(admin)
     assert token_secret_sentinel not in json.dumps(public)
+
+
+def test_authenticated_non_admin_state_endpoint_redacts_operations_and_sensitive_inputs():
+    """The mounted endpoint, session auth, tenant filters, and serializers stay closed."""
+    suffix = os.urandom(4).hex()
+    viewer_email = f"wave39-state-viewer-{suffix}@example.com"
+    viewer_password = "StateViewer39!"
+    sentinels = {
+        "host": f"host-{suffix}.internal.example",
+        "token_id": f"wave39-{suffix}@pve!endpoint",
+        "token_secret": f"WAVE39-ENDPOINT-TOKEN-{suffix}",
+        "storage": f"zfs-private-{suffix}",
+        "iso_storage": f"iso-private-{suffix}",
+        "snippet_storage": f"snippets-private-{suffix}",
+        "ssh_host": f"ssh-{suffix}.internal.example",
+        "ssh_user": f"ssh-user-{suffix}",
+        "ssh_key_path": f"/run/secrets/wave39-{suffix}",
+        "network_topology": f"10.39.{int(suffix[:2], 16)}.0/24",
+        "password_input": f"WAVE39-PASSWORD-INPUT-{suffix}",
+        "token_input": f"WAVE39-TOKEN-INPUT-{suffix}",
+        "password_default": f"WAVE39-PASSWORD-DEFAULT-{suffix}",
+        "token_default": f"WAVE39-TOKEN-DEFAULT-{suffix}",
+        "admin_secret": f"WAVE39-ADMIN-SECRET-{suffix}",
+        "viewer_secret": f"WAVE39-VIEWER-SECRET-{suffix}",
+    }
+
+    with session_scope() as session:
+        admin = User(
+            email=f"wave39-state-admin-{suffix}@example.com",
+            name="Wave 39 state admin",
+            password_hash=hash_password("AdminState39!"),
+            role="admin",
+        )
+        viewer = User(
+            email=viewer_email,
+            name="Wave 39 state viewer",
+            password_hash=hash_password(viewer_password),
+            role="user",
+        )
+        connection = Connection(
+            name=f"wave39-public-target-{suffix}",
+            host=sentinels["host"],
+            port=9443,
+            token_id=sentinels["token_id"],
+            token_secret_enc=encrypt(sentinels["token_secret"]),
+            verify_tls=False,
+            node="pve-public-node",
+            storage=sentinels["storage"],
+            iso_storage=sentinels["iso_storage"],
+            snippet_storage=sentinels["snippet_storage"],
+            bridge="vmbr39-private",
+            ssh_host=sentinels["ssh_host"],
+            ssh_user=sentinels["ssh_user"],
+            ssh_key_path=sentinels["ssh_key_path"],
+            max_cores=8,
+            max_ram_mb=16 * 1024,
+            max_disk_gb=200,
+        )
+        image = Image(
+            kind="base",
+            name=f"wave39-public-image-{suffix}",
+            source_url="https://example.com/wave39-public.img",
+            build_status="ready",
+        )
+        session.add(admin)
+        session.add(viewer)
+        session.add(connection)
+        session.add(image)
+        session.flush()
+
+        network = Network(
+            connection_id=connection.id,
+            name=f"wave39-public-network-{suffix}",
+            mode="static",
+            bridge="vmbr39-private",
+            vlan=339,
+            subnet_cidr=sentinels["network_topology"],
+            gateway=sentinels["network_topology"].replace("0/24", "1"),
+            range_start=sentinels["network_topology"].replace("0/24", "20"),
+            range_end=sentinels["network_topology"].replace("0/24", "30"),
+            dns="10.39.0.53",
+        )
+        sensitive_block = Block(
+            key=f"c-wave39-state-sensitive-{suffix}",
+            kind="custom",
+            builtin=False,
+            owner_id=admin.id,
+            name="Wave 39 sensitive public block",
+            input_schema_json=json.dumps([
+                {
+                    "name": "password",
+                    "type": "password",
+                    "default": sentinels["password_default"],
+                },
+                {
+                    "name": "token",
+                    "type": "secret",
+                    "default": sentinels["token_default"],
+                },
+                {"name": "note", "type": "text", "default": "safe default"},
+            ]),
+        )
+        public_block = Block(
+            key=f"b-wave39-state-public-{suffix}",
+            builtin=True,
+            name="Wave 39 public palette block",
+            input_schema_json=json.dumps([
+                {"name": "message", "type": "text", "default": "safe default"},
+            ]),
+        )
+        session.add(network)
+        session.add(sensitive_block)
+        session.add(public_block)
+        session.flush()
+
+        template = Template(
+            name=f"wave39-public-template-{suffix}",
+            owner_id=admin.id,
+            public=True,
+            recipe_json=json.dumps([{"blocks": [{
+                "ref": sensitive_block.key,
+                "inputs": {
+                    "password": sentinels["password_input"],
+                    "token": sentinels["token_input"],
+                    "note": "safe public note",
+                },
+            }]}]),
+            base_image_id=image.id,
+            connection_id=connection.id,
+            network_id=network.id,
+        )
+        admin_secret = Secret(
+            scope="global",
+            owner_id=admin.id,
+            name=f"WAVE39_ADMIN_SECRET_{suffix}",
+            value_enc=encrypt(sentinels["admin_secret"]),
+            created_by=admin.id,
+        )
+        viewer_secret = Secret(
+            scope="user",
+            owner_id=viewer.id,
+            name=f"WAVE39_VIEWER_SECRET_{suffix}",
+            value_enc=encrypt(sentinels["viewer_secret"]),
+            created_by=viewer.id,
+        )
+        admin_variable = Variable(
+            scope="global",
+            owner_id=admin.id,
+            name=f"WAVE39_ADMIN_VARIABLE_{suffix}",
+            value="admin-only variable",
+            created_by=admin.id,
+        )
+        viewer_variable = Variable(
+            scope="user",
+            owner_id=viewer.id,
+            name=f"WAVE39_VIEWER_VARIABLE_{suffix}",
+            value="viewer-visible variable",
+            created_by=viewer.id,
+        )
+        session.add(template)
+        session.add(admin_secret)
+        session.add(viewer_secret)
+        session.add(admin_variable)
+        session.add(viewer_variable)
+        session.flush()
+        fixture = {
+            "viewer_id": viewer.id,
+            "connection_id": connection.id,
+            "connection_name": connection.name,
+            "network_id": network.id,
+            "network_name": network.name,
+            "template_id": template.id,
+            "image_name": image.name,
+            "sensitive_block": sensitive_block.key,
+            "public_block": public_block.key,
+            "viewer_secret": viewer_secret.name,
+            "admin_secret": admin_secret.name,
+            "viewer_variable": viewer_variable.name,
+            "admin_variable": admin_variable.name,
+        }
+
+    original_px_cache = api._px_cache
+    api._px_cache = lambda _connections: {}
+    try:
+        login = asyncio.run(_asgi_request(
+            "POST",
+            "/api/auth/login",
+            json_body={"email": viewer_email, "password": viewer_password},
+        ))
+        assert login["status"] == 200, login["body"].decode("utf-8")
+        set_cookie = next(
+            value for name, value in login["headers"] if name.lower() == "set-cookie"
+        )
+        response = asyncio.run(_asgi_request(
+            "GET", "/api/state", cookie=set_cookie.split(";", 1)[0],
+        ))
+        assert response["status"] == 200, response["body"].decode("utf-8")
+        state = json.loads(response["body"])
+    finally:
+        api._px_cache = original_px_cache
+
+    assert state["me"]["id"] == fixture["viewer_id"]
+    assert state["me"]["isAdmin"] is False
+    assert state["USERS"] == []
+
+    public_connection = next(
+        row for row in state["CONNECTIONS"]
+        if row["connId"] == fixture["connection_id"]
+    )
+    assert public_connection == {
+        "id": f"c-{fixture['connection_id']}",
+        "connId": fixture["connection_id"],
+        "name": fixture["connection_name"],
+        "status": "unknown",
+        "version": "—",
+        "node": "pve-public-node",
+        "vms": 0,
+        "maxCores": 8,
+        "maxRamGb": 16,
+        "maxDiskGb": 200,
+    }
+    forbidden_connection_keys = {
+        "url", "host", "port", "tokenId", "token_id", "tokenSecret",
+        "token_secret", "token_secret_enc", "verifyTls", "verify_tls", "storage",
+        "isoStorage", "iso_storage", "snippetStorage", "snippet_storage", "bridge",
+        "sshHost", "ssh_host", "sshUser", "ssh_user", "sshKeyPath", "ssh_key_path",
+    }
+    assert forbidden_connection_keys.isdisjoint(public_connection), public_connection
+
+    public_network = next(
+        row for row in state["NETWORKS"] if row["netId"] == fixture["network_id"]
+    )
+    assert public_network["name"] == fixture["network_name"]
+    assert public_network["connId"] == fixture["connection_id"]
+    assert public_network["rawMode"] == "static"
+    assert {"bridge", "vlan", "subnet", "gateway", "rangeStart", "rangeEnd", "dns"}.isdisjoint(
+        public_network
+    )
+
+    public_template = next(
+        row for row in state["TEMPLATES"]
+        if row["templateId"] == fixture["template_id"]
+    )
+    assert (public_template["canEdit"], public_template["canDelete"]) == (False, False)
+    assert public_template["deployable"] is True
+    assert public_template["base"] == fixture["image_name"]
+    assert public_template["connectionId"] == fixture["connection_id"]
+    assert public_template["networkId"] == fixture["network_id"]
+    assert public_template["recipe"][0]["blocks"][0]["inputs"] == {
+        "password": "********",
+        "token": "********",
+        "note": "safe public note",
+    }
+
+    palette_keys = {row["key"] for row in state["PALETTE"]}
+    assert fixture["public_block"] in palette_keys
+    assert fixture["sensitive_block"] not in palette_keys
+    assert fixture["admin_secret"] not in {row["name"] for row in state["SECRETS"]}
+    public_viewer_secret = next(
+        row for row in state["SECRETS"] if row["name"] == fixture["viewer_secret"]
+    )
+    assert public_viewer_secret["val"] != sentinels["viewer_secret"]
+    assert "•" in public_viewer_secret["val"]
+    assert fixture["admin_variable"] not in {row["name"] for row in state["VARIABLES"]}
+    public_viewer_variable = next(
+        row for row in state["VARIABLES"] if row["name"] == fixture["viewer_variable"]
+    )
+    assert public_viewer_variable["value"] == "viewer-visible variable"
+
+    serialized_state = json.dumps(state)
+    for name, sentinel in sentinels.items():
+        assert sentinel not in serialized_state, f"{name} leaked from authenticated /api/state"
 
 
 def _template_capability_fixture():
@@ -1162,6 +1520,7 @@ def test_base_image_create_and_edit_persist_normalized_checksum_atomically():
 
 
 if __name__ == "__main__":
+    test_ci_runs_ui_behavior_suites_and_fail_closed_syntax_checks_all_20_scripts()
     test_sri_rejects_local_vendor_resource_without_integrity()
     test_sri_rejects_local_vendor_resource_with_sha256_only()
     test_sri_rejects_duplicate_resource_replacing_distinct_vendor_asset()
@@ -1176,6 +1535,7 @@ if __name__ == "__main__":
     test_sri_reports_exact_pre_fix_six_crlf_mismatches()
     test_local_sri_resources_match_exact_working_tree_bytes()
     test_connection_admin_round_trip_and_public_redaction()
+    test_authenticated_non_admin_state_endpoint_redacts_operations_and_sensitive_inputs()
     test_template_capabilities_follow_owner_and_admin_edit_authority()
     test_referenced_owned_template_stays_editable_but_cannot_be_deleted()
     test_template_capabilities_fail_safe_without_viewer_and_preserve_payload_data()
