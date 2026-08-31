@@ -21,9 +21,9 @@ os.environ.setdefault("GOBLINDOCK_DATA_DIR", os.path.join(tempfile.gettempdir(),
 
 from sqlmodel import Session, select  # noqa: E402
 
-from app import api, execution_plan  # noqa: E402
+from app import api, execution_plan, worker  # noqa: E402
 from app.db import engine, init_db, session_scope  # noqa: E402
-from app.models import Block, Connection, Image, Job, Network, Template, User  # noqa: E402
+from app.models import Block, Connection, Deployment, Image, Job, Network, Template, User  # noqa: E402
 from app.security import hash_password  # noqa: E402
 from app import serialize as S  # noqa: E402
 
@@ -124,8 +124,44 @@ def test_job_detail_does_not_disclose_execution_plan_or_captured_command():
     assert "private-command" not in rendered
 
 
+def test_legacy_queued_job_persists_execution_plan_once():
+    """A pre-snapshot queued job must be upgraded to a persisted plan before execution."""
+    uid, template_id, block_key = _mk_plan_fixture(command="legacy-command")
+    with session_scope() as s:
+        template = s.get(Template, template_id)
+        deployment = Deployment(
+            name="legacy-plan-vm", owner_id=uid, template_id=template.id,
+            connection_id=template.connection_id, image_id=template.base_image_id,
+            network_id=template.network_id,
+            deploy_inputs_json='{"0.0":{"hostname":"legacy-host"}}',
+        )
+        s.add(deployment)
+        s.flush()
+        job = Job(
+            type="deploy", status="queued", deployment_id=deployment.id,
+            connection_id=deployment.connection_id, created_by=uid,
+        )
+        s.add(job)
+        s.flush()
+        job_copy = Job(**job.model_dump())
+        deployment_copy = Deployment(**deployment.model_dump())
+        job_id = job.id
+
+    _plan, recipe, blocks = worker._load_materialized_job_plan(job_copy, deployment_copy)
+    assert recipe[0]["blocks"][0]["inputs"]["hostname"] == "legacy-host"
+    assert "legacy-command" in blocks[block_key].ansible_template
+    with session_scope() as s:
+        persisted = s.get(Job, job_id).execution_plan_enc
+    assert persisted
+
+    worker._load_materialized_job_plan(job_copy, deployment_copy)
+    with session_scope() as s:
+        assert s.get(Job, job_id).execution_plan_enc == persisted
+
+
 if __name__ == "__main__":
     test_execution_plan_is_encrypted_and_immutable()
     test_execution_plan_rejects_malformed_ciphertext()
     test_job_detail_does_not_disclose_execution_plan_or_captured_command()
+    test_legacy_queued_job_persists_execution_plan_once()
     print("\\nALL WAVE 37 UNIT TESTS PASSED")

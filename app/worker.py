@@ -35,6 +35,7 @@ from .models import (
     Job,
     JobEvent,
     JobStep,
+    Template,
     Secret,
     User,
     Variable,
