@@ -103,6 +103,7 @@ def _migrate() -> None:
         ],
         "users": [
             ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
+            ("deleted_at", "TIMESTAMP"),
             ("failed_logins", "INTEGER NOT NULL DEFAULT 0"),
             ("locked_until", "TIMESTAMP"),
             ("widget_key_hash", "TEXT"),

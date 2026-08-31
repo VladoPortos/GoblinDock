@@ -10,6 +10,7 @@ import re
 import socket
 import threading
 import time
+from collections import OrderedDict
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -42,7 +43,6 @@ from .models import (
     Secret,
     Variable,
     User,
-    ensure_utc,
     utcnow,
 )
 from .proxmox import Proxmox, base_disk_filename
@@ -340,6 +340,8 @@ def _build_job_ctx(session: Session, base: Image, cpu: int, ram: int, disk: int,
 # helpers                                                                      #
 # --------------------------------------------------------------------------- #
 def _maps(session: Session):
+    # Keep tombstones in this reference map so historical VMs/jobs/templates retain a
+    # stable, scrubbed owner rather than becoming detached from a reused integer ID.
     users = {u.id: u for u in session.exec(select(User)).all()}
     conns = {c.id: c for c in session.exec(select(Connection)).all()}
     return users, conns
@@ -413,7 +415,7 @@ def _owned_deployment(session: Session, dep_id: int, user: User) -> Deployment:
 # auth                                                                          #
 # --------------------------------------------------------------------------- #
 class LoginBody(BaseModel):
-    email: str
+    email: str = Field(max_length=320)
     password: str
 
 
@@ -427,13 +429,18 @@ class SetupBody(BaseModel):
 def auth_status(request: Request, session: Session = Depends(get_session)):
     # Always 200 (never 401), so the client can cheaply re-verify after a stray 401
     # without that very check tripping the "drop to login" path.
-    has_users = session.exec(select(User)).first() is not None
+    has_users = session.exec(
+        select(User.id).where(User.deleted_at.is_(None))
+    ).first() is not None
     uid = request.session.get("uid")
     authed = False
     if uid:
         u = session.get(User, uid)
         # mirror current_user: a stale session epoch (post password-change) is NOT authed
-        authed = bool(u and not u.disabled and request.session.get("sv", 0) == u.session_epoch)
+        authed = bool(
+            u and not u.disabled and u.deleted_at is None
+            and request.session.get("sv", 0) == u.session_epoch
+        )
     return {"needsSetup": not has_users, "authenticated": authed}
 
 
@@ -446,7 +453,7 @@ _setup_lock = threading.Lock()
 @router.post("/auth/setup")
 def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get_session)):
     with _setup_lock:
-        if session.exec(select(User)).first():
+        if session.exec(select(User.id).where(User.deleted_at.is_(None))).first():
             raise HTTPException(400, "already initialised")
         _check_password(body.password)
         user = User(email=body.email.strip().lower(), name=body.name.strip() or "Admin",
@@ -462,32 +469,44 @@ def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get
 
 
 # Tiny in-memory login throttle (per email+ip). Resets on restart — fine for v1.
-_login_attempts: dict[str, list[float]] = {}
+_login_attempts: OrderedDict[str, list[float]] = OrderedDict()
+_login_attempts_lock = threading.Lock()
 _MAX_THROTTLE_KEYS = 10_000
 
 
 def _throttle(key: str) -> None:
     now = time.time()
-    window = [t for t in _login_attempts.get(key, []) if now - t < 300]
-    if window:
-        _login_attempts[key] = window
-    else:
-        # Don't keep empty windows around — the key is f"{email}|{ip}" with an
-        # unvalidated email, so a stream of unique emails would otherwise grow the
-        # dict without bound (unauthenticated memory-growth DoS).
-        _login_attempts.pop(key, None)
-    # Opportunistic sweep once the dict is large: drop every key whose window is empty
-    # or fully outside the 5-min horizon. Keeps memory bounded under an attack.
-    if len(_login_attempts) > _MAX_THROTTLE_KEYS:
-        for k, ts in list(_login_attempts.items()):
-            if not ts or now - ts[-1] >= 300:
-                _login_attempts.pop(k, None)
-    if len(window) >= 8:
-        raise HTTPException(429, "too many attempts — try again in a few minutes")
+    with _login_attempts_lock:
+        window = [t for t in _login_attempts.get(key, []) if now - t < 300]
+        if window:
+            _login_attempts[key] = window
+            _login_attempts.move_to_end(key)
+        else:
+            _login_attempts.pop(key, None)
+        # `_record_attempt` enforces this after every public mutation. Retain a
+        # defensive trim for tests/diagnostics or accidental direct mutation, removing
+        # expired entries before evicting the least-recently-used live windows.
+        if len(_login_attempts) > _MAX_THROTTLE_KEYS:
+            for stale_key, timestamps in list(_login_attempts.items()):
+                if not timestamps or now - timestamps[-1] >= 300:
+                    _login_attempts.pop(stale_key, None)
+            while len(_login_attempts) > _MAX_THROTTLE_KEYS:
+                _login_attempts.popitem(last=False)
+        if len(window) >= 8:
+            raise HTTPException(429, "too many attempts — try again in a few minutes")
 
 
 def _record_attempt(key: str) -> None:
-    _login_attempts.setdefault(key, []).append(time.time())
+    with _login_attempts_lock:
+        _login_attempts.setdefault(key, []).append(time.time())
+        _login_attempts.move_to_end(key)
+        while len(_login_attempts) > _MAX_THROTTLE_KEYS:
+            _login_attempts.popitem(last=False)
+
+
+def _clear_login_attempts(key: str) -> None:
+    with _login_attempts_lock:
+        _login_attempts.pop(key, None)
 
 
 _LOCK_THRESHOLD = 5      # consecutive failures before a temporary lock
@@ -523,20 +542,23 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     email = body.email.strip().lower()
     key = f"{email}|{ip}"
     _throttle(key)
-    user = session.exec(select(User).where(User.email == email)).first()
-    # Per-account lockout — persists across restarts (unlike the in-memory IP throttle),
-    # blunting password-spray and proxy-IP-collapsed brute force. SQLite returns the
-    # stored datetime as naive, so normalise to UTC before comparing with utcnow().
-    if user and user.locked_until:
-        lu = ensure_utc(user.locked_until)
-        if lu > utcnow():
-            raise HTTPException(429, "account temporarily locked — try again later")
-    if not user or user.disabled or not verify_password(body.password, user.password_hash):
+    user = session.exec(select(User).where(
+        User.email == email, User.deleted_at.is_(None),
+    )).first()
+    # Persistent failure state must never become an account-existence oracle or deny a
+    # legitimate password. Wrong known/unknown credentials share the same response;
+    # the symmetric email+IP throttle above is the only 429 path. A correct credential
+    # clears any persistent lock and authenticates normally.
+    valid_password = bool(
+        user and not user.disabled and user.deleted_at is None
+        and verify_password(body.password, user.password_hash)
+    )
+    if not valid_password:
         _record_attempt(key)
-        if user and not user.disabled:
+        if user and not user.disabled and user.deleted_at is None:
             _record_account_login_failure(session, user.id, utcnow())
         raise HTTPException(401, "invalid email or password")
-    _login_attempts.pop(key, None)
+    _clear_login_attempts(key)
     user.failed_logins = 0
     user.locked_until = None
     user.last_login = utcnow()
@@ -673,7 +695,9 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     networks = S.network_dicts(session, conn_list, public=not is_admin)
     # The full user directory (names, emails, roles, last-login) is admin-only — a
     # non-admin never needs it (their own identity comes from `me`) and it must not leak.
-    users_list = [S.user_dict(session, u) for u in users.values()] if is_admin else []
+    users_list = [
+        S.user_dict(session, u) for u in users.values() if u.deleted_at is None
+    ] if is_admin else []
 
     jobs_q = select(Job).where(Job.dismissed == False).order_by(Job.id.desc()).limit(20)  # noqa: E712
     if user.role != "admin":
@@ -2403,7 +2427,9 @@ class UserBody(BaseModel):
 
 @router.post("/users")
 def add_user(body: UserBody, user: User = Depends(require_admin), session: Session = Depends(get_session)):
-    if session.exec(select(User).where(User.email == body.email.strip().lower())).first():
+    if session.exec(select(User).where(
+        User.email == body.email.strip().lower(), User.deleted_at.is_(None),
+    )).first():
         raise HTTPException(400, "email already exists")
     _check_password(body.password)
     u = User(email=body.email.strip().lower(), name=body.name.strip(),
@@ -2598,13 +2624,17 @@ def set_auto_root_password(body: AutoRootPwBody, user: User = Depends(require_ad
 @router.get("/jobs/{job_id}/stream")
 async def stream_job(job_id: int, request: Request, user: User = Depends(current_user)):
     """SSE: emit a job snapshot whenever steps/logs/progress change."""
-    # Authenticate + authorise up front (the generator below runs unattended).
+    # The dependency authenticates this request and this check rejects an unauthorized
+    # handshake. The generator also repeats both checks against fresh rows before every
+    # read/emission because an SSE connection can otherwise outlive revocation.
     with Session(engine) as s0:
         job0 = s0.get(Job, job_id)
         if not job0:
             raise HTTPException(404, "not found")
         if not _job_owned(job0, user):
             raise HTTPException(403, "not your job")
+    granted_user_id = user.id
+    granted_session_epoch = request.session.get("sv", 0)
 
     async def gen():
         last_event_id = 0
@@ -2615,14 +2645,24 @@ async def stream_job(job_id: int, request: Request, user: User = Depends(current
             if await request.is_disconnected() or time.monotonic() > deadline:
                 break
             with Session(engine) as session:
+                live_user = session.get(User, granted_user_id)
+                if (
+                    not live_user
+                    or live_user.disabled
+                    or live_user.deleted_at is not None
+                    or live_user.session_epoch != granted_session_epoch
+                ):
+                    break
                 job = session.get(Job, job_id)
                 if not job:
                     yield "event: error\ndata: {}\n\n"
                     break
+                if not _job_owned(job, live_user):
+                    break
                 # Only load+send the FULL log on the first frame; afterwards send just
                 # the new lines so each tick is O(new), not O(total) — the client
                 # appends `newLogs` to what it already has (see web/job.js).
-                detail = S.job_detail(session, job, include_log=first, viewer=user)
+                detail = S.job_detail(session, job, include_log=first, viewer=live_user)
                 if first:
                     last_event_id = detail.get("lastEventId", 0)
                     new_logs = []
@@ -2712,7 +2752,9 @@ def update_profile(body: ProfileBody, user: User = Depends(current_user),
         u.name = body.name.strip()
     if body.email is not None and body.email.strip():
         email = body.email.strip().lower()
-        clash = session.exec(select(User).where(User.email == email, User.id != u.id)).first()
+        clash = session.exec(select(User).where(
+            User.email == email, User.id != u.id, User.deleted_at.is_(None),
+        )).first()
         if clash:
             raise HTTPException(400, "email already in use")
         u.email = email
@@ -2972,7 +3014,9 @@ class UserEditBody(BaseModel):
 
 def _last_admin_guard(session: Session, target: User):
     if target.role == "admin":
-        admins = session.exec(select(User).where(User.role == "admin", User.disabled == False)).all()  # noqa: E712
+        admins = session.exec(select(User).where(
+            User.role == "admin", User.disabled == False, User.deleted_at.is_(None),  # noqa: E712
+        )).all()
         if len(admins) <= 1:
             raise HTTPException(409, "cannot remove the last active admin")
 
@@ -2981,7 +3025,7 @@ def _last_admin_guard(session: Session, target: User):
 def edit_user(uid: int, body: UserEditBody, user: User = Depends(require_admin),
               session: Session = Depends(get_session)):
     u = session.get(User, uid)
-    if not u:
+    if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")
     if body.name is not None and body.name.strip():
         u.name = body.name.strip()
@@ -3010,7 +3054,7 @@ def reset_user_password(uid: int, body: PasswordResetBody, request: Request,
                         user: User = Depends(require_admin),
                         session: Session = Depends(get_session)):
     u = session.get(User, uid)
-    if not u:
+    if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")
     _check_password(body.value)
     u.password_hash = hash_password(body.value)
@@ -3030,15 +3074,37 @@ def reset_user_password(uid: int, body: PasswordResetBody, request: Request,
 def delete_user(uid: int, user: User = Depends(require_admin),
                 session: Session = Depends(get_session)):
     u = session.get(User, uid)
-    if not u:
+    if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")
     if u.id == user.id:
         raise HTTPException(409, "you cannot delete yourself")
     _last_admin_guard(session, u)
     if session.exec(select(Deployment).where(Deployment.owner_id == uid)).first():
         raise HTTPException(409, "user still owns VMs — reassign or destroy them first")
-    session.delete(u)
-    record_audit(session, user, "user.delete", "user", uid, u.email)
+    original_email = u.email
+    # Private user values should not survive account deletion. Historical ownership on
+    # templates, blocks, jobs and audit records deliberately remains attached to this
+    # tombstone, preventing both broken history and ownership transfer through ID reuse.
+    for secret in session.exec(select(Secret).where(Secret.owner_id == uid)).all():
+        session.delete(secret)
+    for variable in session.exec(select(Variable).where(Variable.owner_id == uid)).all():
+        session.delete(variable)
+    u.disabled = True
+    u.deleted_at = utcnow()
+    u.session_epoch = (u.session_epoch or 0) + 1
+    u.email = f"deleted-{u.id}-{new_csrf_token()}@goblindock.invalid"
+    u.name = f"Deleted user #{u.id}"
+    u.password_hash = ""
+    u.role = "user"
+    u.failed_logins = 0
+    u.locked_until = None
+    u.last_login = None
+    u.widget_key_hash = None
+    u.widget_key_prefix = ""
+    u.widget_key_created_at = None
+    u.widget_key_last_used = None
+    session.add(u)
+    record_audit(session, user, "user.delete", "user", uid, original_email)
     session.commit()
     return {"ok": True}
 

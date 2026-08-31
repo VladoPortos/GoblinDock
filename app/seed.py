@@ -1280,11 +1280,13 @@ def seed_base_image() -> None:
 
 def maybe_seed_admin() -> None:
     with session_scope() as s:
-        if s.exec(select(User)).first():
+        if s.exec(select(User.id).where(User.deleted_at.is_(None))).first():
             return
-        if settings.admin_email and settings.admin_password:
+        email = (settings.admin_email or "").strip().lower()
+        name = (settings.admin_name or "").strip() or "Admin"
+        if email and settings.admin_password:
             s.add(User(
-                email=settings.admin_email, name=settings.admin_name,
+                email=email, name=name,
                 password_hash=hash_password(settings.admin_password), role="admin",
             ))
 

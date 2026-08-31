@@ -32,6 +32,9 @@ class User(SQLModel, table=True):
     password_hash: str
     role: str = "user"  # admin | user
     disabled: bool = False
+    # Deleted accounts remain as inert tombstones so their integer primary keys can
+    # never be reused by SQLite (session cookies and historical ownership reference it).
+    deleted_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
     last_login: Optional[datetime] = None
     # bumped on every password change/reset → invalidates sessions signed under the old

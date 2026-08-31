@@ -14,7 +14,7 @@ def current_user(request: Request, session: Session = Depends(get_session)) -> U
     if not uid:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="not authenticated")
     user = session.get(User, uid)
-    if not user or user.disabled:
+    if not user or user.disabled or user.deleted_at is not None:
         # Fail closed, but do NOT request.session.clear() here. Clearing empties the
         # session, which makes Starlette delete the session cookie — turning even a
         # transient/stale read into a hard logout that a page refresh can't recover
@@ -52,7 +52,7 @@ def widget_key_user(request: Request, session: Session = Depends(get_session)) -
     user = session.exec(
         select(User).where(User.widget_key_hash == hash_widget_key(token))
     ).first()
-    if not user or user.disabled:
+    if not user or user.disabled or user.deleted_at is not None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid api key")
     _touch_widget_key_last_used(session, user)
     return user
