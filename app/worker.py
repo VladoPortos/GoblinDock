@@ -1406,18 +1406,12 @@ def _timeout_waiting_job(job_id: int) -> None:
     statebus.bump()
 
 
-def _poll_waiting_jobs(now: Optional[datetime] = None) -> bool:
-    """Poll at most the oldest wait, but only when no queued work is available."""
-    poll_at = ensure_utc(now) or utcnow()
+def _poll_waiting_job(job_id: int, poll_at: datetime) -> None:
+    """Reload and process one waiting row without retaining its DB session."""
     with session_scope() as s:
-        if s.exec(select(Job.id).where(Job.status == "queued").limit(1)).first() is not None:
-            return False
-        stored = s.exec(
-            select(Job).where(Job.status == "waiting")
-            .order_by(Job.waiting_since, Job.id)
-        ).first()
-        if not stored:
-            return False
+        stored = s.get(Job, job_id)
+        if not stored or stored.status != "waiting":
+            return
         job = Job(**stored.model_dump())
         dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
         conn = s.get(Connection, job.connection_id) if job.connection_id else None
@@ -1426,26 +1420,52 @@ def _poll_waiting_jobs(now: Optional[datetime] = None) -> bool:
 
     if job.cancel_requested:
         _finish_waiting_error(job.id, JobCancelled())
-        return True
+        return
 
     waiting_since = ensure_utc(job.waiting_since) or ensure_utc(job.started_at) or ensure_utc(job.created_at)
     if waiting_since is not None and poll_at >= waiting_since + WAITING_TIMEOUT:
         _timeout_waiting_job(job.id)
-        return True
+        return
 
     if not dep or not conn or dep.vmid is None:
         _finish_waiting_error(job.id, RuntimeError("waiting job target is missing"))
-        return True
+        return
     try:
         ip = Proxmox(conn).agent_ipv4(dep.vmid, dep.node or conn.node)
     except Exception:  # noqa: BLE001
         ip = None
     if not ip:
-        return True
+        return
     try:
         _resume_waiting_ansible(job.id, ip)
     except Exception as exc:  # noqa: BLE001
         _finish_waiting_error(job.id, exc)
+
+
+def _poll_waiting_jobs(now: Optional[datetime] = None) -> bool:
+    """Poll an ordered snapshot of waits only when no queued work is available."""
+    poll_at = ensure_utc(now) or utcnow()
+    with session_scope() as s:
+        if s.exec(select(Job.id).where(Job.status == "queued").limit(1)).first() is not None:
+            return False
+        waiting_ids = s.exec(
+            select(Job.id).where(Job.status == "waiting")
+            .order_by(Job.waiting_since, Job.id)
+        ).all()
+    if not waiting_ids:
+        return False
+
+    for index, job_id in enumerate(waiting_ids):
+        if index:
+            with session_scope() as s:
+                if s.exec(
+                    select(Job.id).where(Job.status == "queued").limit(1)
+                ).first() is not None:
+                    break
+        try:
+            _poll_waiting_job(job_id, poll_at)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
     return True
 
 

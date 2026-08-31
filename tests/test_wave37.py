@@ -559,8 +559,10 @@ def _retire_waiting_jobs() -> None:
 
 def _mk_captured_waiting_job(*, age: timedelta = timedelta(minutes=1),
                              cancel_requested: bool = False,
-                             reserve_ip: bool = False) -> tuple[int, int, int, str]:
-    _retire_waiting_jobs()
+                             reserve_ip: bool = False,
+                             retire_existing: bool = True) -> tuple[int, int, int, str]:
+    if retire_existing:
+        _retire_waiting_jobs()
     user_id, template_id, block_key = _mk_plan_fixture(command="captured-command")
     result = _deploy(template_id, user_id, {"0.0": {"hostname": "captured-host"}})
     with session_scope() as s:
@@ -584,6 +586,14 @@ def _mk_captured_waiting_job(*, age: timedelta = timedelta(minutes=1),
             ))
         s.flush()
         return job.id, dep.id, job.connection_id, block_key
+
+
+def _waiting_vmids(*job_ids: int) -> dict[int, int]:
+    with session_scope() as s:
+        return {
+            job_id: s.get(Deployment, s.get(Job, job_id).deployment_id).vmid
+            for job_id in job_ids
+        }
 
 
 def test_missing_guest_ip_defers_required_ansible_without_false_success():
@@ -673,6 +683,298 @@ def test_waiting_job_resumes_only_captured_ansible_plan_when_ip_appears():
         assert job.finished_at is not None
         assert dep.status == "running"
         assert dep.ip == "10.37.1.42"
+
+
+def test_waiting_poll_does_not_starve_ready_job_behind_missing_ip():
+    """A missing IP on the oldest wait must not block a later ready deployment."""
+    oldest_id, _oldest_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=2),
+    )
+    ready_id, ready_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=1), retire_existing=False,
+    )
+    vmids = _waiting_vmids(oldest_id, ready_id)
+    probed: list[int] = []
+    ansible_ips: list[str] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs):
+            probed.append(vmid)
+            return "10.37.2.42" if vmid == vmids[ready_id] else None
+
+    def _run(_playbook, ip, _user, _key, **_kwargs):
+        ansible_ips.append(ip)
+        return "successful", 0
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=_run,
+    ):
+        assert worker._poll_waiting_jobs() is True
+
+    assert probed == [vmids[oldest_id], vmids[ready_id]]
+    assert ansible_ips == ["10.37.2.42"]
+    with session_scope() as s:
+        assert s.get(Job, oldest_id).status == "waiting"
+        assert s.get(Job, ready_id).status == "succeeded"
+        assert s.get(Deployment, ready_dep_id).status == "running"
+
+
+def test_waiting_poll_times_out_oldest_and_resumes_later_ready_job():
+    """An exact-deadline wait must fail without consuming the whole poll."""
+    oldest_id, oldest_dep_id, _conn_id, _block_key = _mk_captured_waiting_job()
+    ready_id, ready_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        retire_existing=False,
+    )
+    boundary = utcnow()
+    with session_scope() as s:
+        s.get(Job, oldest_id).waiting_since = boundary - timedelta(minutes=30)
+        s.get(Job, ready_id).waiting_since = boundary - timedelta(minutes=1)
+    vmids = _waiting_vmids(oldest_id, ready_id)
+    probed: list[int] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs):
+            probed.append(vmid)
+            return "10.37.2.43" if vmid == vmids[ready_id] else None
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=lambda *_args, **_kwargs: ("successful", 0),
+    ):
+        assert worker._poll_waiting_jobs(now=boundary) is True
+
+    assert probed == [vmids[ready_id]], "the expired wait must not make another IP probe"
+    with session_scope() as s:
+        assert s.get(Job, oldest_id).status == "failed"
+        assert s.get(Deployment, oldest_dep_id).status == "error"
+        assert s.get(Job, ready_id).status == "succeeded"
+        assert s.get(Deployment, ready_dep_id).status == "running"
+
+
+def test_waiting_poll_probes_missing_ip_jobs_once_in_stable_order():
+    """Equal-age waits are probed once per poll in deterministic ID order."""
+    job_ids = []
+    for index in range(3):
+        job_id, _dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+            retire_existing=index == 0,
+        )
+        job_ids.append(job_id)
+    same_waiting_since = utcnow() - timedelta(minutes=1)
+    with session_scope() as s:
+        for job_id in job_ids:
+            s.get(Job, job_id).waiting_since = same_waiting_since
+    vmids = _waiting_vmids(*job_ids)
+    expected_order = [vmids[job_id] for job_id in sorted(job_ids)]
+    probed: list[int] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs):
+            probed.append(vmid)
+            return None
+
+    with _patched_worker(Proxmox=_Px):
+        assert worker._poll_waiting_jobs() is True
+        assert worker._poll_waiting_jobs() is True
+
+    assert probed == expected_order + expected_order
+    with session_scope() as s:
+        assert [s.get(Job, job_id).status for job_id in job_ids] == ["waiting"] * 3
+
+
+def test_waiting_poll_completes_ready_jobs_once_without_duplicate_resume():
+    """Successful waits leave the snapshot and cannot execute Ansible twice."""
+    first_id, _first_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=2),
+    )
+    second_id, _second_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=1), retire_existing=False,
+    )
+    job_ids = [first_id, second_id]
+    vmids = _waiting_vmids(*job_ids)
+    ips = {vmids[first_id]: "10.37.2.44", vmids[second_id]: "10.37.2.45"}
+    probed: list[int] = []
+    ansible_ips: list[str] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs):
+            probed.append(vmid)
+            return ips[vmid]
+
+    def _run(_playbook, ip, _user, _key, **_kwargs):
+        ansible_ips.append(ip)
+        return "successful", 0
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=_run,
+    ):
+        assert worker._poll_waiting_jobs() is True
+        assert worker._poll_waiting_jobs() is False
+
+    assert probed == [vmids[first_id], vmids[second_id]]
+    assert ansible_ips == ["10.37.2.44", "10.37.2.45"]
+    with session_scope() as s:
+        assert [s.get(Job, job_id).status for job_id in job_ids] == ["succeeded"] * 2
+
+
+def test_waiting_poll_isolates_resume_failure_from_later_ready_job():
+    """A failed Ansible resume must be terminal for A and must not block B."""
+    first_id, first_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=2),
+    )
+    second_id, second_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=1), retire_existing=False,
+    )
+    vmids = _waiting_vmids(first_id, second_id)
+    ips = {vmids[first_id]: "10.37.2.46", vmids[second_id]: "10.37.2.47"}
+    ansible_ips: list[str] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs): return ips[vmid]
+        def list_qemu(self, *_args, **_kwargs): return [{"vmid": vmids[first_id]}]
+
+    def _run(_playbook, ip, _user, _key, **_kwargs):
+        ansible_ips.append(ip)
+        if ip == "10.37.2.46":
+            raise RuntimeError("resume A failed")
+        return "successful", 0
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=_run,
+    ):
+        assert worker._poll_waiting_jobs() is True
+
+    assert ansible_ips == ["10.37.2.46", "10.37.2.47"]
+    with session_scope() as s:
+        assert s.get(Job, first_id).status == "failed"
+        assert "resume A failed" in s.get(Job, first_id).error
+        assert s.get(Deployment, first_dep_id).status == "error"
+        assert s.get(Job, second_id).status == "succeeded"
+        assert s.get(Deployment, second_dep_id).status == "running"
+
+
+def test_waiting_poll_isolates_ip_probe_exception_from_later_ready_job():
+    """A failed IP probe is one no-IP result and must not block the next wait."""
+    first_id, _first_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=2),
+    )
+    second_id, second_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=1), retire_existing=False,
+    )
+    vmids = _waiting_vmids(first_id, second_id)
+    probed: list[int] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs):
+            probed.append(vmid)
+            if vmid == vmids[first_id]:
+                raise RuntimeError("probe A failed")
+            return "10.37.2.48"
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=lambda *_args, **_kwargs: ("successful", 0),
+    ):
+        assert worker._poll_waiting_jobs() is True
+
+    assert probed == [vmids[first_id], vmids[second_id]]
+    with session_scope() as s:
+        assert s.get(Job, first_id).status == "waiting"
+        assert s.get(Job, second_id).status == "succeeded"
+        assert s.get(Deployment, second_dep_id).status == "running"
+
+
+def test_waiting_poll_isolates_timeout_transition_exception_from_later_job():
+    """An unexpected timeout-row exception must not prevent processing later IDs."""
+    first_id, _first_dep_id, _conn_id, _block_key = _mk_captured_waiting_job()
+    second_id, second_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        retire_existing=False,
+    )
+    boundary = utcnow()
+    with session_scope() as s:
+        s.get(Job, first_id).waiting_since = boundary - timedelta(minutes=30)
+        s.get(Job, second_id).waiting_since = boundary - timedelta(minutes=1)
+    vmids = _waiting_vmids(first_id, second_id)
+    original_timeout = worker._timeout_waiting_job
+
+    def _timeout_then_raise(job_id: int) -> None:
+        original_timeout(job_id)
+        raise RuntimeError("timeout transition follow-up failed")
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs):
+            return "10.37.2.49" if vmid == vmids[second_id] else None
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _timeout_waiting_job=_timeout_then_raise,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=lambda *_args, **_kwargs: ("successful", 0),
+        traceback=type("Traceback", (), {"print_exc": staticmethod(lambda: None)}),
+    ):
+        try:
+            assert worker._poll_waiting_jobs(now=boundary) is True
+        except RuntimeError as exc:
+            raise AssertionError("one timeout row must not abort the waiting snapshot") from exc
+
+    with session_scope() as s:
+        assert s.get(Job, first_id).status == "failed"
+        assert s.get(Job, second_id).status == "succeeded"
+        assert s.get(Deployment, second_dep_id).status == "running"
+
+
+def test_waiting_poll_yields_between_rows_when_new_work_is_queued():
+    """Work queued while probing A must take priority over waiting row B."""
+    first_id, _first_dep_id, conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=2),
+    )
+    second_id, _second_dep_id, _conn_id, _block_key = _mk_captured_waiting_job(
+        age=timedelta(minutes=1), retire_existing=False,
+    )
+    vmids = _waiting_vmids(first_id, second_id)
+    probed: list[int] = []
+    queued_ids: list[int] = []
+
+    class _Px:
+        def __init__(self, _conn): self.node = "pve"
+        def agent_ipv4(self, vmid, *_args, **_kwargs):
+            probed.append(vmid)
+            if vmid == vmids[first_id]:
+                with session_scope() as s:
+                    queued = Job(type="image_sync", status="queued", connection_id=conn_id)
+                    s.add(queued)
+                    s.flush()
+                    queued_ids.append(queued.id)
+                return None
+            return "10.37.2.50"
+
+    with _patched_worker(
+        Proxmox=_Px,
+        _managed_keypair=lambda: ("managed-private", "managed-public"),
+        run_playbook=lambda *_args, **_kwargs: ("successful", 0),
+    ):
+        assert worker._poll_waiting_jobs() is True
+
+    assert probed == [vmids[first_id]]
+    assert len(queued_ids) == 1
+    with session_scope() as s:
+        assert s.get(Job, queued_ids[0]).status == "queued"
+        assert s.get(Job, second_id).status == "waiting"
+    _retire_waiting_jobs()
 
 
 def test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership():
@@ -1206,6 +1508,14 @@ if __name__ == "__main__":
     test_validate_snippet_volume_rejects_inactive_storage()
     test_missing_guest_ip_defers_required_ansible_without_false_success()
     test_waiting_job_resumes_only_captured_ansible_plan_when_ip_appears()
+    test_waiting_poll_does_not_starve_ready_job_behind_missing_ip()
+    test_waiting_poll_times_out_oldest_and_resumes_later_ready_job()
+    test_waiting_poll_probes_missing_ip_jobs_once_in_stable_order()
+    test_waiting_poll_completes_ready_jobs_once_without_duplicate_resume()
+    test_waiting_poll_isolates_resume_failure_from_later_ready_job()
+    test_waiting_poll_isolates_ip_probe_exception_from_later_ready_job()
+    test_waiting_poll_isolates_timeout_transition_exception_from_later_job()
+    test_waiting_poll_yields_between_rows_when_new_work_is_queued()
     test_waiting_job_times_out_at_thirty_minutes_without_releasing_ownership()
     test_timeout_rechecks_committed_cancellation_before_failing()
     test_waiting_cancellation_uses_deployment_reconciliation()
