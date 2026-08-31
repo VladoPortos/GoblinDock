@@ -20,6 +20,9 @@
   }
 
   const STATUS_LABEL = { running:'Running', stopped:'Stopped', working:'Working', error:'Error', unknown:'Unknown' };
+  function isVmLifecycleLocked(vm) {
+    return !!vm && (vm.status === 'working' || vm.status === 'cleanup_pending');
+  }
   function StatusBadge({ status, label }) {
     return h('span', { className: 'badge ' + status },
       h('span', { className: 'dot ' + status }),
@@ -341,6 +344,6 @@
     Field, TextArea, SelectField, Toggle, TagInput, FormModal,
     collectAsks, initAskAnswers, asksMissing, AskInputs,
     SizeField,
-    copyToClipboard, readClipboard, fmtBytes, useFetched,
+    copyToClipboard, readClipboard, fmtBytes, useFetched, isVmLifecycleLocked,
   };
 })();

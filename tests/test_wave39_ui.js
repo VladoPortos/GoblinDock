@@ -1076,6 +1076,235 @@ assert.equal(findAll(dashboardTree, (node) => node.type === 'button'
   && textOf(node) === 'Deploy VM').length, 1,
   'Dashboard Deploy must remain rendered on the narrow-capable page');
 
+function lifecycleDashboardHarness(vms) {
+  const state = [];
+  let cursor = 0;
+  const apiCalls = [];
+  const HarnessReact = {
+    createElement: React.createElement,
+    Fragment: 'fragment',
+    useState(initial) {
+      const index = cursor++;
+      if (!Object.hasOwn(state, index)) {
+        state[index] = typeof initial === 'function' ? initial() : initial;
+      }
+      return [state[index], (value) => {
+        state[index] = typeof value === 'function' ? value(state[index]) : value;
+      }];
+    },
+  };
+  const harnessWindow = {
+    React: HarnessReact,
+    Icon(props) { return HarnessReact.createElement('span', { 'data-icon': props.name }); },
+    GD: { VMS: vms, CONNECTIONS: [], me: { isAdmin: false } },
+    GDStore: {
+      vmHistory() { return []; },
+      refresh() { return Promise.resolve(); },
+      toast() {},
+      vmAction(depId, action) { apiCalls.push({ kind: 'store-action', depId, action }); return Promise.resolve(); },
+    },
+    API: {
+      vmAction(depId, action) { apiCalls.push({ kind: 'action', depId, action }); return Promise.resolve(); },
+      vmDestroy(depId) { apiCalls.push({ kind: 'destroy', depId }); return Promise.resolve({ jobId: depId }); },
+    },
+    UI: {
+      isVmLifecycleLocked: window.UI.isVmLifecycleLocked,
+      OSGlyph(props) { return HarnessReact.createElement('span', null, props.os); },
+      StatusBadge(props) { return HarnessReact.createElement('span', { className: 'badge ' + props.status }, props.status); },
+      CopyField(props) { return HarnessReact.createElement('span', null, props.value); },
+      Meter() {}, Sparkline() {}, ConfirmModal() {}, FormModal() {}, Field() {},
+      Menu(props) {
+        return HarnessReact.createElement('div', { 'data-vm-menu': true }, props.children,
+          (props.items || []).filter((item) => !item.sep).map((item) => HarnessReact.createElement(
+            'button', { key: item.label, onClick: item.onClick }, item.label,
+          )));
+      },
+      useFetched() { return null; },
+    },
+  };
+  vm.runInNewContext(dashboardSource, {
+    React: HarnessReact,
+    window: harnessWindow,
+    localStorage: { getItem() { return null; }, setItem() {} },
+    setTimeout() {},
+  }, { filename: 'web/dashboard.js' });
+  return {
+    window: harnessWindow,
+    apiCalls,
+    state,
+    render() {
+      cursor = 0;
+      return resolveTree(harnessWindow.Dashboard({ go() {} }));
+    },
+  };
+}
+
+function vmFixture(depId, name, status) {
+  return {
+    id: `vm-${depId}`, depId, name, status, owner: 'you', ownerName: 'Owner',
+    ip: `10.39.0.${depId}`, image: 'Ubuntu', template: 'Base', templateId: 39,
+    conn: 'pve', os: 'ubuntu', cpu: 1, ram: 2, uptime: '1h', tags: '', notes: '',
+    ...(status === 'cleanup_pending' ? { err: 'cleanup failed exactly' } : {}),
+  };
+}
+
+const lifecycleVms = [
+  vmFixture(1, 'Running eligible', 'running'),
+  vmFixture(2, 'Stopped eligible', 'stopped'),
+  vmFixture(3, 'Working locked', 'working'),
+  vmFixture(4, 'Cleanup locked', 'cleanup_pending'),
+];
+const lifecycleDashboard = lifecycleDashboardHarness(lifecycleVms);
+let lifecycleTable = lifecycleDashboard.render();
+function vmSurface(tree, name, type) {
+  return findAll(tree, (node) => node.type === type && textOf(node).includes(name))[0];
+}
+for (const name of ['Working locked', 'Cleanup locked']) {
+  const row = vmSurface(lifecycleTable, name, 'tr');
+  assert.ok(row, `missing ${name} table row`);
+  assert.equal(findAll(row, (node) => node.type === 'input' && node.props.type === 'checkbox').length, 0,
+    `${name} row must not be selectable`);
+  assert.equal(findAll(row, (node) => node.props['data-vm-menu'] === true).length, 0,
+    `${name} row must not expose the lifecycle action menu`);
+  assert.equal(findAll(row, (node) => ['Start', 'Stop', 'Restart'].includes(node.props.title)).length, 0,
+    `${name} row must not expose direct lifecycle actions`);
+}
+for (const name of ['Running eligible', 'Stopped eligible']) {
+  const row = vmSurface(lifecycleTable, name, 'tr');
+  assert.equal(findAll(row, (node) => node.type === 'input' && node.props.type === 'checkbox').length, 1,
+    `${name} row must remain selectable`);
+  assert.equal(findAll(row, (node) => node.props['data-vm-menu'] === true).length, 1,
+    `${name} row must retain its action menu`);
+}
+
+const selectAll = findAll(lifecycleTable, (node) => node.type === 'input'
+  && node.props.title === 'Select all')[0];
+selectAll.props.onChange({ stopPropagation() {} });
+lifecycleTable = lifecycleDashboard.render();
+assert.match(textOf(lifecycleTable), /2 selected/,
+  'select-all and selected count must include only currently unlocked VMs');
+assert.deepEqual([...lifecycleDashboard.state[8]].sort(), [1, 2],
+  'select-all must never add lifecycle-locked deployment IDs');
+
+findAll(lifecycleTable, (node) => node.type === 'button' && textOf(node) === 'Cards')[0].props.onClick();
+const lifecycleCards = lifecycleDashboard.render();
+for (const name of ['Working locked', 'Cleanup locked']) {
+  const card = findAll(lifecycleCards, (node) => node.type === 'div'
+    && node.props.className === 'card card-pad' && textOf(node).includes(name))[0];
+  assert.ok(card, `missing ${name} card`);
+  assert.equal(findAll(card, (node) => node.type === 'input' && node.props.type === 'checkbox').length, 0,
+    `${name} card must not be selectable`);
+  assert.equal(findAll(card, (node) => node.props['data-vm-menu'] === true).length, 0,
+    `${name} card must not expose the lifecycle action menu`);
+  assert.equal(findAll(card, (node) => ['Start', 'Stop', 'Restart'].includes(node.props.title)).length, 0,
+    `${name} card must not expose direct lifecycle actions`);
+}
+
+// Simulate state refreshing after render: the second selected VM becomes locked before
+// the already-rendered bulk Start button is invoked. Submission must filter it again.
+lifecycleVms[1].status = 'working';
+const refreshedLifecycleCards = lifecycleDashboard.render();
+assert.match(textOf(refreshedLifecycleCards), /1 selected/,
+  'selected count must discard a VM that became lifecycle-locked after selection');
+const staleBulkStart = findAll(refreshedLifecycleCards, (node) => node.type === 'button'
+  && textOf(node) === 'Start')[0];
+staleBulkStart.props.onClick();
+assert.deepEqual(lifecycleDashboard.apiCalls.filter((call) => call.kind === 'action'), [
+  { kind: 'action', depId: 1, action: 'start' },
+], 'bulk submission must re-filter mixed/stale selection against current VM state');
+
+function lifecycleDetailHarness(detail) {
+  const state = [detail];
+  let cursor = 0;
+  const HarnessReact = {
+    createElement: React.createElement,
+    Fragment: 'fragment',
+    useState(initial) {
+      const index = cursor++;
+      if (!Object.hasOwn(state, index)) state[index] = typeof initial === 'function' ? initial() : initial;
+      return [state[index], (value) => {
+        state[index] = typeof value === 'function' ? value(state[index]) : value;
+      }];
+    },
+    useEffect() {},
+    useRef(initial) { return { current: initial }; },
+  };
+  const harnessWindow = {
+    React: HarnessReact,
+    Icon(props) { return HarnessReact.createElement('span', { 'data-icon': props.name }); },
+    GDStore: { nav: { depId: detail.depId }, refresh() { return Promise.resolve(); }, toast() {} },
+    API: { job() { return Promise.resolve({ log: [] }); } },
+    UI: {
+      isVmLifecycleLocked: window.UI.isVmLifecycleLocked,
+      OSGlyph() {}, ConfirmModal() {}, StatusBadge() {}, FormModal() {}, Field() {},
+      Toggle() {}, Menu() {}, copyToClipboard() {}, readClipboard() {},
+      fmtBytes(value) { return String(value); },
+      useFetched() { return { error: true }; },
+    },
+  };
+  vm.runInNewContext(vmDetailSource, {
+    React: HarnessReact,
+    window: harnessWindow,
+    setTimeout() {}, setInterval() {}, clearInterval() {},
+  }, { filename: 'web/vmdetail.js' });
+  cursor = 0;
+  return resolveTree(harnessWindow.VmDetail({ go() {} }));
+}
+
+function detailFixture(status, live, err) {
+  return {
+    depId: 39, name: `${status} detail`, status, err, vmid: 9039, node: 'pve', ip: '10.39.0.39',
+    os: 'ubuntu', tags: '', owner: 'Owner', connection: 'pve', baseImage: 'Ubuntu',
+    template: 'Base', reqCpu: 2, reqRam: 4, reqDisk: 20, live: live || null,
+    config: {}, agent: null, consoleReady: !!(live && live.status === 'running'),
+    hasRootPassword: false, jobId: null,
+  };
+}
+
+for (const [status, label, exactError] of [
+  ['working', 'Working', undefined],
+  ['cleanup_pending', 'Cleanup pending', 'cleanup ownership could not be confirmed exactly'],
+]) {
+  const tree = lifecycleDetailHarness(detailFixture(status, null, exactError));
+  assert.ok(textOf(tree).includes(label), `${status} detail must render ${label}`);
+  if (exactError) assert.ok(textOf(tree).includes(exactError), 'cleanup detail must render its exact error');
+  const buttons = findAll(tree, (node) => node.type === 'button');
+  assert.equal(buttons.some((button) => ['Start', 'Stop', 'Restart', 'Rebuild'].includes(textOf(button))), false,
+    `${status} detail must not render lifecycle controls`);
+  assert.equal(buttons.some((button) => button.props['aria-label'] === 'Delete VM'), false,
+    `${status} detail must not render Delete VM`);
+}
+
+const runningDetail = lifecycleDetailHarness(detailFixture('running', {
+  status: 'running', uptime: 60, cpuPct: 5, memUsed: 1, memMax: 2, diskUsed: 1, diskMax: 2,
+}));
+assert.ok(findAll(runningDetail, (node) => node.type === 'button' && textOf(node) === 'Stop').length,
+  'ordinary running detail must retain Stop');
+assert.ok(findAll(runningDetail, (node) => node.type === 'button' && textOf(node) === 'Restart').length,
+  'ordinary running detail must retain Restart');
+assert.ok(findAll(runningDetail, (node) => node.type === 'button' && textOf(node) === 'Console').length,
+  'ordinary running detail must retain Console');
+assert.ok(findAll(runningDetail, (node) => node.type === 'button'
+  && node.props['aria-label'] === 'Delete VM').length,
+  'ordinary running detail must retain Delete VM');
+const stoppedDetail = lifecycleDetailHarness(detailFixture('stopped', { status: 'stopped' }));
+assert.ok(findAll(stoppedDetail, (node) => node.type === 'button' && textOf(node) === 'Start').length,
+  'ordinary stopped detail must retain Start');
+assert.ok(findAll(stoppedDetail, (node) => node.type === 'button' && textOf(node) === 'Restart').length,
+  'ordinary stopped detail must retain Restart');
+assert.ok(findAll(stoppedDetail, (node) => node.type === 'button' && textOf(node) === 'Console').length,
+  'ordinary stopped detail must retain Console');
+assert.ok(findAll(stoppedDetail, (node) => node.type === 'button'
+  && node.props['aria-label'] === 'Delete VM').length,
+  'ordinary stopped detail must retain Delete VM');
+
+assert.equal(typeof window.UI.isVmLifecycleLocked, 'function',
+  'the UI must expose one shared lifecycle-lock predicate');
+assert.equal(window.UI.isVmLifecycleLocked({ status: 'working' }), true);
+assert.equal(window.UI.isVmLifecycleLocked({ status: 'cleanup_pending' }), true);
+assert.equal(window.UI.isVmLifecycleLocked({ status: 'running' }), false);
+assert.equal(window.UI.isVmLifecycleLocked({ status: 'stopped' }), false);
+
 assert.match(vmDetailSource, /className:\s*'row vm-detail-actions'/,
   'VM detail actions need their responsive structural class');
 assert.match(vmDetailSource, /className:\s*'vm-detail-columns'/,

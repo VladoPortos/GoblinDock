@@ -945,6 +945,9 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
               session: Session = Depends(get_session)):
     dep = _owned_deployment(session, dep_id, user)
     _reject_cleanup_pending(dep)
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
@@ -1062,11 +1065,17 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
     img = session.get(Image, dep.image_id) if dep.image_id else None
     tpl = session.get(Template, dep.template_id) if dep.template_id else None
     owner = session.get(User, dep.owner_id) if dep.owner_id else None
-    job = session.exec(select(Job).where(Job.deployment_id == dep.id).order_by(Job.id.desc())).first()
+    active = _active_lifecycle_job(session, dep.id)
+    job = active or session.exec(
+        select(Job).where(Job.deployment_id == dep.id).order_by(Job.id.desc())
+    ).first()
+    effective_status = (
+        "working" if active and dep.status != "cleanup_pending" else dep.status
+    )
     out = {
         "name": dep.name, "vmid": dep.vmid,
         "node": dep.node or (conn.node if conn else ""),
-        "status": dep.status, "ip": dep.ip, "mac": dep.mac, "tags": dep.tags,
+        "status": effective_status, "ip": dep.ip, "mac": dep.mac, "tags": dep.tags,
         "created": S._rel(dep.created_at), "owner": owner.name if owner else "—",
         "connection": conn.name if conn else "—",
         "baseImage": img.name if img else "—", "template": tpl.name if tpl else None,
@@ -1077,8 +1086,10 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         "live": None, "config": None, "agent": None, "consoleReady": False,
         "hasRootPassword": bool(dep.root_password_enc),
         "credUser": dep.cred_user or "root",
+        **({"err": dep.error}
+           if dep.status in ("error", "cleanup_pending") and dep.error else {}),
     }
-    if conn and dep.vmid and dep.status not in ("working", "error"):
+    if conn and dep.vmid and effective_status not in ("working", "error", "cleanup_pending"):
         try:
             px = Proxmox(conn)
             node = dep.node or conn.node or px.pick_node()

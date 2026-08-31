@@ -3,7 +3,8 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { OSGlyph, StatusBadge, CopyField, Meter, Sparkline, Menu, ConfirmModal, FormModal, Field } = window.UI;
+  const { OSGlyph, StatusBadge, CopyField, Meter, Sparkline, Menu, ConfirmModal,
+          FormModal, Field, isVmLifecycleLocked } = window.UI;
   const h = React.createElement;
 
   // Transitional label for the uptime cell while an optimistic power action is in
@@ -49,6 +50,7 @@
   }
 
   function ActionCluster({ vm, onAct }) {
+    if (isVmLifecycleLocked(vm)) return null;
     const running = vm.status === 'running';
     return h('div', { className: 'row', style: { gap: 2, justifyContent: 'flex-end' } },
       running
@@ -87,17 +89,18 @@
     });
   }
 
-  function TableView({ vms, go, onAct, sel, toggleSel, allSel, toggleAll }) {
+  function TableView({ vms, go, onAct, sel, toggleSel, allSel, toggleAll, hasEligible }) {
     return h('div', { className: 'card', style: { overflow: 'hidden' } },
       h('div', { className: 'table-scroll' },
         h('table', { className: 'tbl' },
           h('thead', null, h('tr', null,
-            h('th', { style: { width: 34 } }, h(SelBox, { checked: allSel, onToggle: toggleAll, title: 'Select all' })),
+            h('th', { style: { width: 34 } }, hasEligible && h(SelBox, { checked: allSel, onToggle: toggleAll, title: 'Select all' })),
             ['', 'Name', 'IP', 'Lineage', 'Connection', 'CPU', 'RAM', 'Uptime', ''].map((hh, i) =>
               h('th', { key: i, style: i === 0 ? { width: 36 } : null }, hh)))),
           h('tbody', null, vms.map(vm =>
             h('tr', { key: vm.id, style: { cursor: 'pointer' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
-              h('td', { onClick: (e) => e.stopPropagation() }, h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
+              h('td', { onClick: (e) => e.stopPropagation() }, !isVmLifecycleLocked(vm)
+                && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
               h('td', null, h('span', { className: 'dot ' + vm.status, title: vm.status })),
               h('td', null,
                 h('div', { className: 'mono', style: { fontWeight: 600, fontSize: 13.5 } }, vm.name),
@@ -128,7 +131,7 @@
                   ? h('span', { style: { color: 'var(--accent)' } },
                       h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
                   : vm.uptime),
-              h('td', null, h(ActionCluster, { vm, onAct }))
+              h('td', null, !isVmLifecycleLocked(vm) && h(ActionCluster, { vm, onAct }))
             )))
         )
       )
@@ -137,9 +140,9 @@
 
   function CardView({ vms, go, onAct, sel, toggleSel }) {
     return h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(310px, 1fr))', gap: 14 } },
-      vms.map(vm => h('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
+      vms.map(vm => h('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: !isVmLifecycleLocked(vm) && sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
         h('div', { className: 'row' },
-          h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
+          !isVmLifecycleLocked(vm) && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
           h('span', { className: 'dot ' + vm.status }),
           h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 15 } }, vm.name),
           h('div', { style: { marginLeft: 'auto' } }, h(StatusBadge, { status: vm.status }))
@@ -166,7 +169,7 @@
             ? h('span', { className: 'hint mono', style: { fontSize: 11, color: 'var(--accent)' } },
                 h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
             : h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
-          h('div', { style: { marginLeft: 'auto' } }, h(ActionCluster, { vm, onAct }))
+          h('div', { style: { marginLeft: 'auto' } }, !isVmLifecycleLocked(vm) && h(ActionCluster, { vm, onAct }))
         )
       ))
     );
@@ -248,18 +251,27 @@
     if (q) vms = vms.filter(v => (v.name + v.ip + v.template + (v.tags || '')).toLowerCase().includes(q.toLowerCase()));
 
     // ---- selection ----
-    const toggleSel = (depId) => setSel((prev) => { const n = new Set(prev); if (n.has(depId)) n.delete(depId); else n.add(depId); return n; });
-    const clearSel = () => setSel(new Set());
-    const allSel = vms.length > 0 && vms.every(v => sel.has(v.depId));
-    const toggleAll = () => setSel((prev) => {
+    const toggleSel = (depId) => setSel((prev) => {
       const n = new Set(prev);
-      if (vms.every(v => n.has(v.depId))) vms.forEach(v => n.delete(v.depId));
-      else vms.forEach(v => n.add(v.depId));
+      const vm = GD.VMS.find((candidate) => candidate.depId === depId);
+      if (n.has(depId) || isVmLifecycleLocked(vm)) n.delete(depId);
+      else if (vm) n.add(depId);
       return n;
     });
-    const selectedVms = () => GD.VMS.filter(v => sel.has(v.depId));
+    const clearSel = () => setSel(new Set());
+    const eligibleVms = vms.filter((vm) => !isVmLifecycleLocked(vm));
+    const allSel = eligibleVms.length > 0 && eligibleVms.every(v => sel.has(v.depId));
+    const toggleAll = () => setSel((prev) => {
+      const n = new Set(prev);
+      if (eligibleVms.every(v => n.has(v.depId))) eligibleVms.forEach(v => n.delete(v.depId));
+      else eligibleVms.forEach(v => n.add(v.depId));
+      return n;
+    });
+    const selectedVms = () => GD.VMS.filter(v => sel.has(v.depId) && !isVmLifecycleLocked(v));
+    const selectedCount = selectedVms().length;
 
     const onAct = async (action, vm) => {
+      if (isVmLifecycleLocked(vm)) return;
       if (action === 'delete' || action === 'rebuild') { setConfirm({ action, vm }); return; }
       if (action === 'edit') { setEdit(vm); return; }
       if (action === 'start' || action === 'stop' || action === 'restart') {
@@ -358,8 +370,8 @@
       ),
 
       // ---- bulk action bar (appears when something is selected) ----
-      sel.size > 0 && h('div', { className: 'card card-pad', style: { marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', borderColor: 'var(--accent)' } },
-        h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, sel.size, ' selected'),
+      selectedCount > 0 && h('div', { className: 'card card-pad', style: { marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', borderColor: 'var(--accent)' } },
+        h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, selectedCount, ' selected'),
         h('div', { className: 'spacer' }),
         h('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('start') }, h(Icon, { name: 'play', size: 14 }), 'Start'),
         h('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('stop') }, h(Icon, { name: 'stop', size: 14 }), 'Stop'),
@@ -376,7 +388,7 @@
                 h('p', null, 'Try clearing the filters above.')))
             : h(FirstRunChecklist, { go }))
         : view === 'table'
-          ? h(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll })
+          ? h(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll, hasEligible: eligibleVms.length > 0 })
           : h(CardView, { vms, go, onAct, sel, toggleSel }),
 
       confirm && h(ConfirmModal, {
@@ -405,9 +417,9 @@
 
       bulkDel && h(ConfirmModal, {
         onClose: () => setBulkDel(false), tone: 'danger', icon: 'trash',
-        title: 'Destroy ' + sel.size + ' VM' + (sel.size === 1 ? '' : 's') + '?',
-        body: 'This destroys ' + sel.size + ' VM' + (sel.size === 1 ? '' : 's') + ' and their disks, returning their IPs to the pool. This cannot be undone.',
-        confirmLabel: 'Destroy ' + sel.size,
+        title: 'Destroy ' + selectedCount + ' VM' + (selectedCount === 1 ? '' : 's') + '?',
+        body: 'This destroys ' + selectedCount + ' VM' + (selectedCount === 1 ? '' : 's') + ' and their disks, returning their IPs to the pool. This cannot be undone.',
+        confirmLabel: 'Destroy ' + selectedCount,
         onConfirm: bulkDelete,
       }),
 

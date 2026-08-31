@@ -835,6 +835,41 @@ def test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_statu
     print("test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status OK")
 
 
+def test_active_lifecycle_jobs_reject_direct_actions_before_proxmox_prerequisites():
+    """Every active lifecycle type/status must block every direct power action first."""
+    uid = _mk_user("w36-direct-lifecycle-conflicts@example.com")
+    saved_proxmox = api.Proxmox
+    api.Proxmox = lambda *_args, **_kwargs: (_ for _ in ()).throw(
+        AssertionError("active lifecycle rejection must precede Proxmox access")
+    )
+    try:
+        for action in ("start", "stop", "restart"):
+            for active_type in ("deploy", "rebuild", "destroy"):
+                for active_status in ("queued", "running", "waiting"):
+                    dep_id = _mk_lifecycle_deployment(uid)
+                    with session_scope() as s:
+                        dep = s.get(Deployment, dep_id)
+                        # The lifecycle guard must win before VMID/connection admission.
+                        dep.vmid = None
+                        dep.connection_id = None
+                        s.add(dep)
+                        s.add(Job(
+                            type=active_type, status=active_status,
+                            deployment_id=dep_id, created_by=uid,
+                        ))
+                    with Session(engine) as s:
+                        exc = _expect_http(409, lambda: api.vm_action(
+                            dep_id, api.ActionBody(action=action),
+                            user=s.get(User, uid), session=s,
+                        ))
+                        assert active_type in str(exc.detail), (
+                            action, active_type, active_status, exc.detail,
+                        )
+    finally:
+        api.Proxmox = saved_proxmox
+    print("test_active_lifecycle_jobs_reject_direct_actions_before_proxmox_prerequisites OK")
+
+
 def test_cleanup_pending_rejects_every_vm_lifecycle_operation():
     """An ambiguously owned VM must not accept direct, rebuild, or destroy operations."""
     uid = _mk_user("w36-cleanup-lifecycle@example.com")
@@ -1105,6 +1140,7 @@ if __name__ == "__main__":
     test_sequential_duplicate_destroy_returns_one_active_job()
     test_concurrent_duplicate_destroy_returns_one_active_job()
     test_active_lifecycle_jobs_reject_conflicting_admission_for_every_live_status()
+    test_active_lifecycle_jobs_reject_direct_actions_before_proxmox_prerequisites()
     test_cleanup_pending_rejects_every_vm_lifecycle_operation()
     test_template_write_rejects_malformed_recipe_shape()
     test_template_write_rejects_private_block_from_another_user()

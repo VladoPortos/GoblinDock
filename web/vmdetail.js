@@ -3,7 +3,8 @@
   const { useState, useEffect, useRef } = React;
   const Icon = window.Icon;
   const { OSGlyph, ConfirmModal, StatusBadge, FormModal, Field, Toggle, Menu,
-          copyToClipboard, readClipboard, fmtBytes, useFetched } = window.UI;
+          copyToClipboard, readClipboard, fmtBytes, useFetched,
+          isVmLifecycleLocked } = window.UI;
   const h = React.createElement;
   const toast = (m, t) => window.GDStore.toast(m, t);
   // Transitional uptime-box label while a power action is in flight, until the live
@@ -330,7 +331,9 @@
     const live = d.live || {};
     const cfg = d.config || {};
     const running = live.status === 'running';
-    const statusTone = running ? 'running' : (d.status === 'working') ? 'working' : (d.status === 'error') ? 'error' : 'stopped';
+    const locked = isVmLifecycleLocked(d);
+    const statusTone = running ? 'running' : (d.status === 'working') ? 'working'
+      : (d.status === 'error' || d.status === 'cleanup_pending') ? 'error' : 'stopped';
     const memPct = live.memMax ? Math.round(live.memUsed / live.memMax * 100) : null;
     const diskPct = live.diskMax ? Math.round(live.diskUsed / live.diskMax * 100) : null;
 
@@ -343,18 +346,25 @@
             h(OSGlyph, { os: d.os, size: 26 }),
             h('h1', { className: 'page-title' }, d.name),
             h('span', { className: 'badge ' + statusTone }, h('span', { className: 'dot ' + statusTone }),
-              d.status === 'working' ? 'Working' : d.status === 'error' ? 'Error' : running ? 'Running' : 'Stopped')),
+              d.status === 'working' ? 'Working' : d.status === 'cleanup_pending' ? 'Cleanup pending'
+                : d.status === 'error' ? 'Error' : running ? 'Running' : 'Stopped')),
           h('div', { className: 'page-sub mono' }, 'vmid ', d.vmid || '—', ' · ', d.node, d.ip ? ' · ' + d.ip : '')),
         h('div', { className: 'spacer' }),
         h('div', { className: 'row vm-detail-actions', style: { gap: 8 } },
-          running
+          !locked && (running
             ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
-            : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy || d.status === 'working' }, h(Icon, { name: 'play', size: 14 }), 'Start'),
-          h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
+            : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy }, h(Icon, { name: 'play', size: 14 }), 'Start')),
+          !locked && h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
           h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
-          h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
+          !locked && h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
             onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 }))),
       ),
+
+      d.err && h('div', {
+        className: 'mono',
+        style: { marginBottom: 16, padding: '10px 12px', borderRadius: 9,
+          color: 'var(--err)', background: 'var(--err-ghost)', fontSize: 12.5 },
+      }, d.err),
 
       // live metrics
       h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14, marginBottom: 16 } },

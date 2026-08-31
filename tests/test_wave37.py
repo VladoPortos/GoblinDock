@@ -184,6 +184,171 @@ def test_cleanup_pending_serialization_uses_owned_static_allocation_when_ip_is_e
     assert out["ip"] == "10.37.0.73"
 
 
+def _mk_detail_fixture(status: str, *, error: str = "") -> tuple[int, int]:
+    suffix = os.urandom(3).hex()
+    with session_scope() as s:
+        user = User(
+            email=f"detail-{status}-{suffix}@example.com", name="detail",
+            password_hash=hash_password("StrongPass12!"),
+        )
+        conn = Connection(
+            name=f"detail-{suffix}", host="pve", token_id="u@pve!token", node="pve",
+        )
+        s.add(user)
+        s.add(conn)
+        s.flush()
+        dep = Deployment(
+            name=f"detail-{suffix}", owner_id=user.id, connection_id=conn.id,
+            node="pve", vmid=8374, status=status, error=error,
+        )
+        s.add(dep)
+        s.flush()
+        return user.id, dep.id
+
+
+def test_vm_detail_cleanup_pending_preserves_exact_error_without_live_probe():
+    """Ambiguous cleanup ownership must remain visible without consulting Proxmox."""
+    uid, dep_id = _mk_detail_fixture(
+        "cleanup_pending", error="cleanup ownership could not be confirmed exactly",
+    )
+    probes = []
+
+    class _Px:
+        def __init__(self, _conn): probes.append("construct")
+        def vm_current(self, *_args, **_kwargs): probes.append("current"); return {}
+        def vm_config(self, *_args, **_kwargs): probes.append("config"); return {}
+
+    saved_px = api.Proxmox
+    api.Proxmox = _Px
+    try:
+        with Session(engine) as s:
+            out = api.vm_detail(dep_id, user=s.get(User, uid), session=s)
+    finally:
+        api.Proxmox = saved_px
+
+    assert probes == [], probes
+    assert out["status"] == "cleanup_pending"
+    assert out["err"] == "cleanup ownership could not be confirmed exactly"
+    assert out["live"] is None and out["config"] is None and out["agent"] is None
+
+
+def test_vm_detail_error_preserves_exact_error_without_live_probe():
+    """A persisted failure must be returned verbatim and remain probe-free."""
+    uid, dep_id = _mk_detail_fixture("error", error="provisioning failed exactly here")
+    probes = []
+
+    class _Px:
+        def __init__(self, _conn): probes.append("construct")
+
+    saved_px = api.Proxmox
+    api.Proxmox = _Px
+    try:
+        with Session(engine) as s:
+            out = api.vm_detail(dep_id, user=s.get(User, uid), session=s)
+    finally:
+        api.Proxmox = saved_px
+
+    assert probes == [], probes
+    assert out["status"] == "error"
+    assert out["err"] == "provisioning failed exactly here"
+    assert out["live"] is None and out["config"] is None and out["agent"] is None
+
+
+def test_vm_detail_prefers_active_lifecycle_job_and_effective_working_state():
+    """Active lifecycle work, not a newer terminal row or stale deployment state, owns detail."""
+    uid, dep_id = _mk_detail_fixture("running")
+    with session_scope() as s:
+        dep = s.get(Deployment, dep_id)
+        active = Job(
+            type="rebuild", status="waiting", deployment_id=dep_id,
+            connection_id=dep.connection_id, created_by=uid,
+        )
+        s.add(active)
+        s.flush()
+        active_id = active.id
+        terminal = Job(
+            type="deploy", status="succeeded", deployment_id=dep_id,
+            connection_id=dep.connection_id, created_by=uid,
+        )
+        s.add(terminal)
+        s.flush()
+        assert terminal.id > active_id
+
+    probes = []
+
+    class _Px:
+        def __init__(self, _conn): probes.append("construct")
+
+    saved_px = api.Proxmox
+    api.Proxmox = _Px
+    try:
+        with Session(engine) as s:
+            out = api.vm_detail(dep_id, user=s.get(User, uid), session=s)
+    finally:
+        api.Proxmox = saved_px
+
+    assert probes == [], probes
+    assert out["status"] == "working"
+    assert out["jobId"] == active_id
+    assert out["live"] is None and out["config"] is None and out["agent"] is None
+
+
+def test_vm_detail_normal_running_and_stopped_states_still_live_probe():
+    """The lifecycle lock must not remove ordinary running/stopped detail probing."""
+    for persisted_status, live_status in (("running", "running"), ("stopped", "stopped")):
+        uid, dep_id = _mk_detail_fixture(persisted_status)
+        probes = []
+
+        class _Px:
+            def __init__(self, _conn): probes.append("construct")
+            def vm_current(self, vmid, node):
+                probes.append(("current", vmid, node))
+                return {"status": live_status, "uptime": 61, "cpu": 0.25, "agent": 0}
+            def vm_config(self, vmid, node):
+                probes.append(("config", vmid, node))
+                return {"cores": 2, "memory": 2048}
+
+        saved_px = api.Proxmox
+        api.Proxmox = _Px
+        try:
+            with Session(engine) as s:
+                out = api.vm_detail(dep_id, user=s.get(User, uid), session=s)
+        finally:
+            api.Proxmox = saved_px
+
+        assert probes == [
+            "construct", ("current", 8374, "pve"), ("config", 8374, "pve"),
+        ]
+        assert out["status"] == persisted_status
+        assert out["live"]["status"] == live_status
+        assert out["config"]["cores"] == 2
+        assert out["consoleReady"] is (live_status == "running")
+
+
+def test_cleanup_pending_vm_dict_wins_over_stale_active_job_overlay():
+    """A stale active map must not turn cleanup ownership into a working job chip."""
+    uid, dep_id = _mk_detail_fixture(
+        "cleanup_pending", error="cleanup remains ambiguous",
+    )
+    with session_scope() as s:
+        dep = s.get(Deployment, dep_id)
+        active = Job(
+            type="destroy", status="running", deployment_id=dep_id,
+            connection_id=dep.connection_id, created_by=uid, phase="Destroying",
+        )
+        s.add(active)
+        s.flush()
+        out = S.vm_dict(
+            s, dep, s.get(User, uid), {}, {uid: s.get(User, uid)},
+            {dep.connection_id: s.get(Connection, dep.connection_id)},
+            active_jobs={dep_id: active},
+        )
+
+    assert out["status"] == "cleanup_pending"
+    assert out["err"] == "cleanup remains ambiguous"
+    assert "job" not in out
+
+
 def test_cleanup_origin_migration_is_additive_and_idempotent():
     """An upgraded deployments table gains nullable cleanup provenance exactly once."""
     with engine.begin() as conn:
@@ -1498,6 +1663,11 @@ if __name__ == "__main__":
     test_job_detail_does_not_disclose_execution_plan_or_captured_command()
     test_cleanup_pending_serialization_preserves_owned_identity_and_error()
     test_cleanup_pending_serialization_uses_owned_static_allocation_when_ip_is_empty()
+    test_vm_detail_cleanup_pending_preserves_exact_error_without_live_probe()
+    test_vm_detail_error_preserves_exact_error_without_live_probe()
+    test_vm_detail_prefers_active_lifecycle_job_and_effective_working_state()
+    test_vm_detail_normal_running_and_stopped_states_still_live_probe()
+    test_cleanup_pending_vm_dict_wins_over_stale_active_job_overlay()
     test_cleanup_origin_migration_is_additive_and_idempotent()
     test_cleanup_retry_uses_persisted_origin_after_job_retention_prunes_history()
     test_legacy_queued_job_persists_execution_plan_once()

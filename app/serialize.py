@@ -142,7 +142,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
             select(Job).where(Job.deployment_id == dep.id,
                               Job.status.in_(["queued", "running", "waiting"])).order_by(Job.id.desc())
         ).first()
-    if active:
+    if active and dep.status != "cleanup_pending":
         steps = session.exec(select(JobStep).where(JobStep.job_id == active.id)).all()
         done = sum(1 for s in steps if s.state in ("done", "skipped"))
         label = {"deploy": "Deploying", "rebuild": "Rebuilding", "destroy": "Destroying"}.get(active.type, "Working")
