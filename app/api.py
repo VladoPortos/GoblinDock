@@ -58,6 +58,7 @@ from .recipes import (
     lint_block,
     load_recipe,
     normalize_input_schema,
+    reject_cross_owner_hidden_references,
     validate_public_sensitive_inputs,
 )
 from .seed import backfill_starter_template_location
@@ -958,6 +959,14 @@ def _validate_cross_owner_execution_plan(plan: dict) -> None:
         validate_public_sensitive_inputs(
             plan["recipe"], schemas_by_ref,
             deploy_inputs=plan["deploy_inputs"], cross_owner=True, reject_unknown=True,
+        )
+        reject_cross_owner_hidden_references(
+            plan["recipe"], schemas_by_ref,
+            {
+                ref: (snapshot.get("ansible_template"), snapshot.get("cloudinit_template"))
+                for ref, snapshot in plan["blocks"].items()
+            },
+            deploy_inputs=plan["deploy_inputs"],
         )
     except (KeyError, TypeError):
         raise HTTPException(409, "template execution plan is invalid")

@@ -44,12 +44,19 @@ def _mk_plan_fixture(command: str) -> tuple[int, int, str]:
             email=f"wave37-{suffix}@example.com", name="wave37",
             password_hash=hash_password("StrongPass12!"),
         )
+        # custom Ansible blocks are admin-only (control-node RCE closure) — this
+        # fixture is about plan immutability, so the block simply gets an admin author
+        author = User(
+            email=f"wave37-author-{suffix}@example.com", name="wave37 author",
+            password_hash=hash_password("StrongPass12!"), role="admin",
+        )
         conn = Connection(name=f"w37-conn-{suffix}", host="pve", token_id="u@pve!token")
         image = Image(
             kind="base", name=f"w37-image-{suffix}", source_url="https://example.com/base.img",
             build_status="ready",
         )
         s.add(user)
+        s.add(author)
         s.add(conn)
         s.add(image)
         s.flush()
@@ -57,7 +64,7 @@ def _mk_plan_fixture(command: str) -> tuple[int, int, str]:
         s.add(net)
         block_key = f"c-wave37-plan-{suffix}"
         s.add(Block(
-            key=block_key, kind="custom", builtin=False, owner_id=user.id,
+            key=block_key, kind="custom", builtin=False, owner_id=author.id,
             name="mutable block", phase="ansible",
             input_schema_json=(
                 '[{"name":"command","type":"text"},'

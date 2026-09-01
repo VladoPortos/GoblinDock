@@ -231,6 +231,90 @@ def validate_public_sensitive_inputs(
                 )
 
 
+def reject_cross_owner_hidden_references(recipe, schemas_by_ref, sources_by_ref,
+                                         deploy_inputs=None) -> None:
+    """Fail a cross-owner plan whose author-controlled text carries deployer refs.
+
+    Every ``{{ secrets.NAME }}`` / ``{{ variable.NAME }}`` reference resolves in the
+    DEPLOYER's scope at compile time. The only legitimate cross-owner carriers are a
+    sensitive stored input (exactly one full deployer secret reference, enforced by
+    validate_public_sensitive_inputs) and the deployer's own deploy-time answers.
+    A reference anywhere else — block source templates, non-sensitive schema
+    defaults, non-sensitive stored input values — would silently resolve the
+    deployer's secrets inside author-controlled text that can ship them anywhere
+    (exfiltration primitive), so admission fails closed on any such reference.
+    Error messages intentionally contain block/field names only.
+    """
+    schemas_by_ref = schemas_by_ref if isinstance(schemas_by_ref, dict) else {}
+    sources_by_ref = sources_by_ref if isinstance(sources_by_ref, dict) else {}
+    deploy_inputs = deploy_inputs if isinstance(deploy_inputs, dict) else {}
+
+    def _carries_ref(value) -> bool:
+        if isinstance(value, str):
+            return _REF_RE.search(value) is not None
+        if isinstance(value, list):
+            return any(_carries_ref(item) for item in value)
+        return False
+
+    for ref, sources in sources_by_ref.items():
+        if any(isinstance(text, str) and _REF_RE.search(text) for text in (sources or ())):
+            raise ValueError(
+                f"block {ref!r} source must not reference deployer secrets or variables"
+            )
+    if not isinstance(recipe, list):
+        raise ValueError("recipe is unavailable")
+    for si, section in enumerate(recipe):
+        if not isinstance(section, dict):
+            continue
+        placements = section.get("blocks") or []
+        if not isinstance(placements, list):
+            continue
+        for bi, placed in enumerate(placements):
+            if not isinstance(placed, dict):
+                continue
+            ref = placed.get("ref")
+            schema = schemas_by_ref.get(ref)
+            if not isinstance(ref, str) or not isinstance(schema, list):
+                continue
+            sensitive = {
+                field.get("name") for field in schema
+                if isinstance(field, dict)
+                and isinstance(field.get("name"), str)
+                and field.get("type") in ("password", "secret")
+            }
+            for field in schema:
+                if not isinstance(field, dict):
+                    continue
+                name = field.get("name")
+                if not isinstance(name, str) or name in sensitive:
+                    continue
+                if _carries_ref(field.get("default")):
+                    raise ValueError(
+                        f"block {ref!r} field {name!r} default must not reference "
+                        "deployer secrets or variables"
+                    )
+            asks = {
+                name for name in (placed.get("ask") or [])
+                if isinstance(name, str)
+            }
+            answers = deploy_inputs.get(f"{si}.{bi}") or {}
+            if not isinstance(answers, dict):
+                answers = {}
+            inputs = placed.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                inputs = {}
+            for name, value in inputs.items():
+                if not isinstance(name, str) or name in sensitive:
+                    continue
+                if name in asks and name in answers:
+                    continue  # deployer-supplied answer — their own scope by choice
+                if _carries_ref(value):
+                    raise ValueError(
+                        f"block {ref!r} field {name!r} must not reference "
+                        "deployer secrets or variables"
+                    )
+
+
 def _placed_blocks(recipe):
     """Yield well-formed block placements, ignoring malformed legacy recipe rows."""
     if not isinstance(recipe, list):
