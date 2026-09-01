@@ -73,6 +73,10 @@ class Connection(SQLModel, table=True):
     max_cores: int = 0
     max_ram_mb: int = 0
     max_disk_gb: int = 0
+    # Admin's persisted choice: a disabled source keeps its config and VM records but
+    # is never polled, offered as a target, or shown in normal inventory. Distinct
+    # from an ENABLED connection that is merely unreachable right now.
+    disabled: bool = False
     created_by: Optional[int] = None
     created_at: datetime = Field(default_factory=utcnow)
 

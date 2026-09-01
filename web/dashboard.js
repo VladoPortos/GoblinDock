@@ -76,6 +76,9 @@
           { label: 'Rebuild', icon: 'rebuild', onClick: () => onAct('rebuild', vm), disabled: !vm.templateId, title: 'legacy VM — redeploy from a template' },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onAct('delete', vm) },
+          { label: 'Clean up (local only)', icon: 'cancel', danger: true,
+            title: 'Remove GoblinDock\'s record without touching Proxmox — for VMs already deleted upstream',
+            onClick: () => onAct('cleanupLocal', vm) },
         ]}, h('button', { className: 'icon-btn', title: 'More' }, h(Icon, { name: 'more', size: 16 }))))
     );
   }
@@ -297,7 +300,7 @@
 
     const onAct = async (action, vm) => {
       if (!vmActionable(vm)) return;
-      if (action === 'delete' || action === 'rebuild') { setConfirm({ action, vm }); return; }
+      if (action === 'delete' || action === 'rebuild' || action === 'cleanupLocal') { setConfirm({ action, vm }); return; }
       if (action === 'edit') { setEdit(vm); return; }
       if (action === 'start' || action === 'stop' || action === 'restart') {
         window.GDStore.vmAction(vm.depId, action).catch(() => {});
@@ -418,19 +421,30 @@
 
       confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null),
-        tone: confirm.action === 'delete' ? 'danger' : 'accent',
-        icon: confirm.action === 'delete' ? 'trash' : 'rebuild',
-        title: confirm.action === 'delete' ? 'Delete ' + confirm.vm.name + '?' : 'Rebuild ' + confirm.vm.name + '?',
+        tone: confirm.action === 'rebuild' ? 'accent' : 'danger',
+        icon: confirm.action === 'delete' ? 'trash' : confirm.action === 'cleanupLocal' ? 'warn' : 'rebuild',
+        title: confirm.action === 'delete' ? 'Delete ' + confirm.vm.name + '?'
+          : confirm.action === 'cleanupLocal' ? 'Clean up ' + confirm.vm.name + ' locally?'
+          : 'Rebuild ' + confirm.vm.name + '?',
         body: confirm.action === 'delete'
           ? 'This destroys the VM and its disk on ' + confirm.vm.conn + '. The IP ' + confirm.vm.ip + ' returns to the pool. This cannot be undone.'
-          : 'Re-clones from image ' + confirm.vm.image + ', keeping the name and IP (' + confirm.vm.ip + '). Anything written on disk is lost.',
-        confirmLabel: confirm.action === 'delete' ? 'Delete VM' : 'Rebuild',
+          : confirm.action === 'cleanupLocal'
+            ? 'Removes only GoblinDock\'s record of this VM — NOTHING is deleted in Proxmox. Meant for a VM already deleted upstream (or stranded on a disabled/unreachable source). If the VM still exists on the node it keeps running unmanaged; GoblinDock refuses the cleanup if it can confirm the VM is still there.'
+            : 'Re-clones from image ' + confirm.vm.image + ', keeping the name and IP (' + confirm.vm.ip + '). Anything written on disk is lost.',
+        confirmLabel: confirm.action === 'delete' ? 'Delete VM'
+          : confirm.action === 'cleanupLocal' ? 'Remove local record' : 'Rebuild',
         onConfirm: async () => {
           // toast + rethrow: ConfirmModal stays open for retry when the call fails
           try {
             if (confirm.action === 'rebuild') {
               const r = await window.API.vmRebuild(confirm.vm.depId);
               go('job', { jobId: r.jobId });
+            } else if (confirm.action === 'cleanupLocal') {
+              const r = await window.API.vmCleanupLocal(confirm.vm.depId);
+              window.GDStore.toast(r.verified
+                ? confirm.vm.name + ' removed (VM confirmed absent in Proxmox)'
+                : confirm.vm.name + ' removed — upstream could not be verified', r.verified ? 'ok' : 'warn');
+              window.GDStore.refresh().catch(() => {});
             } else {
               const r = await window.API.vmDestroy(confirm.vm.depId);
               window.GDStore.toast('Destroying ' + confirm.vm.name, 'warn');

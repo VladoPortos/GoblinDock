@@ -97,6 +97,7 @@ def _migrate() -> None:
             ("max_cores", "INTEGER NOT NULL DEFAULT 0"),
             ("max_ram_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("max_disk_gb", "INTEGER NOT NULL DEFAULT 0"),
+            ("disabled", "INTEGER NOT NULL DEFAULT 0"),
         ],
         "audit": [
             ("ip", "TEXT NOT NULL DEFAULT ''"),

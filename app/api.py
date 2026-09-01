@@ -55,7 +55,14 @@ from .models import (
     ensure_utc,
     utcnow,
 )
-from .proxmox import Proxmox, base_disk_filename
+from .proxmox import (
+    VM_ABSENT,
+    VM_PRESENT,
+    VM_UNKNOWN,
+    Proxmox,
+    base_disk_filename,
+    probe_vm_presence,
+)
 from .recipes import (
     ask_map,
     compile_playbook,
@@ -362,11 +369,23 @@ def _maps(session: Session):
 def _px_cache(conns: dict) -> dict:
     cache = {}
     for cid, c in conns.items():
+        if c.disabled:
+            continue  # an admin-disabled source is never probed or targeted
         try:
             cache[cid] = Proxmox(c)
         except Exception:  # noqa: BLE001
             pass
     return cache
+
+
+def _reject_disabled_connection(conn: Optional[Connection], *, detail: str = "") -> None:
+    """New operations must not target an admin-disabled Proxmox source. Distinct
+    from an unreachable connection: this is a persisted operator choice."""
+    if conn is not None and conn.disabled:
+        raise HTTPException(
+            409, detail or f"Proxmox connection {conn.name!r} is disabled — "
+                           "enable it in Settings first",
+        )
 
 
 # Short-TTL cache for the per-connection /version probe on /state. SSE-driven refetches
@@ -678,6 +697,12 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     if user.role != "admin":
         deps_q = deps_q.where(Deployment.owner_id == user.id)
     deps = session.exec(deps_q).all()
+    # An admin-disabled source keeps its VM records (re-enable loses nothing) but
+    # they are hidden from normal inventory and never live-probed. Settings still
+    # shows the connection itself, including how many VMs it holds.
+    disabled_conn_ids = {cid for cid, c in conns.items() if c.disabled}
+    if disabled_conn_ids:
+        deps = [d for d in deps if d.connection_id not in disabled_conn_ids]
     # Batch the active-job lookup once instead of one SELECT per deployment (N+1 on the
     # /state hot path). Highest id wins per deployment (matches the per-dep query order).
     active_by_dep: dict[int, Job] = {}
@@ -765,7 +790,9 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     for c in conn_list:
         px = px_cache.get(c.id)
         st = conn_statuses.get(c.id)
-        if st is None:
+        if c.disabled:
+            st = {"status": "disabled"}   # operator choice — no probe, ever
+        elif st is None:
             st = _conn_status(px, c.id) if px else {"status": "unknown"}
         # Non-admins get a REDACTED connection (target name + node + sizing only) — never
         # the Proxmox host / token id / SSH paths / storage backends, which are admin-only
@@ -1107,6 +1134,7 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
     conn = session.get(Connection, tpl.connection_id) if tpl.connection_id else None
     if not conn:
         raise HTTPException(400, "template has no location — edit it and pick a Proxmox connection")
+    _reject_disabled_connection(conn)
     # Re-check at deploy: a legacy template (or one whose block author was demoted) must
     # not run a non-admin custom Ansible block on the control node.
     _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
@@ -1179,6 +1207,7 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
         conn = session.get(Connection, dep.connection_id)
         if not conn or not dep.vmid:
             raise HTTPException(400, "VM not provisioned")
+        _reject_disabled_connection(conn)
         px = Proxmox(conn)
         node = dep.node or conn.node
         try:
@@ -1227,6 +1256,8 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     active = _active_lifecycle_job(session, dep.id)
     if active:
         raise HTTPException(409, f"{active.type} job already active for this deployment")
+    _reject_disabled_connection(session.get(Connection, dep.connection_id)
+                                if dep.connection_id else None)
     if not dep.template_id:
         raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
     tpl = session.get(Template, dep.template_id)
@@ -1275,6 +1306,11 @@ def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session
 def _vm_destroy_transaction(dep_id: int, user: User, session: Session):
     dep = _owned_deployment(session, dep_id, user)
     _reject_cleanup_pending(dep)
+    conn = session.get(Connection, dep.connection_id) if dep.connection_id else None
+    _reject_disabled_connection(conn, detail=(
+        f"Proxmox connection {conn.name!r} is disabled — enable it in Settings to "
+        "destroy this VM upstream, or use 'Clean up (local only)' if the VM no "
+        "longer exists in Proxmox" if conn else ""))
     # De-dupe / serialise lifecycle jobs per VM (worker-starvation guard). A destroy
     # already in flight is returned as-is; a deploy/rebuild in flight must finish or be
     # cancelled before a destroy is queued.
@@ -1296,6 +1332,60 @@ def _vm_destroy_transaction(dep_id: int, user: User, session: Session):
     session.refresh(job)
     statebus.bump()
     return {"ok": True, "jobId": job.id}
+
+
+@router.post("/deployments/{dep_id}/cleanup_local")
+def vm_cleanup_local(dep_id: int, user: User = Depends(current_user),
+                     session: Session = Depends(get_session)):
+    """Remove GoblinDock's record of a VM WITHOUT deleting anything in Proxmox.
+
+    Recovery path for a VM that was deleted directly in Proxmox (normal Delete
+    would launch an upstream destroy that fails and leave the stale row) and for
+    records stranded on a disabled/unreachable source. At most a read-only
+    inventory probe is sent upstream: a VM confirmed present is refused — the
+    normal Delete flow (upstream first, local record only after success) is the
+    correct tool then."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        with _lifecycle_admission_lock:
+            return _vm_cleanup_local_transaction(dep_id, user, session)
+
+
+def _vm_cleanup_local_transaction(dep_id: int, user: User, session: Session):
+    dep = _owned_deployment(session, dep_id, user)
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
+    conn = session.get(Connection, dep.connection_id) if dep.connection_id else None
+    if conn and not conn.disabled:
+        try:
+            px = Proxmox(conn)
+        except Exception:  # noqa: BLE001
+            px = None
+        presence, detail = probe_vm_presence(px, dep.vmid, dep.node or conn.node)
+    elif conn:
+        presence, detail = VM_UNKNOWN, "Proxmox connection is disabled"
+    else:
+        presence, detail = VM_UNKNOWN, "Proxmox connection no longer exists"
+    if presence == VM_PRESENT:
+        raise HTTPException(409, "the VM still exists in Proxmox — use the normal "
+                                 "Delete action so it is destroyed upstream first")
+    verified = presence == VM_ABSENT
+    for alloc in session.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep.id)).all():
+        session.delete(alloc)
+    # Audit must let an operator tell local-only cleanup apart from a completed
+    # upstream destroy, including whether absence was actually confirmed.
+    record_audit(
+        session, user, "vm.cleanup_local", "deployment", dep.id,
+        f"{dep.name} — local record removed, Proxmox untouched "
+        f"({'upstream absence confirmed' if verified else f'unverified: {detail}'})",
+    )
+    session.delete(dep)
+    session.commit()
+    statebus.bump()
+    return {"ok": True, "verified": verified}
 
 
 def _iface_summary(ifaces) -> list:
@@ -1341,7 +1431,9 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         **({"err": dep.error}
            if dep.status in ("error", "cleanup_pending") and dep.error else {}),
     }
-    if conn and dep.vmid and effective_status not in ("working", "error", "cleanup_pending"):
+    out["connectionDisabled"] = bool(conn and conn.disabled)
+    if (conn and not conn.disabled and dep.vmid
+            and effective_status not in ("working", "error", "cleanup_pending")):
         try:
             px = Proxmox(conn)
             node = dep.node or conn.node or px.pick_node()
@@ -1392,6 +1484,7 @@ def _snapshot_px(session: Session, dep: Deployment) -> tuple[Proxmox, str]:
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
+    _reject_disabled_connection(conn)
     px = Proxmox(conn)
     return px, dep.node or conn.node or px.pick_node()
 
@@ -1720,6 +1813,7 @@ def _prepare_serial_console(dep_id: int, grant: _ConsoleGrant) -> _SerialConsole
             conn = session.get(Connection, dep.connection_id)
             if not conn or not dep.vmid:
                 raise HTTPException(400, "VM not provisioned")
+            _reject_disabled_connection(conn)
             px = Proxmox(conn)
             node = dep.node or conn.node or px.pick_node()
             px.ensure_serial(dep.vmid, node)
@@ -1790,6 +1884,7 @@ def vm_vncproxy(dep_id: int, response: Response, user: User = Depends(current_us
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
+    _reject_disabled_connection(conn)
     px = Proxmox(conn)
     node = dep.node or conn.node or px.pick_node()
     try:
@@ -1898,6 +1993,8 @@ def cached_images(connectionId: int, user: User = Depends(current_user),
     conn = session.get(Connection, connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
+    if conn.disabled:
+        return {"online": False, "disabled": True, "cached": []}
     now = time.time()
     hit = _CACHED_IMAGES_CACHE.get(connectionId)
     if hit and now - hit[0] < _CACHED_IMAGES_TTL:
@@ -1944,6 +2041,7 @@ def sync_image(img_id: int, body: SyncBody, user: User = Depends(require_admin),
     conn = session.get(Connection, body.connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
+    _reject_disabled_connection(conn)
     # De-dupe: return any already active sync for this image+connection instead
     # of piling identical heavyweight downloads onto the worker.
     existing = session.exec(select(Job).where(
@@ -2113,6 +2211,9 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
         conn = session.get(Connection, body.connectionId)
         if not conn:
             raise HTTPException(400, "connectionId not found")
+        if conn.disabled:
+            raise HTTPException(400, f"Proxmox connection {conn.name!r} is disabled "
+                                     "— it cannot be picked as a template location")
         cid = conn.id
     if body.networkId is not None:
         if cid is None:
@@ -2577,6 +2678,7 @@ def connection_capacity(conn_id: int, user: User = Depends(current_user),
     conn = session.get(Connection, conn_id)
     if not conn:
         raise HTTPException(404, "not found")
+    _reject_disabled_connection(conn)
     now = time.monotonic()
     cached = _CAPACITY_CACHE.get(conn_id)
     if cached and now - cached[0] < _CAPACITY_TTL:
@@ -3017,6 +3119,7 @@ class ConnEditBody(BaseModel):
     max_cores: Optional[int] = Field(default=None, ge=0, le=256)
     max_ram_gb: Optional[int] = Field(default=None, ge=0, le=1024)
     max_disk_gb: Optional[int] = Field(default=None, ge=0, le=16384)
+    disabled: Optional[bool] = None
 
 
 @router.put("/connections/{conn_id}")
@@ -3037,12 +3140,23 @@ def edit_connection(conn_id: int, body: ConnEditBody, user: User = Depends(requi
     for fld in ("node", "storage", "iso_storage", "snippet_storage"):
         if data.get(fld) is not None:
             data[fld] = _clean_storage_id(data[fld], fld.replace("_", " "))
+    was_disabled = bool(c.disabled)
     for k, v in data.items():
         if v is not None:                      # 0 is allowed (unlimited)
             setattr(c, k, v)
     session.add(c)
-    record_audit(session, user, "connection.update", "connection", c.id, c.name)
+    if bool(c.disabled) != was_disabled:
+        # Distinct audit trail for the enable/disable choice, and an immediate
+        # status-cache bust so Settings reflects the new state on the next poll
+        # (re-enable also makes the first /state probe refresh the inventory).
+        _CONN_STATUS_CACHE.pop(c.id, None)
+        record_audit(session, user,
+                     "connection.disable" if c.disabled else "connection.enable",
+                     "connection", c.id, c.name)
+    else:
+        record_audit(session, user, "connection.update", "connection", c.id, c.name)
     session.commit()
+    statebus.bump()
     return {"ok": True}
 
 

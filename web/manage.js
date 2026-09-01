@@ -395,8 +395,12 @@
             h(Field, { label: 'Max disk (GB)', value: f.max_disk_gb, onChange: (v) => set('max_disk_gb', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' })))));
   }
 
-  function NodeGauge({ connId }) {
-    const cap = useFetched(() => window.API.connectionCapacity(connId), [connId], { online: false });
+  function NodeGauge({ connId, disabled }) {
+    // a disabled source is never probed — don't even ask the capacity endpoint
+    const cap = useFetched(() => disabled
+      ? Promise.resolve({ online: false, disabled: true })
+      : window.API.connectionCapacity(connId), [connId, disabled], { online: false });
+    if (disabled) return h('div', { className: 'hint mono', style: { fontSize: 11, opacity: 0.6 } }, 'source disabled — not polled');
     if (!cap) return h('div', { className: 'hint mono', style: { fontSize: 11 } }, 'checking capacity…');
     if (!cap.online) return h('div', { className: 'hint mono', style: { fontSize: 11, opacity: 0.6 } }, 'node offline');
     const bar = (label, used, total) => h('div', { style: { marginTop: 4 } },
@@ -420,6 +424,15 @@
       setTesting((t) => ({ ...t, [c.connId]: false })); refresh();
     };
     const del = async (c) => { try { await window.API.deleteConnection(c.connId); toast('Connection removed', 'ok'); refresh(); } catch (e) { toast(e.message, 'err'); } };
+    const toggleDisabled = async (c) => {
+      try {
+        await window.API.editConnection(c.connId, { disabled: !c.disabled });
+        toast(c.disabled
+          ? c.name + ' enabled — inventory refreshes on the next poll'
+          : c.name + ' disabled — its VMs are hidden and it will not be polled or targeted', c.disabled ? 'ok' : 'warn');
+        refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    };
     return h('div', null,
       h('div', { className: 'row', style: { marginBottom: 14 } },
         h('span', { className: 'panel-title' }, (GD.CONNECTIONS || []).length, ' connections'),
@@ -432,7 +445,8 @@
               h('div', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, c.name),
               h('div', { className: 'copy mono', style: { fontSize: 11 } }, c.url)),
             h('div', { style: { marginLeft: 'auto' } },
-              c.status === 'online' ? h('span', { className: 'badge running' }, h('span', { className: 'dot running' }), 'v', c.version)
+              c.disabled ? h('span', { className: 'badge', title: 'Disabled by an admin — not polled, VMs hidden, no new operations' }, h('span', { className: 'dot' }), 'Disabled')
+                : c.status === 'online' ? h('span', { className: 'badge running' }, h('span', { className: 'dot running' }), 'v', c.version)
                 : c.status === 'offline' ? h('span', { className: 'badge error' }, h('span', { className: 'dot error' }), 'Offline')
                 : h('span', { className: 'badge' }, 'Unknown'))),
           h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
@@ -446,10 +460,16 @@
               h(Icon, { name: 'sliders', size: 12 }),
               h('span', { className: 'hint mono', style: { fontSize: 11 } }, 'Per-VM max: ' + cpu + ' vCPU · ' + ram + ' GB · ' + disk + ' GB'));
           })(),
-          h(NodeGauge, { connId: c.connId }),
+          h(NodeGauge, { connId: c.connId, disabled: c.disabled }),
           h('div', { className: 'divider' }),
           h('div', { className: 'row', style: { gap: 8 } },
             h('button', { className: 'btn sm', style: { flex: 1 }, onClick: () => test(c), disabled: testing[c.connId] }, h(Icon, { name: 'refresh', size: 14 }), testing[c.connId] ? 'Testing…' : 'Test'),
+            h('button', {
+              className: 'btn sm' + (c.disabled ? ' primary' : ''), style: { flex: 1 },
+              title: c.disabled ? 'Re-enable: VMs reappear and inventory refreshes — nothing was lost'
+                : 'Disable: keep the config and VM records, but stop polling and hide its VMs (for a source that is offline / in maintenance / retired)',
+              onClick: () => toggleDisabled(c),
+            }, h(Icon, { name: c.disabled ? 'play' : 'stop', size: 14 }), c.disabled ? 'Enable' : 'Disable'),
             h('button', { className: 'btn ghost sm icon', onClick: () => setModal({ conn: c }) }, h(Icon, { name: 'edit', size: 15 })),
             h('button', { className: 'icon-btn danger', onClick: () => setConfirm(c) }, h(Icon, { name: 'trash', size: 16 })))))),
       modal === 'add' && h(ConnModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Connection added', 'ok'); refresh(); } }),

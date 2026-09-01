@@ -46,10 +46,14 @@ from .models import (
     utcnow,
 )
 from .proxmox import (
+    VM_ABSENT,
+    VM_PRESENT,
+    VM_UNKNOWN,
     JobCancelled,
     Proxmox,
     base_disk_filename,
     delete_snippet_over_ssh,
+    probe_vm_presence as _probe_vm_presence,
     write_snippet_over_ssh,
 )
 from .recipes import (
@@ -963,6 +967,7 @@ _DISPATCH = {
 # --------------------------------------------------------------------------- #
 def _claim_next_job() -> Optional[int]:
     canceled_id = None
+    failed_id = None
     with session_scope() as s:
         job = s.exec(
             select(Job).where(Job.status == "queued").order_by(Job.id)
@@ -976,15 +981,29 @@ def _claim_next_job() -> Optional[int]:
             job.finished_at = utcnow()
             s.add(job)
             canceled_id = job.id
+        elif (job.connection_id
+              and (conn := s.get(Connection, job.connection_id)) is not None
+              and conn.disabled):
+            # The admin disabled the source after this job was queued. Admission
+            # blocks new jobs on disabled connections; a stranded queued one must
+            # not silently start talking to a target the operator switched off.
+            job.status = "failed"
+            job.error = (f"Proxmox connection {conn.name!r} was disabled while this "
+                         "job was queued — enable it and retry")
+            job.finished_at = utcnow()
+            s.add(job)
+            failed_id = job.id
         else:
             job.status = "running"
             job.started_at = utcnow()
             s.add(job)
             statebus.bump()
             return job.id
-    # A queued job was cancelled: reconcile its deployment so it isn't stranded in
-    # "working" with a leaked IP reservation (see _reconcile_canceled_job).
+    # A queued job was cancelled/failed pre-start: reconcile its deployment so it
+    # isn't stranded in "working" with a leaked IP reservation.
     _reconcile_canceled_job(canceled_id)
+    if failed_id:
+        _reconcile_failed_job(failed_id)
     statebus.bump()
     return None
 
@@ -1043,28 +1062,6 @@ def _execute(job_id: int) -> None:
         traceback.print_exc()
 
 
-VM_PRESENT = "present"
-VM_ABSENT = "absent"
-VM_UNKNOWN = "unknown"
-
-
-def _probe_vm_presence(
-    px: Optional[Proxmox], vmid: Optional[int], node: Optional[str]
-) -> tuple[str, str]:
-    """Return tri-state Proxmox inventory truth without collapsing errors to absence."""
-    if vmid is None:
-        return VM_ABSENT, "VM ID was never assigned"
-    if px is None:
-        return VM_UNKNOWN, "Proxmox client unavailable"
-    try:
-        present = vmid in {int(v["vmid"]) for v in px.list_qemu(node)}
-    except Exception as exc:  # noqa: BLE001
-        return VM_UNKNOWN, f"Proxmox inventory probe failed: {exc}"
-    if present:
-        return VM_PRESENT, f"VM {vmid} is present in Proxmox inventory"
-    return VM_ABSENT, f"VM {vmid} is absent from Proxmox inventory"
-
-
 def _vm_exists(px: Proxmox, vmid: int, node: Optional[str]) -> bool:
     """Fail-safe compatibility helper used by rebuild's post-destroy check."""
     state, _detail = _probe_vm_presence(px, vmid, node)
@@ -1092,6 +1089,11 @@ def _px_for_conn(conn_id: Optional[int]) -> Optional[Proxmox]:
     try:
         with session_scope() as s:
             conn = s.get(Connection, conn_id)
+            # An admin-disabled source must never be contacted, even by cancel/
+            # cleanup reconciliation — callers treat None as "inventory unknown"
+            # and keep ownership, which is the fail-safe outcome.
+            if conn is not None and conn.disabled:
+                return None
             conn = Connection(**conn.model_dump()) if conn else None
         return Proxmox(conn) if conn else None
     except Exception:  # noqa: BLE001

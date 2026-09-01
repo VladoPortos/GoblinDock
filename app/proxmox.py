@@ -675,3 +675,28 @@ def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:
         pass
     finally:
         client.close()
+
+
+# --------------------------------------------------------------------------- #
+# read-only inventory truth                                                    #
+# --------------------------------------------------------------------------- #
+VM_PRESENT = "present"
+VM_ABSENT = "absent"
+VM_UNKNOWN = "unknown"
+
+
+def probe_vm_presence(
+    px: Optional["Proxmox"], vmid: Optional[int], node: Optional[str]
+) -> tuple[str, str]:
+    """Return tri-state Proxmox inventory truth without collapsing errors to absence."""
+    if vmid is None:
+        return VM_ABSENT, "VM ID was never assigned"
+    if px is None:
+        return VM_UNKNOWN, "Proxmox client unavailable"
+    try:
+        present = vmid in {int(v["vmid"]) for v in px.list_qemu(node)}
+    except Exception as exc:  # noqa: BLE001
+        return VM_UNKNOWN, f"Proxmox inventory probe failed: {exc}"
+    if present:
+        return VM_PRESENT, f"VM {vmid} is present in Proxmox inventory"
+    return VM_ABSENT, f"VM {vmid} is absent from Proxmox inventory"

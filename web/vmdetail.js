@@ -320,6 +320,16 @@
       try { const r = await window.API.vmDestroy(depId); go('job', { jobId: r.jobId }); }
       catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
     };
+    const cleanupLocal = async () => {
+      try {
+        const r = await window.API.vmCleanupLocal(depId);
+        window.GDStore.toast(r.verified
+          ? 'Local record removed (VM confirmed absent in Proxmox)'
+          : 'Local record removed — upstream could not be verified', r.verified ? 'ok' : 'warn');
+        window.GDStore.refresh().catch(() => {});
+        go('dashboard');
+      } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
+    };
 
     if (err && !d) return h('div', { className: 'page fadein' },
       h('div', { className: 'card' }, h('div', { className: 'empty' },
@@ -360,7 +370,15 @@
           !locked && h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
           !locked && h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
           !locked && h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
-            onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 }))),
+            onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 })),
+          // recovery path for a record whose VM is gone / unreachable upstream:
+          // offered when the source is disabled, live status is unavailable, or the
+          // VM is stuck in an error/cleanup state — never for a healthy VM.
+          !locked && (d.connectionDisabled || powerUnavailable || d.liveError
+              || d.status === 'error' || d.status === 'cleanup_pending')
+            && h('button', { type: 'button', className: 'btn ghost sm', 'aria-label': 'Clean up local record',
+              title: 'Remove GoblinDock\'s record only — never touches Proxmox',
+              onClick: () => setConfirm('local') }, h(Icon, { name: 'cancel', size: 14 }), 'Clean up')),
       ),
 
       d.err && h('div', {
@@ -447,12 +465,23 @@
           Card('Deployment log', h(DeployLog, { jobId: d.jobId }),
             d.jobId && h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => go('job', { jobId: d.jobId }) }, 'Open full log')))),
 
-      confirm && h(ConfirmModal, {
-        onClose: () => setConfirm(false), tone: 'danger', icon: 'trash',
-        title: 'Delete ' + d.name + '?',
-        body: 'This destroys the VM and its disk on ' + d.node + '. The IP returns to the pool. This cannot be undone.',
-        confirmLabel: 'Delete VM', onConfirm: destroy,
-      }));
+      confirm === 'local'
+        ? h(ConfirmModal, {
+            onClose: () => setConfirm(false), tone: 'danger', icon: 'warn',
+            title: 'Clean up ' + d.name + ' locally?',
+            body: 'Removes only GoblinDock\'s record of this VM — NOTHING is deleted in Proxmox.'
+              + (d.connectionDisabled
+                ? ' Its connection is disabled, so GoblinDock cannot verify whether the VM still exists upstream.'
+                : ' GoblinDock refuses the cleanup if it can confirm the VM still exists upstream.')
+              + ' If the VM still exists on the node it keeps running unmanaged.',
+            confirmLabel: 'Remove local record', onConfirm: cleanupLocal,
+          })
+        : confirm && h(ConfirmModal, {
+            onClose: () => setConfirm(false), tone: 'danger', icon: 'trash',
+            title: 'Delete ' + d.name + '?',
+            body: 'This destroys the VM and its disk on ' + d.node + '. The IP returns to the pool. This cannot be undone.',
+            confirmLabel: 'Delete VM', onConfirm: destroy,
+          }));
   }
 
   window.VmDetail = VmDetail;

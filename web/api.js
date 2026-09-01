@@ -90,6 +90,8 @@ window.API = (function () {
     vmAction: (id, action) => req('POST', `/api/deployments/${id}/action`, { action }),
     vmRebuild: (id) => req('POST', `/api/deployments/${id}/rebuild`),
     vmDestroy: (id) => req('DELETE', `/api/deployments/${id}`),
+    // removes only GoblinDock's record — never sends a delete to Proxmox
+    vmCleanupLocal: (id) => req('POST', `/api/deployments/${id}/cleanup_local`),
     patchVm: (id, p) => req('PATCH', `/api/deployments/${id}`, p),
     vmDetail: (id) => req('GET', `/api/vms/${id}/detail`),
     vncProxy: (id) => req('POST', `/api/vms/${id}/vncproxy`),
