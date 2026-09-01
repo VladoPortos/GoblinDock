@@ -808,6 +808,7 @@ def test_authenticated_non_admin_state_endpoint_redacts_operations_and_sensitive
         "id": f"c-{fixture['connection_id']}",
         "connId": fixture["connection_id"],
         "name": fixture["connection_name"],
+        "disabled": False,
         "status": "unknown",
         "version": "—",
         "node": "pve-public-node",
@@ -1401,8 +1402,10 @@ def test_add_connection_persists_default_network_then_starter_backfill():
         assert starter.network_id == networks[0].id
 
 
-def test_task7_keeps_token_free_first_admin_setup_contract():
-    assert set(api.SetupBody.model_fields) == {"email", "name", "password"}
+def test_task7_first_admin_setup_contract_survives_token_gate():
+    # main's first-run race fix added a setup token (ignored under GOBLINDOCK_DEV=1,
+    # which these tests run with); the flow keeps the same three identity fields.
+    assert set(api.SetupBody.model_fields) == {"email", "name", "password", "token"}
     local_engine = _starter_engine()
     request = SimpleNamespace(session={})
     with Session(local_engine) as session:
@@ -1579,7 +1582,7 @@ if __name__ == "__main__":
     test_seed_templates_creates_only_a_location_null_system_definition()
     test_run_all_seeds_orders_default_network_before_committed_backfill()
     test_add_connection_persists_default_network_then_starter_backfill()
-    test_task7_keeps_token_free_first_admin_setup_contract()
+    test_task7_first_admin_setup_contract_survives_token_gate()
     test_checksum_validation_normalizes_supported_digests_without_legacy_regression()
     test_base_image_create_and_edit_persist_normalized_checksum_atomically()
     print("\nALL WAVE 39 UNIT TESTS PASSED")

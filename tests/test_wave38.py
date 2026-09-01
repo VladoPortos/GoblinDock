@@ -748,26 +748,34 @@ def test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit():
         assert "DEPLOY_TOKEN" not in str(exc.detail)
 
 
-def test_public_edit_rejects_literal_but_private_and_owner_paths_remain_allowed():
+def test_literal_sensitive_values_rejected_for_private_and_public_saves():
+    """Since wave 49 a literal password/secret input is rejected for EVERY
+    template save/edit — private ones too (it would sit in plaintext in
+    recipe_json). A reference-based private save still works, and a legacy row
+    that predates the rule still deploys for its owner (startup migration moves
+    its literals into the encrypted secret store)."""
     fixture = _sensitive_fixture()
     private_recipe = _recipe(
         fixture["block"], password="PRIVATE-AUTHOR-VALUE", token="PRIVATE-TOKEN",
     )
-    assert _save(fixture, public=False, recipe=private_recipe)["ok"]
+    exc = _expect_http(400, lambda: _save(fixture, public=False, recipe=private_recipe))
+    assert "password" in str(exc.detail)
+    assert "PRIVATE-AUTHOR-VALUE" not in str(exc.detail)
+
+    assert _save(fixture, public=False, recipe=_recipe(
+        fixture["block"], password="{{ secrets.W38_PASSWORD }}",
+        token="{{ secrets.W38_TOKEN }}",
+    ))["ok"]
+
+    imported_id = _insert_template(fixture, private_recipe, public=True)
     with session_scope() as s:
-        template = s.exec(select(Template).where(
-            Template.owner_id == fixture["author"],
-            Template.name == "w38-sensitive-template",
-        )).first()
-        template_id = template.id
         exc = _expect_http(400, lambda: api.edit_template_ep(
-            template_id, _body(fixture, public=True, recipe=private_recipe),
+            imported_id, _body(fixture, public=True, recipe=private_recipe),
             user=s.get(User, fixture["author"]), session=s,
         ))
         assert "password" in str(exc.detail)
         assert "PRIVATE-AUTHOR-VALUE" not in str(exc.detail)
 
-    imported_id = _insert_template(fixture, private_recipe, public=True)
     with Session(engine) as s:
         result = api.deploy(
             api.DeployBody(templateId=imported_id, name="w38-owner-deploy"),
@@ -1250,7 +1258,7 @@ if __name__ == "__main__":
     test_public_literal_is_rejected_without_echo()
     test_public_ask_and_exact_deployer_secret_references_are_allowed()
     test_public_blank_sensitive_fields_require_exact_ask_on_save_and_edit()
-    test_public_edit_rejects_literal_but_private_and_owner_paths_remain_allowed()
+    test_literal_sensitive_values_rejected_for_private_and_public_saves()
     test_cross_owner_missing_sensitive_ask_answer_cannot_fallback_to_author_value()
     test_cross_owner_imported_literal_is_rejected_before_any_rows_are_inserted()
     test_cross_owner_blank_sensitive_without_ask_is_rejected_before_persistence()
