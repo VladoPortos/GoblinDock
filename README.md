@@ -44,7 +44,13 @@ GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
   & network info, the deployment log, and a built-in **console** (graphical VGA *and*
   serial — the same noVNC console Proxmox uses).
 - **🛠️ Lifecycle** — start / stop / restart / **rebuild** / **destroy**, all from the
-  dashboard or detail page.
+  dashboard or detail page. A VM deleted directly in Proxmox gets an explicit
+  **Clean up (local only)** action that removes just GoblinDock's record (never
+  touching Proxmox, and refusing if the VM demonstrably still exists upstream).
+- **🔌 Disable a Proxmox source** — a connection that is offline, in maintenance or
+  retired can be **disabled** in Settings: its config and VM records are kept, but
+  its VMs leave the inventory, nothing polls it, and it can't be targeted until
+  re-enabled — at which point everything reconciles without loss.
 - **📸 Snapshots** — take, roll back and delete Proxmox-native snapshots (optionally
   with RAM state) right from the VM detail page — snapshot before risky changes,
   roll back in seconds.
