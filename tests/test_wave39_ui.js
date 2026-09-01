@@ -1012,9 +1012,11 @@ const settingsHarness = persistentManageHarness();
 let settingsTree = settingsHarness.render();
 let settingsSelector = findAll(settingsTree,
   (node) => node.props.className === 'seg settings-section-selector')[0];
-assert.ok(settingsSelector, 'Settings needs one narrow-safe six-section selector');
+assert.ok(settingsSelector, 'Settings needs one narrow-safe section selector');
 let settingsTabs = findAll(settingsSelector, (node) => node.type === 'button');
-assert.equal(settingsTabs.length, 6);
+assert.equal(settingsTabs.length, 7);   // + Health (wave 51)
+assert.equal(textOf(settingsTabs[6]), 'Health',
+  'the Health section must sit after Preferences');
 assert.equal(settingsTabs[0].props.className, 'active',
   'Settings must keep connections as its default section');
 assert.ok(findAll(settingsTree, (node) => node.type === 'button'
