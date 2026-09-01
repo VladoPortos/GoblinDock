@@ -10,6 +10,7 @@ import os
 import sys
 import tempfile
 from contextlib import contextmanager
+from datetime import timedelta
 from types import SimpleNamespace
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -236,8 +237,10 @@ def test_login_rejects_email_longer_than_320_characters():
     raise AssertionError("a 321-character login email must fail request validation")
 
 
-def test_correct_password_clears_persistent_lock_and_authenticates():
-    """Lock state must slow wrong guesses, never deny the legitimate credential."""
+def test_active_lock_denies_even_the_correct_password_until_it_expires():
+    """The persistent per-account lock is a hard spray brake: while it is active even
+    the correct credential gets the generic 401 (no oracle), and once it expires the
+    correct credential authenticates and clears the failure state."""
     suffix = os.urandom(4).hex()
     email = f"wave44-locked-{suffix}@example.com"
     password = "CorrectPass12!"
@@ -261,7 +264,30 @@ def test_correct_password_clears_persistent_lock_and_authenticates():
             assert locked.locked_until is not None
             assert ensure_utc(locked.locked_until) > utcnow()
 
-        request = _request(ip="198.51.100.200")
+        # While locked: the correct password from a fresh IP still gets the same
+        # generic 401, and the lock is neither extended nor the counter bumped.
+        with Session(engine) as s:
+            exc = _expect_http(
+                401,
+                lambda: api.login(
+                    api.LoginBody(email=email, password=password),
+                    _request(ip="198.51.100.200"),
+                    s,
+                ),
+            )
+        assert exc.detail == "invalid email or password"
+        with Session(engine) as s:
+            still_locked = s.get(User, user_id)
+            assert still_locked.failed_logins == 0
+            assert ensure_utc(still_locked.locked_until) > utcnow()
+
+        # After the lock expires the legitimate credential works and clears state.
+        with Session(engine) as s:
+            expired = s.get(User, user_id)
+            expired.locked_until = utcnow() - timedelta(minutes=1)
+            s.add(expired)
+            s.commit()
+        request = _request(ip="198.51.100.201")
         with Session(engine) as s:
             out = api.login(
                 api.LoginBody(email=email, password=password), request, s,
@@ -486,7 +512,7 @@ if __name__ == "__main__":
     test_existing_database_migration_adds_deleted_at()
     test_login_attempt_keys_are_hard_bounded_by_lru()
     test_login_rejects_email_longer_than_320_characters()
-    test_correct_password_clears_persistent_lock_and_authenticates()
+    test_active_lock_denies_even_the_correct_password_until_it_expires()
     test_known_and_unknown_wrong_credentials_share_throttle_contract()
     test_env_seeded_admin_identity_is_normalized()
     test_job_stream_reauthorizes_after_handshake_before_first_emit()

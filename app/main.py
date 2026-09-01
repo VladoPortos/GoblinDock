@@ -33,6 +33,13 @@ CSRF_EXEMPT = {"/api/auth/login", "/api/auth/setup"}
 async def lifespan(app: FastAPI):
     init_db()
     run_all_seeds()
+    # If no admin exists yet (and we're not in dev / env-seeded), print the first-run
+    # setup token so the operator — and only the operator, who can read these logs — can
+    # complete the unauthenticated /auth/setup without an internet attacker racing them.
+    from .api import announce_setup_token
+    from .db import session_scope
+    with session_scope() as _s:
+        announce_setup_token(_s)
     start_worker()
     start_scheduler()
     log.info("GoblinDock ready · web=%s · vmid=%s-%s · max %sc/%sMB · dev=%s",

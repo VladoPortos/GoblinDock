@@ -586,6 +586,14 @@ def _ssh_client(conn: Connection, key, timeout: int):
     return client
 
 
+def _safe_path_token(s: str) -> bool:
+    """A single path segment safe to splice into a node-side SFTP path: a normal leading
+    character (not a dot) then the allowed set, and never a '..' anywhere. The bare
+    ``[A-Za-z0-9_.-]+`` allowlist matched '..' and '.'; requiring a non-dot lead and
+    rejecting '..' closes traversal even if a future caller passes user input here."""
+    return bool(re.fullmatch(r"[A-Za-z0-9_][A-Za-z0-9_.-]*", s or "")) and ".." not in s
+
+
 def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str:
     """Drop a cloud-init snippet onto the node's snippet storage via SSH/SFTP.
 
@@ -598,9 +606,9 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
     # snippet_storage and filename land in shell/sftp paths on the node — both are
     # constrained to a strict allowlist so neither can inject shell or traverse.
     store = conn.snippet_storage or "local"
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", store):
+    if not _safe_path_token(store):
         raise ProxmoxError(f"invalid snippet storage name: {store!r}")
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", filename):
+    if not _safe_path_token(filename):
         raise ProxmoxError(f"invalid snippet filename: {filename!r}")
 
     base = "/var/lib/vz/snippets" if store == "local" else f"/mnt/pve/{store}/snippets"
@@ -643,10 +651,10 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
 
 def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:
     """Best-effort removal of a cloud-init snippet from the node (cleanup)."""
-    if not conn.ssh_key_path or not re.fullmatch(r"[A-Za-z0-9_.-]+", filename or ""):
+    if not conn.ssh_key_path or not _safe_path_token(filename or ""):
         return
     store = conn.snippet_storage or "local"
-    if not re.fullmatch(r"[A-Za-z0-9_.-]+", store):
+    if not _safe_path_token(store):
         return
     base = "/var/lib/vz/snippets" if store == "local" else f"/mnt/pve/{store}/snippets"
     key = _load_ssh_key(conn.ssh_key_path)

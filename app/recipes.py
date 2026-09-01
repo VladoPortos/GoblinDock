@@ -24,6 +24,11 @@ _DEPLOYER_SECRET_REF_RE = re.compile(r"^\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}$")
 
 _PLACEHOLDER_RE = re.compile(r"(?P<indent>[^\S\n]*)\{(?P<key>[A-Za-z0-9_]+)\}")
 
+# C0 control chars (incl. newline/tab) + DEL. A non-'code' input value's RAW form must
+# never carry these — in a YAML scalar they can break the scalar and inject a sibling
+# Ansible task (control-node RCE). See _ansible_flat's sink hardening.
+_CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
+
 
 def _substitute(template: str, flat: dict) -> str:
     """Indentation-aware placeholder fill: when a placeholder is filled with a
@@ -95,16 +100,32 @@ def _ansible_flat(inputs: dict, types: dict,
       {k_yamlq}  JSON-encoded — a safe double-quoted YAML scalar
       {k_set}    'true' if the scalar value is non-empty/non-false, 'false' otherwise —
                  safe for ansible ``when:`` clauses without embedding the value in YAML
-    'code'-typed fields stay raw in {k_q} (a Run Script body is intentionally shell)."""
+    'code'-typed fields stay raw in {k_q} (a Run Script body is intentionally shell).
+
+    SINK HARDENING: the raw ``{k}`` slot is spliced verbatim into the playbook YAML by
+    several built-in blocks (e.g. ``name: {user}``, ``key: "{key}"``). A newline / control
+    char in a non-'code' value there could break the scalar and inject a sibling task —
+    e.g. one carrying ``delegate_to: localhost`` (code execution on the shared control
+    node, not the tenant's VM). The API rejects such values on template save, but this
+    also neutralises control chars in the raw form at compile time so a legacy row that
+    predates that check can't inject either. 'code' bodies stay raw by design; the shell-
+    quoted ({k_q}) and JSON-encoded ({k_yamlq}) forms already contain any control char."""
     def _res(x) -> str:
         return resolve_secrets(str(x), secret_lookup) if secret_lookup else str(x)
+
+    def _raw(s: str, t: str) -> str:
+        # Keep 'code' bodies verbatim (intentionally multi-line); scrub control chars
+        # from every other value's raw form so it can never break out of a YAML scalar.
+        return s if t == "code" else _CTRL_CHAR_RE.sub(" ", s)
+
     flat: dict = {}
     for k, v in (inputs or {}).items():
         t = types.get(k, "text")
         if isinstance(v, list):
             items = [_res(x) for x in v]
-            flat[k] = " ".join(items)
-            flat[f"{k}_yaml"] = "[" + ", ".join(items) + "]"
+            raw_items = [_raw(x, t) for x in items]
+            flat[k] = " ".join(raw_items)
+            flat[f"{k}_yaml"] = "[" + ", ".join(raw_items) + "]"
             flat[f"{k}_yamlq"] = "[" + ", ".join(json.dumps(x) for x in items) + "]"
             flat[f"{k}_q"] = " ".join(shlex.quote(x) for x in items)
         elif isinstance(v, bool):
@@ -112,7 +133,7 @@ def _ansible_flat(inputs: dict, types: dict,
             flat[f"{k}_set"] = "true" if v else "false"
         else:
             sval = _res(v)
-            flat[k] = sval
+            flat[k] = _raw(sval, t)
             flat[f"{k}_q"] = sval if t == "code" else shlex.quote(sval)
             flat[f"{k}_yamlq"] = json.dumps(sval)
             flat[f"{k}_set"] = "true" if sval else "false"
