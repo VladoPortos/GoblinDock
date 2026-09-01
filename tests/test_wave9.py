@@ -80,7 +80,10 @@ def test_migration_renames_and_extends():
     assert "golden_image_id" not in tcols, tcols
     dcols = _cols("deployments")
     assert "template_id" in dcols and "recipe_id" not in dcols, dcols
-    assert "deploy_inputs_json" in dcols, dcols
+    # 2026-09: ask-on-deploy answers are encrypted at rest; the plaintext column
+    # must be migrated away (or at minimum blanked where DROP COLUMN is missing)
+    assert "deploy_inputs_enc" in dcols, dcols
+    assert "deploy_inputs_json" not in dcols, dcols
     # data survived the rename
     from app.models import Deployment, Template
     from sqlmodel import select
@@ -90,7 +93,7 @@ def test_migration_renames_and_extends():
         assert t.base_image_id is None
         d = s.exec(select(Deployment).where(Deployment.name == "legacy-vm")).first()
         assert d is not None and d.template_id == 1
-        assert d.deploy_inputs_json == "{}"
+        assert d.deploy_inputs_enc == ""
     print("test_migration_renames_and_extends OK")
 
 
@@ -265,7 +268,9 @@ def test_deploy_with_inputs():
     with session_scope() as s:
         d = s.exec(select(Deployment).where(Deployment.name == "vm-a")).first()
         assert d.template_id == tid
-        assert json.loads(d.deploy_inputs_json) == {"0.0": {"hostname": "my-host"}}
+        from app.execution_plan import open_deploy_inputs
+        assert json.loads(open_deploy_inputs(d.deploy_inputs_enc)) == {"0.0": {"hostname": "my-host"}}
+        assert "my-host" not in d.deploy_inputs_enc
 
     # ask-flagged text input left unanswered → 400 (stored default is empty)
     _expect_http(400, lambda: _deploy(templateId=tid, name="vm-b", deployInputs={}))
@@ -306,8 +311,9 @@ def test_deploy_with_inputs():
     with session_scope() as s:
         from app.models import Deployment
         from sqlmodel import select
+        from app.execution_plan import open_deploy_inputs
         d2 = s.exec(select(Deployment).where(Deployment.name == "vm-i")).first()
-        assert json.loads(d2.deploy_inputs_json) == {}, d2.deploy_inputs_json
+        assert json.loads(open_deploy_inputs(d2.deploy_inputs_enc)) == {}
     print("test_deploy_with_inputs OK")
 
 

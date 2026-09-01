@@ -165,6 +165,22 @@ def build_execution_plan(session: Session, template: Template, deployment_owner_
     })
 
 
+def encrypt_deploy_inputs(deploy_inputs_json: str) -> str:
+    """Encrypt a deployment's ask-on-deploy answers for at-rest storage. The
+    answers may hold literal credentials typed at deploy time, so they never
+    land in the database as plaintext."""
+    return encrypt(deploy_inputs_json or "{}")
+
+
+def open_deploy_inputs(ciphertext: str) -> str:
+    """Decrypt stored ask-on-deploy answers. Fails closed (raises ValueError) on
+    a rotated key / corrupt ciphertext instead of silently rebuilding without
+    the deployer's answers; an empty column is a legitimate 'no answers'."""
+    if not ciphertext:
+        return "{}"
+    return decrypt(ciphertext, strict=True) or "{}"
+
+
 def seal_execution_plan(plan: dict) -> str:
     """Validate, canonicalize, then encrypt an execution plan."""
     return encrypt(_canonical_json(_validate_plan(plan)))

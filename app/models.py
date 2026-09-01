@@ -168,8 +168,10 @@ class Deployment(SQLModel, table=True):
     image_id: Optional[int] = None        # the base image this VM was built from
     template_id: Optional[int] = None     # optional template applied on top
     # ask-on-deploy answers, {"<si>.<bi>": {"<input>": value}} — kept on the row
-    # (not just the job) so a VM rebuild re-applies them.
-    deploy_inputs_json: str = "{}"
+    # (not just the job) so a VM rebuild re-applies them. Answers can hold literal
+    # credentials, so the JSON is Fernet-encrypted at rest ('' = none); see
+    # execution_plan.encrypt_deploy_inputs / open_deploy_inputs.
+    deploy_inputs_enc: str = ""
     vmid: Optional[int] = None
     node: str = ""
     network_id: Optional[int] = None

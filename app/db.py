@@ -117,7 +117,7 @@ def _migrate() -> None:
             ("network_id", "INTEGER"),
         ],
         "deployments": [
-            ("deploy_inputs_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("deploy_inputs_enc", "TEXT NOT NULL DEFAULT ''"),
             ("root_password_enc", "TEXT NOT NULL DEFAULT ''"),
             ("cred_user", "TEXT NOT NULL DEFAULT ''"),
             ("cleanup_last_attempt_at", "TIMESTAMP"),
@@ -140,7 +140,10 @@ def _migrate() -> None:
         # so they MUST go or inserts from the new model crash on upgraded DBs.
         "images": ["audit_log_json", "node", "storage", "base_image_id",
                    "recipe_json", "disk_gb", "progress", "built_at"],
-        "deployments": ["last_action"],
+        # deploy_inputs_json → deploy_inputs_enc (2026-09): ask-on-deploy answers can
+        # hold literal credentials; they are encrypted-then-blanked below before this
+        # drop runs, so no plaintext survives even where DROP COLUMN is unsupported.
+        "deployments": ["last_action", "deploy_inputs_json"],
         "blocks": ["editable"],
         "jobs": ["total_phases"],
         # templates.golden_image_id → superseded by base_image_id + connection_id
@@ -155,6 +158,27 @@ def _migrate() -> None:
             for name, ddl in cols:
                 if name not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        # 2026-09: ask-on-deploy answers (may contain literal secrets) move from
+        # plaintext deployments.deploy_inputs_json into Fernet-encrypted
+        # deploy_inputs_enc. Encrypt, blank the plaintext, then the drops below
+        # remove the legacy column entirely (blanking first means no plaintext
+        # survives even on SQLite < 3.35 where DROP COLUMN fails).
+        dep_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(deployments)")}
+        if "deploy_inputs_json" in dep_cols and "deploy_inputs_enc" in dep_cols:
+            from .security import encrypt
+            rows = conn.exec_driver_sql(
+                "SELECT id, deploy_inputs_json FROM deployments "
+                "WHERE deploy_inputs_json IS NOT NULL AND deploy_inputs_json NOT IN ('', '{}') "
+                "AND (deploy_inputs_enc IS NULL OR deploy_inputs_enc = '')"
+            ).fetchall()
+            for dep_id, plaintext in rows:
+                conn.exec_driver_sql(
+                    "UPDATE deployments SET deploy_inputs_enc = ? WHERE id = ?",
+                    (encrypt(plaintext), dep_id),
+                )
+            if rows:
+                log.info("migrated: %d deployment answer row(s) encrypted", len(rows))
+            conn.exec_driver_sql("UPDATE deployments SET deploy_inputs_json = '{}'")
         for table, names in drops.items():
             existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
             for name in names:

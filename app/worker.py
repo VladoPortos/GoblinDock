@@ -24,6 +24,7 @@ from .db import session_scope
 from .execution_plan import (
     build_execution_plan,
     materialize_execution_plan,
+    open_deploy_inputs,
     open_execution_plan,
     seal_execution_plan,
 )
@@ -537,8 +538,13 @@ def _load_materialized_job_plan(job: Job, dep: Deployment) -> tuple[dict, list[d
                 template = s.get(Template, stored_dep.template_id)
                 if not template:
                     raise RuntimeError("missing template for legacy execution plan")
+                try:
+                    deploy_inputs_json = open_deploy_inputs(stored_dep.deploy_inputs_enc)
+                except ValueError as exc:
+                    raise RuntimeError("stored deployment answers cannot be "
+                                       "decrypted — key mismatch") from exc
                 ciphertext = seal_execution_plan(build_execution_plan(
-                    s, template, stored_dep.owner_id, stored_dep.deploy_inputs_json,
+                    s, template, stored_dep.owner_id, deploy_inputs_json,
                 ))
                 stored_job.execution_plan_enc = ciphertext
                 s.add(stored_job)

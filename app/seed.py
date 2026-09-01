@@ -5,13 +5,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from copy import deepcopy
 
 from sqlmodel import Session, select
 
 from .config import settings
 from .db import session_scope
-from .models import Block, Connection, Image, Network, Template, User
+from .models import Block, Connection, Image, Network, Secret, Template, User
 from .security import encrypt, hash_password, password_problem
 
 log = logging.getLogger("goblindock")
@@ -1417,6 +1418,80 @@ def seed_default_networks() -> None:
                               bridge=c.bridge or "vmbr0", created_by=c.created_by))
 
 
+def migrate_template_literal_secrets() -> None:
+    """2026-09: literal values typed into password/secret template inputs used to sit
+    in plaintext in templates.recipe_json (and every backup of it). Move each literal
+    into the owner's encrypted Secret store and leave a ``{{ secrets.NAME }}``
+    reference in the recipe. Idempotent: references and empty values are skipped, so
+    a migrated recipe never matches again."""
+    from .recipes import is_deployer_secret_ref, load_recipe, normalize_input_schema
+
+    with session_scope() as s:
+        templates = s.exec(select(Template)).all()
+        if not templates:
+            return
+        blocks = {b.key: b for b in s.exec(select(Block)).all()}
+        migrated = 0
+        for tpl in templates:
+            recipe = load_recipe(tpl.recipe_json)
+            changed = False
+            for si, section in enumerate(recipe):
+                if not isinstance(section, dict):
+                    continue
+                placements = section.get("blocks") or []
+                if not isinstance(placements, list):
+                    continue
+                for bi, placed in enumerate(placements):
+                    if not isinstance(placed, dict):
+                        continue
+                    block = blocks.get(placed.get("ref"))
+                    if not block:
+                        continue
+                    try:
+                        schema = normalize_input_schema(
+                            json.loads(block.input_schema_json or "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    sensitive = {
+                        field.get("name") for field in schema
+                        if isinstance(field, dict)
+                        and isinstance(field.get("name"), str)
+                        and field.get("type") in ("password", "secret")
+                    }
+                    inputs = placed.get("inputs")
+                    if not sensitive or not isinstance(inputs, dict):
+                        continue
+                    for name in sorted(sensitive):
+                        value = inputs.get(name)
+                        if (not isinstance(value, str) or not value
+                                or is_deployer_secret_ref(value)):
+                            continue
+                        scope = "user" if tpl.owner_id is not None else "global"
+                        base_name = re.sub(
+                            r"[^A-Za-z0-9_]", "_", f"TPL{tpl.id}_{name}",
+                        ).upper()
+                        secret_name = base_name
+                        counter = 2
+                        while s.exec(select(Secret).where(
+                                Secret.name == secret_name, Secret.scope == scope,
+                                Secret.owner_id == tpl.owner_id)).first():
+                            secret_name = f"{base_name}_{counter}"
+                            counter += 1
+                        s.add(Secret(
+                            name=secret_name, value_enc=encrypt(value), scope=scope,
+                            owner_id=tpl.owner_id, created_by=tpl.owner_id,
+                        ))
+                        inputs[name] = "{{ secrets." + secret_name + " }}"
+                        changed = True
+                        migrated += 1
+            if changed:
+                tpl.recipe_json = json.dumps(recipe)
+                s.add(tpl)
+        if migrated:
+            log.info("migrated: %d literal template credential(s) moved into the "
+                     "encrypted secret store", migrated)
+
+
 def run_all_seeds() -> None:
     seed_blocks()
     seed_base_image()
@@ -1424,5 +1499,6 @@ def run_all_seeds() -> None:
     maybe_seed_proxmox()
     seed_templates()          # definition only; location is assigned after networks exist
     seed_default_networks()   # after maybe_seed_proxmox so the seeded connection gets one
+    migrate_template_literal_secrets()
     with session_scope() as s:
         backfill_starter_template_location(s)

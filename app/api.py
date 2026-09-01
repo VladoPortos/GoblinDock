@@ -29,7 +29,12 @@ from sqlmodel import Session, select
 
 from .config import settings
 from .db import engine, get_session
-from .execution_plan import build_execution_plan, seal_execution_plan
+from .execution_plan import (
+    build_execution_plan,
+    encrypt_deploy_inputs,
+    open_deploy_inputs,
+    seal_execution_plan,
+)
 from .deps import current_user, require_admin, widget_key_user
 from .netutil import client_ip, current_request_ip
 from .network_pool import StaticPool, StaticPoolError, parse_static_pool
@@ -1137,7 +1142,7 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
                      image_id=base.id, template_id=tpl.id, cpu=cpu, ram=ram,
                      disk=disk, status="working", node=conn.node,
                      network_id=net.id, tags=body.tags, notes=body.notes,
-                     deploy_inputs_json=deploy_inputs_json)
+                     deploy_inputs_enc=encrypt_deploy_inputs(deploy_inputs_json))
     session.add(dep)
     session.flush()
 
@@ -1229,8 +1234,13 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     if not base or base.kind != "base":
         raise HTTPException(400, "template has no base image — edit it first")
     _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
+    try:
+        deploy_inputs_json = open_deploy_inputs(dep.deploy_inputs_enc)
+    except ValueError:
+        raise HTTPException(409, "stored deployment answers cannot be decrypted "
+                                 "— secret key mismatch or corrupt row")
     execution_plan_enc = _build_admitted_execution_plan(
-        session, tpl, dep.owner_id, dep.deploy_inputs_json,
+        session, tpl, dep.owner_id, deploy_inputs_json,
     )
     dep.status = "working"
     dep.cleanup_origin = None
@@ -2061,7 +2071,10 @@ def _validate_recipe(session: Session, recipe: list, user: User) -> None:
     _assert_trusted_ansible_blocks(session, recipe, blocks_by_key)
 
 
-def _validate_public_recipe_sensitive_inputs(session: Session, recipe: list) -> None:
+def _validate_recipe_sensitive_inputs(session: Session, recipe: list) -> None:
+    """Sensitive (password/secret) template inputs must be ask-on-deploy or a
+    deployer secret reference — for EVERY template, not just public ones: a
+    literal would sit in plaintext in templates.recipe_json (and its backups)."""
     refs = {
         placed.get("ref")
         for section in recipe if isinstance(section, dict)
@@ -2114,8 +2127,7 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
 @router.post("/templates")
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     _validate_recipe(session, body.recipe, user)
-    if body.public:
-        _validate_public_recipe_sensitive_inputs(session, body.recipe)
+    _validate_recipe_sensitive_inputs(session, body.recipe)
     bid, cid, nid = _validate_template_refs(session, body)
     # Store the authored sizes verbatim. The per-VM ceiling is enforced at deploy
     # time from the connection (0 = unlimited), so a template default is never
@@ -2155,8 +2167,7 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
     if not _template_owned(rc, user):
         raise HTTPException(403, "not yours")
     _validate_recipe(session, body.recipe, user)
-    if body.public:
-        _validate_public_recipe_sensitive_inputs(session, body.recipe)
+    _validate_recipe_sensitive_inputs(session, body.recipe)
     rc.name = body.name.strip() or rc.name
     rc.description = body.description
     rc.os_family = body.os_family

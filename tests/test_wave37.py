@@ -441,7 +441,8 @@ def test_legacy_queued_job_persists_execution_plan_once():
             name="legacy-plan-vm", owner_id=uid, template_id=template.id,
             connection_id=template.connection_id, image_id=template.base_image_id,
             network_id=template.network_id,
-            deploy_inputs_json='{"0.0":{"hostname":"legacy-host"}}',
+            deploy_inputs_enc=execution_plan.encrypt_deploy_inputs(
+                '{"0.0":{"hostname":"legacy-host"}}'),
         )
         s.add(deployment)
         s.flush()
