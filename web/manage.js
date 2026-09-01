@@ -720,10 +720,11 @@
   }
 
   function HealthRow({ ok, label, detail }) {
-    return h('div', { className: 'row', style: { gap: 9, padding: '6px 0' } },
-      h('span', { className: 'dot ' + (ok ? 'running' : 'error') }),
-      h('span', { className: 'mono', style: { fontSize: 12.5, fontWeight: 600, minWidth: 110 } }, label),
-      h('span', { className: 'hint mono', style: { fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+    // details may be long (build ids, backup names) — wrap, never truncate
+    return h('div', { className: 'row', style: { gap: 9, padding: '6px 0', alignItems: 'baseline' } },
+      h('span', { className: 'dot ' + (ok ? 'running' : 'error'), style: { flexShrink: 0 } }),
+      h('span', { className: 'mono', style: { fontSize: 12.5, fontWeight: 600, minWidth: 110, flexShrink: 0 } }, label),
+      h('span', { className: 'hint mono', style: { fontSize: 11.5, flex: 1, minWidth: 0, overflowWrap: 'anywhere' } },
         detail || (ok ? 'ok' : 'not running')));
   }
 
@@ -750,15 +751,18 @@
         h('span', { className: 'panel-title' }, 'System health'),
         h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTick((t) => t + 1) },
           h(Icon, { name: 'refresh', size: 14 }), 'Refresh')),
-      h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 14 } },
+      // two wide cards per row (one on narrow screens) — the details are long
+      // mono strings (build ids, backup names) and must never truncate
+      h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(480px, 100%), 1fr))', gap: 14 } },
         h('div', { className: 'card card-pad' },
           h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Version'),
           h('div', { className: 'mono', style: { fontSize: 24, fontWeight: 700 } }, 'v', hlt.version),
-          h('div', { className: 'copy mono', style: { fontSize: 11.5, marginTop: 3 } },
+          h('div', { className: 'copy mono', style: { fontSize: 11.5, marginTop: 3, overflowWrap: 'anywhere' } },
             hlt.build || 'local build (no CI build id)'),
-          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 14 } },
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 14 } },
             h(Stat, { k: 'Python', v: hlt.python || '—' }),
-            h(Stat, { k: 'Uptime', v: fmtUptime(hlt.uptimeSeconds) }))),
+            h(Stat, { k: 'Uptime', v: fmtUptime(hlt.uptimeSeconds) }),
+            h(Stat, { k: 'Started', v: hlt.startedAt ? new Date(hlt.startedAt).toLocaleString() : '—' }))),
         h('div', { className: 'card card-pad' },
           h('div', { className: 'panel-title', style: { marginBottom: 6 } }, 'Components'),
           h(HealthRow, { ok: true, label: 'API', detail: 'serving requests' }),
@@ -770,13 +774,17 @@
           }),
           h(HealthRow, {
             ok: !!sched.ok, label: 'Scheduler',
-            detail: sched.running ? ((sched.jobs || []).length + ' scheduled task' + ((sched.jobs || []).length === 1 ? '' : 's')) : 'not running',
+            detail: sched.running
+              ? ((sched.jobs || []).map((j) => j.id
+                  + (j.nextRun ? ' (next ' + new Date(j.nextRun).toLocaleString() + ')' : ''))
+                  .join(' · ') || 'running — no tasks registered')
+              : 'not running',
           }),
           h(HealthRow, {
             ok: !!db.ok, label: 'Database',
             detail: db.ok
-              ? (String(db.journalMode || '').toUpperCase() + ' · ' + fmtBytes(db.sizeBytes || 0)
-                 + (db.walBytes ? ' + ' + fmtBytes(db.walBytes) + ' WAL' : ''))
+              ? (String(db.journalMode || '').toUpperCase() + ' mode · db ' + fmtBytes(db.sizeBytes || 0)
+                 + (db.walBytes ? ' · wal ' + fmtBytes(db.walBytes) : ''))
               : 'unreadable',
           }),
           // enabled-with-none-yet is healthy on a fresh instance (the first
@@ -784,7 +792,11 @@
           h(HealthRow, {
             ok: true, label: 'Backups',
             detail: bk.enabled
-              ? (bk.count ? (bk.count + ' kept · latest ' + ((bk.newest || {}).name || '—')) : 'enabled — first run pending')
+              ? (bk.count
+                ? (bk.count + ' kept · latest ' + ((bk.newest || {}).name || '—')
+                   + ((bk.newest || {}).modified
+                     ? ' (' + new Date(bk.newest.modified).toLocaleString() + ')' : ''))
+                : 'enabled — first run pending')
               : 'disabled',
           })),
         h('div', { className: 'card card-pad' },
