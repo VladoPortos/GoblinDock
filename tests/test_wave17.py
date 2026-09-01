@@ -53,8 +53,8 @@ def test_new_blocks_seeded():
     for key in NEW_KEYS:
         assert key in blocks, f"{key} not seeded"
         assert blocks[key].builtin, f"{key} not marked builtin"
-    assert len([b for b in blocks.values() if b.builtin]) == 45, \
-        "expected 45 built-in blocks (b-ssh merged into the unified b-user)"
+    assert len([b for b in blocks.values() if b.builtin]) == 57, \
+        "expected 57 built-in blocks (45 post b-ssh merge + the 12 wave-52 blocks)"
 
 
 def test_phase_assignment():
