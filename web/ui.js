@@ -226,36 +226,78 @@
 
   // small dropdown menu — rendered in a portal so it is NEVER clipped by a card's
   // overflow:hidden, and positioned with fixed coords from the trigger's rect.
+  function menuItems(menu) {
+    return menu ? Array.from(menu.querySelectorAll('[role="menuitem"]:not(:disabled)')) : [];
+  }
+
+  function focusLater(node) {
+    if (!node || typeof node.focus !== 'function') return;
+    const focus = () => { if (node && typeof node.focus === 'function') node.focus(); };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(focus);
+    else setTimeout(focus, 0);
+  }
+
+  function handleMenuKey(event, menu, close) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    const enabled = menuItems(menu);
+    if (!enabled.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const active = document.activeElement;
+    const current = enabled.indexOf(active);
+    let next = 0;
+    if (event.key === 'End') next = enabled.length - 1;
+    else if (event.key === 'ArrowDown') next = current < 0 ? 0 : (current + 1) % enabled.length;
+    else if (event.key === 'ArrowUp') next = current < 0 ? enabled.length - 1 : (current - 1 + enabled.length) % enabled.length;
+    enabled[next].focus();
+  }
+
   function Menu({ items, children, align = 'right' }) {
     const [open, setOpen] = useState(false);
     const [pos, setPos] = useState(null);
-    const ref = React.useRef(null);
-    const openMenu = (e) => {
+    const triggerRef = React.useRef(null);
+    const menuRef = React.useRef(null);
+    const focusEdgeRef = React.useRef('first');
+    const menuId = React.useId();
+    const closeMenu = (restore = true) => {
+      setOpen(false);
+      if (restore) focusLater(triggerRef.current);
+    };
+    const openMenu = (e, edge = 'first') => {
       e.stopPropagation();
-      const r = ref.current.getBoundingClientRect();
+      if (open) { closeMenu(true); return; }
+      const r = triggerRef.current.getBoundingClientRect();
+      focusEdgeRef.current = edge;
       setPos({ top: Math.round(r.bottom + 6), left: Math.round(r.left), right: Math.round(window.innerWidth - r.right) });
       setOpen(true);
     };
     React.useEffect(() => {
       if (!open) return undefined;
-      const close = () => setOpen(false);
-      const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+      const enabled = menuItems(menuRef.current);
+      const initial = focusEdgeRef.current === 'last' ? enabled[enabled.length - 1] : enabled[0];
+      if (initial) initial.focus();
+      const close = () => closeMenu(true);
       window.addEventListener('scroll', close, true);
       window.addEventListener('resize', close);
-      document.addEventListener('keydown', onKey);
       return () => {
         window.removeEventListener('scroll', close, true);
         window.removeEventListener('resize', close);
-        document.removeEventListener('keydown', onKey);
       };
     }, [open]);
 
     const dropdown = open && pos && ReactDOM.createPortal(
       h(React.Fragment, null,
-        h('div', { style: { position: 'fixed', inset: 0, zIndex: 200 }, onMouseDown: (e) => { e.stopPropagation(); setOpen(false); } }),
+        h('div', { style: { position: 'fixed', inset: 0, zIndex: 200 }, onMouseDown: (e) => { e.stopPropagation(); closeMenu(true); } }),
         h('div', {
-          role: 'menu',
+          id: menuId, ref: menuRef, role: 'menu',
           onMouseDown: (e) => e.stopPropagation(),
+          onKeyDown: (event) => handleMenuKey(event, menuRef.current, () => closeMenu(true)),
           style: {
             position: 'fixed', top: pos.top, zIndex: 201,
             ...(align === 'right' ? { right: pos.right } : { left: pos.left }),
@@ -278,7 +320,7 @@
               type: 'button', role: 'menuitem',
               disabled: !!it.disabled,
               title: it.title || null,
-              onClick: (e) => { e.stopPropagation(); if (it.disabled) return; setOpen(false); it.onClick && it.onClick(); },
+              onClick: (e) => { e.stopPropagation(); if (it.disabled) return; closeMenu(true); it.onClick && it.onClick(); },
               style: {
                 display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left',
                 padding: '8px 9px', borderRadius: 7, border: 'none', cursor: 'pointer',
@@ -291,8 +333,26 @@
         )),
       ), document.body);
 
-    return h('div', { ref, style: { display: 'inline-flex' }, onClick: openMenu },
-      children, dropdown);
+    const childProps = (children && children.props) || {};
+    const trigger = React.cloneElement(children, {
+      ref: triggerRef,
+      'aria-haspopup': 'menu',
+      'aria-expanded': open,
+      'aria-controls': open ? menuId : undefined,
+      onClick: (event) => {
+        if (childProps.onClick) childProps.onClick(event);
+        if (!event.defaultPrevented) openMenu(event, 'first');
+      },
+      onKeyDown: (event) => {
+        if (childProps.onKeyDown) childProps.onKeyDown(event);
+        if (event.defaultPrevented) return;
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          event.preventDefault();
+          openMenu(event, event.key === 'ArrowUp' ? 'last' : 'first');
+        }
+      },
+    });
+    return h('div', { style: { display: 'inline-flex' } }, trigger, dropdown);
   }
 
   // ---- ask-on-deploy helpers (shared by the Deploy modal and anything that prompts for template inputs) ----

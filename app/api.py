@@ -807,7 +807,10 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
             schema = json.loads(blk.input_schema_json or "[]") if blk else []
         except (json.JSONDecodeError, TypeError):
             schema = []
-        ftypes = {f.get("name"): f.get("type", "text") for f in schema if isinstance(f, dict)}
+        fields = {
+            f.get("name"): f for f in schema
+            if isinstance(f, dict) and isinstance(f.get("name"), str)
+        }
         answers = supplied.get(addr) or {}
         if not isinstance(answers, dict):
             raise HTTPException(400, f"deployInputs: {addr!r} must be an object")
@@ -816,9 +819,10 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                 raise HTTPException(400, f"deployInputs: {name!r} is not ask-on-deploy")
         out = {}
         for name in names:
-            if name not in ftypes:
+            if name not in fields:
                 continue  # ask references an input the block no longer has — ignore
-            ftype = ftypes.get(name, "text")
+            field = fields[name]
+            ftype = field.get("type", "text")
             if name in answers:
                 v = answers[name]
                 if ftype in ("bool", "boolean", "toggle") and not isinstance(v, bool):
@@ -827,6 +831,15 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                     raise HTTPException(400, f"deployInputs: {name!r} must be a list")
                 if ftype not in ("bool", "boolean", "toggle", "tags", "list") and not isinstance(v, str):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a string")
+                if ftype == "select":
+                    options = field.get("options")
+                    if (not isinstance(options, list)
+                            or any(not isinstance(option, str) for option in options)
+                            or v not in options):
+                        raise HTTPException(
+                            400,
+                            f"deployInputs: {name!r} must be one of its configured options",
+                        )
                 # Reject control chars / newlines in non-code answers: a multi-line scalar
                 # could inject sibling keys into the rendered module-arg dict. 'code' (Run
                 # Script) is intentionally free-form shell on the deployer's own VM.

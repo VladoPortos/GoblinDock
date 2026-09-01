@@ -96,7 +96,7 @@ def _public_custom_template_fixture():
                     "api_token": secret_sentinel,
                     "mode": "safe",
                 },
-                "ask": ["hostname", "api_token"],
+                "ask": ["hostname", "api_token", "mode"],
             }]}]),
             base_image_id=image.id, connection_id=connection.id,
         )
@@ -130,6 +130,7 @@ def test_non_owner_gets_only_sanitized_ask_descriptors_and_can_deploy():
     assert placed["askSchema"] == [
         {"name": "hostname", "type": "text", "label": "Host name"},
         {"name": "api_token", "type": "secret", "label": "API token"},
+        {"name": "mode", "type": "select", "label": "Mode", "options": ["safe", "fast"]},
     ]
     serialized = json.dumps(payload)
     assert fixture["script_sentinel"] not in serialized
@@ -149,6 +150,17 @@ def test_non_owner_gets_only_sanitized_ask_descriptors_and_can_deploy():
         job = session.get(Job, result["jobId"])
         assert job and job.created_by == viewer.id and job.status == "queued"
 
+    with session_scope() as session:
+        template = session.get(Template, fixture["template"])
+        invalid = _expect_http(400, lambda: api._validate_deploy_inputs(
+            session, template, {"0.0": {"mode": "unsafe"}},
+        ))
+        assert "configured options" in invalid.detail
+        accepted = json.loads(api._validate_deploy_inputs(
+            session, template, {"0.0": {"mode": "fast"}},
+        ))
+        assert accepted == {"0.0": {"mode": "fast"}}
+
 
 def test_state_hides_custom_block_but_keeps_its_public_prompt_contract():
     fixture = _public_custom_template_fixture()
@@ -165,7 +177,7 @@ def test_state_hides_custom_block_but_keeps_its_public_prompt_contract():
     template = next(row for row in state["TEMPLATES"]
                     if row["templateId"] == fixture["template"])
     assert [field["name"] for field in template["recipe"][0]["blocks"][0]["askSchema"]] == [
-        "hostname", "api_token",
+        "hostname", "api_token", "mode",
     ]
 
 

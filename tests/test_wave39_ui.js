@@ -27,6 +27,13 @@ const React = {
       children: children.flat(Infinity).filter((child) => child != null && child !== false),
     };
   },
+  cloneElement(element, props, ...children) {
+    return {
+      ...element,
+      props: { ...(element.props || {}), ...(props || {}) },
+      children: children.length ? children.flat(Infinity) : (element.children || []),
+    };
+  },
   useState() {},
   useId() { return `:wave39-${nextId++}:`; },
   useRef(initial) { return { current: initial }; },
@@ -1513,6 +1520,7 @@ function statefulReact(seed = []) {
     state,
     begin() { cursor = 0; },
     createElement: React.createElement,
+    cloneElement: React.cloneElement,
     Fragment: 'fragment',
     useState(initial) {
       const index = cursor++;
@@ -1747,6 +1755,11 @@ async function testWave46Contracts() {
   const activityTree46 = shellWindow.Shell.ActivityDrawer({
     onClose() {}, go(route, nav) { shellGo.push({ route, nav }); },
   });
+  const activityDialog46 = findAll(activityTree46, (node) => node.props.className === 'drawer')[0];
+  assert.equal(activityDialog46.props.role, 'dialog');
+  assert.equal(activityDialog46.props['aria-modal'], true);
+  assert.ok(activityDialog46.props['aria-labelledby']);
+  assert.equal(typeof activityDialog46.props.onKeyDown, 'function');
   const activityCard46 = findAll(activityTree46, (node) => String(node.props.className || '').includes('card')
     && textOf(node).includes('Keyboard activity'))[0];
   assert.equal(activityCard46.props.role, 'link');
@@ -1790,26 +1803,122 @@ async function testWave46Contracts() {
   });
   assert.deepEqual(historyCalls, [460], 'Enter must expand a history row');
 
+  const activityEffects = [];
+  const activityFocusReact = statefulReact();
+  activityFocusReact.useEffect = (effect) => { activityEffects.push(effect); };
+  const openerDom = { focused: 0, focus() { this.focused++; } };
+  const activityDocument = { activeElement: openerDom };
+  let drawerCloseCount = 0;
+  const activityFocusWindow = {
+    React: activityFocusReact, Icon: wave46Icon,
+    GD: { JOBS: [], VMS: [] },
+    GDStore: { refresh() { return Promise.resolve(); }, toast() {} }, API: {},
+    UI: { Menu: NavigationMenu, jobPresentation() {} },
+  };
+  vm.runInNewContext(shellSource, {
+    React: activityFocusReact, window: activityFocusWindow, document: activityDocument,
+  }, { filename: 'web/shell.js' });
+  activityFocusReact.begin();
+  const focusDrawerTree = activityFocusWindow.Shell.ActivityDrawer({
+    onClose() { drawerCloseCount++; }, go() {},
+  });
+  const focusDrawer = findAll(focusDrawerTree, (node) => node.props.className === 'drawer')[0];
+  const focusClose = findAll(focusDrawer, (node) => node.type === 'button'
+    && node.props['aria-label'] === 'Close activity')[0];
+  const firstFocusable = { focused: 0, focus() { this.focused++; activityDocument.activeElement = this; } };
+  const lastFocusable = { focused: 0, focus() { this.focused++; activityDocument.activeElement = this; } };
+  const drawerDom = {
+    querySelectorAll() { return [firstFocusable, lastFocusable]; },
+  };
+  focusDrawer.props.ref.current = drawerDom;
+  focusClose.props.ref.current = firstFocusable;
+  assert.equal(activityEffects.length, 1, 'the activity dialog needs one focus lifecycle effect');
+  const cleanupActivityFocus = activityEffects[0]();
+  assert.equal(firstFocusable.focused, 1, 'opening activity must focus its close control');
+  activityDocument.activeElement = lastFocusable;
+  let trappedForward = false;
+  focusDrawer.props.onKeyDown({
+    key: 'Tab', shiftKey: false,
+    preventDefault() { trappedForward = true; }, stopPropagation() {},
+  });
+  assert.equal(trappedForward, true);
+  assert.equal(activityDocument.activeElement, firstFocusable, 'Tab from the end must wrap to the start');
+  activityDocument.activeElement = firstFocusable;
+  let trappedBack = false;
+  focusDrawer.props.onKeyDown({
+    key: 'Tab', shiftKey: true,
+    preventDefault() { trappedBack = true; }, stopPropagation() {},
+  });
+  assert.equal(trappedBack, true);
+  assert.equal(activityDocument.activeElement, lastFocusable, 'Shift+Tab from the start must wrap to the end');
+  focusDrawer.props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} });
+  assert.equal(drawerCloseCount, 1, 'Escape must close activity');
+  cleanupActivityFocus();
+  assert.equal(openerDom.focused, 1, 'closing activity must restore focus to its opener');
+
+  const menuEffects = [];
+  const menuRefs = [];
   const menuReact = statefulReact([true, { top: 10, left: 10, right: 10 }]);
-  menuReact.useRef = () => ({ current: { getBoundingClientRect() { return { top: 0, bottom: 0, left: 0, right: 0 }; } } });
-  const menuWindow = { React: menuReact, Icon: wave46Icon, UI: {} };
+  menuReact.useRef = (initial) => {
+    const ref = { current: initial };
+    menuRefs.push(ref);
+    return ref;
+  };
+  menuReact.useEffect = (effect) => { menuEffects.push(effect); };
+  const menuDocument = { body: {}, activeElement: null, addEventListener() {}, removeEventListener() {} };
+  const menuWindow = {
+    React: menuReact, Icon: wave46Icon, UI: {}, innerWidth: 1200,
+    addEventListener() {}, removeEventListener() {},
+  };
   vm.runInNewContext(uiSource, {
     React: menuReact,
     ReactDOM: { createPortal(node) { return node; } },
     window: menuWindow,
     navigator: {},
-    document: { body: {}, addEventListener() {}, removeEventListener() {} },
+    document: menuDocument,
+    requestAnimationFrame(callback) { callback(); },
   }, { filename: 'web/ui.js' });
   menuReact.begin();
   const menuTree = menuWindow.UI.Menu({
-    items: [{ label: 'Profile', onClick() {} }, { label: 'Sign out', onClick() {} }],
+    items: [
+      { label: 'Unavailable', disabled: true, onClick() {} },
+      { label: 'Profile', onClick() {} },
+      { label: 'Sign out', onClick() {} },
+    ],
     children: menuReact.createElement('button', { type: 'button' }, 'Account'),
   });
+  const renderedTrigger = findAll(menuTree, (node) => node.type === 'button'
+    && textOf(node) === 'Account')[0];
+  assert.equal(renderedTrigger.props['aria-haspopup'], 'menu');
+  assert.equal(renderedTrigger.props['aria-expanded'], true);
   const popupMenu = findAll(menuTree, (node) => node.props.role === 'menu')[0];
   assert.ok(popupMenu, 'the dropdown needs menu semantics');
   const menuItems = findAll(popupMenu, (node) => node.type === 'button');
-  assert.equal(menuItems.length, 2);
+  assert.equal(menuItems.length, 3);
   assert.ok(menuItems.every((item) => item.props.role === 'menuitem'));
+  assert.equal(typeof popupMenu.props.onKeyDown, 'function');
+  const triggerDom = { focused: 0, focus() { this.focused++; menuDocument.activeElement = this; } };
+  const firstMenuItem = { focused: 0, focus() { this.focused++; menuDocument.activeElement = this; } };
+  const lastMenuItem = { focused: 0, focus() { this.focused++; menuDocument.activeElement = this; } };
+  const menuDom = { querySelectorAll() { return [firstMenuItem, lastMenuItem]; } };
+  renderedTrigger.props.ref.current = triggerDom;
+  popupMenu.props.ref.current = menuDom;
+  assert.equal(menuEffects.length, 1, 'an open menu needs one focus/close effect');
+  const cleanupMenu = menuEffects[0]();
+  assert.equal(firstMenuItem.focused, 1, 'opening a menu must focus its first enabled item');
+  menuDocument.activeElement = firstMenuItem;
+  popupMenu.props.onKeyDown({ key: 'ArrowDown', preventDefault() {}, stopPropagation() {} });
+  assert.equal(menuDocument.activeElement, lastMenuItem);
+  popupMenu.props.onKeyDown({ key: 'Home', preventDefault() {}, stopPropagation() {} });
+  assert.equal(menuDocument.activeElement, firstMenuItem);
+  popupMenu.props.onKeyDown({ key: 'End', preventDefault() {}, stopPropagation() {} });
+  assert.equal(menuDocument.activeElement, lastMenuItem);
+  popupMenu.props.onKeyDown({ key: 'ArrowUp', preventDefault() {}, stopPropagation() {} });
+  assert.equal(menuDocument.activeElement, firstMenuItem);
+  popupMenu.props.onKeyDown({ key: 'Escape', preventDefault() {}, stopPropagation() {} });
+  assert.equal(menuReact.state[0], false);
+  assert.equal(triggerDom.focused, 1, 'Escape must restore focus to the menu trigger');
+  cleanupMenu();
 
   for (const selector of ['.vm-nav-surface:focus-visible', '.activity-nav-surface:focus-visible', '.history-toggle:focus-visible']) {
     assert.match(cssRule(selector), /outline\s*:/, `${selector} needs a visible keyboard focus indicator`);

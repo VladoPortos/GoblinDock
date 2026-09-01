@@ -38,6 +38,33 @@
     open();
   }
 
+  function activityFocusable(drawer) {
+    return drawer ? Array.from(drawer.querySelectorAll(
+      'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )) : [];
+  }
+
+  function activityDialogKeydown(event, drawer, close) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = activityFocusable(drawer);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
   function Sidebar({ route, go, collapsed, setCollapsed, mobileOpen = false }) {
     const presentationCollapsed = collapsed && !mobileOpen;
     return h('aside', {
@@ -117,7 +144,8 @@
           const jobs = GD.JOBS || [];
           const total = jobs.length;
           const anyRunning = jobs.some(j => j.status === 'working');
-          return h('button', { className: 'icon-btn', onClick: openDrawer, title: 'Activity', style: { position: 'relative' } },
+          return h('button', { className: 'icon-btn', onClick: openDrawer, title: 'Activity',
+            'aria-label': 'Activity', 'aria-haspopup': 'dialog', style: { position: 'relative' } },
             h(Icon, { name: 'bell', size: 17 }),
             total > 0 && h('span', {
               style: { position: 'absolute', top: 1, right: 1, minWidth: 15, height: 15, padding: '0 3px',
@@ -144,6 +172,18 @@
   function ActivityDrawer({ onClose, go }) {
     const jobs = GD.JOBS || [];
     const finished = jobs.filter(j => j.status !== 'working').length;
+    const drawerRef = React.useRef(null);
+    const closeRef = React.useRef(null);
+    const openerRef = React.useRef(typeof document !== 'undefined' ? document.activeElement : null);
+    const onCloseRef = React.useRef(onClose);
+    onCloseRef.current = onClose;
+    React.useEffect(() => {
+      if (closeRef.current && typeof closeRef.current.focus === 'function') closeRef.current.focus();
+      const opener = openerRef.current;
+      return () => {
+        if (opener && typeof opener.focus === 'function') opener.focus();
+      };
+    }, []);
     const dismiss = async (e, j) => {
       e.stopPropagation();
       try { await window.API.deleteJob(j.jobId); window.GDStore.refresh().catch(() => {}); }
@@ -157,15 +197,21 @@
       // overlay must sit BELOW the drawer (z 55) so the drawer stays clickable;
       // it only catches clicks OUTSIDE the drawer to close it.
       h('div', { className: 'overlay', style: { background: 'transparent', backdropFilter: 'none', zIndex: 54 }, onClick: onClose }),
-      h('div', { className: 'drawer' },
+      h('div', {
+        ref: drawerRef, className: 'drawer', role: 'dialog', 'aria-modal': true,
+        'aria-labelledby': 'activity-drawer-title',
+        onKeyDown: (event) => activityDialogKeydown(
+          event, drawerRef.current, () => onCloseRef.current(),
+        ),
+      },
         h('div', { className: 'drawer-head' },
           h(Icon, { name: 'activity', size: 17 }),
-          h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, 'Activity'),
+          h('span', { id: 'activity-drawer-title', className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, 'Activity'),
           h('span', { className: 'badge accent', style: { marginLeft: 4 } }, jobs.filter(j => j.status === 'working').length, ' running'),
           h('div', { style: { marginLeft: 'auto', display: 'flex', gap: 4 } },
             finished > 0 && h('button', { className: 'btn ghost sm', onClick: clearAll, title: 'Clear finished' },
               h(Icon, { name: 'trash', size: 14 }), 'Clear'),
-            h('button', { className: 'icon-btn', onClick: onClose, 'aria-label': 'Close' },
+            h('button', { ref: closeRef, type: 'button', className: 'icon-btn', onClick: onClose, 'aria-label': 'Close activity' },
               h(Icon, { name: 'x', size: 16 })))
         ),
         h('div', { style: { padding: 12, overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 8 } },
@@ -200,5 +246,5 @@
     );
   }
 
-  window.Shell = { Sidebar, SidebarScrim, TopBar, ActivityDrawer, mobileNavKeydown };
+  window.Shell = { Sidebar, SidebarScrim, TopBar, ActivityDrawer, mobileNavKeydown, activityDialogKeydown };
 })();
