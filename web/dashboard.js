@@ -441,10 +441,14 @@
               go('job', { jobId: r.jobId });
             } else if (confirm.action === 'cleanupLocal') {
               const r = await window.API.vmCleanupLocal(confirm.vm.depId);
+              // drop the row NOW — the next /state fetch can be seconds away when
+              // the VM's Proxmox is unreachable, and an in-flight stale response
+              // must not resurrect it (removeVm tombstones + fresh refetch)
+              window.GDStore.removeVm(confirm.vm.depId);
               window.GDStore.toast(r.verified
                 ? confirm.vm.name + ' removed (VM confirmed absent in Proxmox)'
                 : confirm.vm.name + ' removed — upstream could not be verified', r.verified ? 'ok' : 'warn');
-              window.GDStore.refresh().catch(() => {});
+              window.GDStore.refresh({ fresh: true }).catch(() => {});
             } else {
               const r = await window.API.vmDestroy(confirm.vm.depId);
               window.GDStore.toast('Destroying ' + confirm.vm.name, 'warn');

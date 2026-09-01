@@ -392,10 +392,13 @@
     const cleanupLocal = async () => {
       try {
         const r = await window.API.vmCleanupLocal(depId);
+        // drop the row before landing on the dashboard — a stale in-flight
+        // /state response must not show the just-removed VM there
+        window.GDStore.removeVm(depId);
         window.GDStore.toast(r.verified
           ? 'Local record removed (VM confirmed absent in Proxmox)'
           : 'Local record removed — upstream could not be verified', r.verified ? 'ok' : 'warn');
-        window.GDStore.refresh().catch(() => {});
+        window.GDStore.refresh({ fresh: true }).catch(() => {});
         go('dashboard');
       } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
     };
