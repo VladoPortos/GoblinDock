@@ -1,109 +1,73 @@
-# Outstanding audit findings
+# Audit findings — remediation record
 
-These findings were confirmed during the 2026-08-31 end-to-end review but were
-intentionally left for a later remediation pass. They are not release claims or
-theoretical hardening ideas; each has a reachable application path.
+The 2026-08-31 end-to-end review left seven confirmed findings for a later
+remediation pass. All seven are now fixed on this branch; each entry names the
+enforcement point and the regression wave that pins the behaviour.
 
-## Important — public custom templates can reference a deployer's secrets
+## Fixed — public custom templates can reference a deployer's secrets
 
-Cross-owner public templates may execute author-controlled custom block code while
-secret references are resolved in the deployer's scope (`app/api.py`, `app/worker.py`,
-`app/recipes.py`). A malicious public template can embed a secret reference directly
-in its hidden block source and send the resolved value elsewhere when another user
-deploys it.
+Cross-owner admission now fails closed on any `{{ secrets.* }}` /
+`{{ variable.* }}` reference in author-controlled text: block source templates,
+non-sensitive schema defaults, and non-sensitive stored inputs
+(`reject_cross_owner_hidden_references` in `app/recipes.py`, enforced at the
+execution-plan chokepoint in `app/api.py`, covering deploy and rebuild). The
+two legitimate carriers are untouched: a sensitive stored input holding exactly
+one full deployer secret reference, and the deployer's own deploy-time answers.
+Regression: `tests/test_wave48.py`.
 
-Recommended fix: reject hidden secret references in cross-owner block source and
-non-sensitive inputs, or require an explicit admin-reviewed/trusted publishing model
-before custom code may execute for another user.
+## Fixed — literal sensitive inputs remain in plaintext database fields
 
-## Important — literal sensitive inputs remain in plaintext database fields
+Sensitive (password/secret) template inputs must now be ask-on-deploy or a
+deployer secret reference for every template, not just public ones; startup
+migrates legacy literals into the owner's encrypted Secret store and rewrites
+the recipe to reference them (`migrate_template_literal_secrets` in
+`app/seed.py`). Ask-on-deploy answers moved to the Fernet-encrypted
+`deployments.deploy_inputs_enc` column; the upgrade migration encrypts existing
+rows, blanks the plaintext, then drops the legacy column (`app/db.py`). Rebuild
+and the worker's legacy-plan path decrypt fail-closed. Regression:
+`tests/test_wave49.py`.
 
-Literal password/secret template values can remain in `Template.recipe_json`, and
-ask-on-deploy answers are stored in `Deployment.deploy_inputs_json` (`app/models.py`,
-`app/api.py`, `app/serialize.py`). They therefore appear in the SQLite database and
-its backups even though the execution-plan snapshot is encrypted.
+## Fixed — select answers are not checked against configured options
 
-Recommended fix: require template credentials to use Secret references, migrate
-legacy literals into encrypted Secret records, and store rebuild-required deployment
-answers in an encrypted column with an upgrade migration that clears plaintext rows.
+`_validate_deploy_inputs` retains the full field schema and rejects a select
+answer that is not exactly one of the block's normalized `options`
+(`app/api.py`). Regression: `tests/test_wave46.py`.
 
-## Important — select answers are not checked against configured options
+## Fixed — account menu focus does not enter the open menu
 
-`app/api.py` verifies that an ask-on-deploy select answer is a string but does not
-require it to be one of the block schema's options. A crafted API request can persist
-and execute an option the template author never configured.
+`UI.Menu` exposes `aria-haspopup`/`aria-expanded`/`aria-controls` on its
+trigger, focuses the first enabled item on open, supports
+ArrowUp/ArrowDown/Home/End/Escape, and restores trigger focus on close
+(`web/ui.js`). Regression: `tests/test_wave39_ui.js`.
 
-Recommended fix: retain the complete field schema during deploy-input validation and
-reject select values not exactly present in its normalized `options` list.
+## Fixed — activity drawer lacks modal focus management
 
-## Important — account menu focus does not enter the open menu
+The activity drawer is a real `role="dialog"` with `aria-modal`, labelled
+title, initial focus on its close control, a Tab/Shift+Tab focus trap, Escape
+dismissal, and opener focus restoration (`web/shell.js`). Regression:
+`tests/test_wave39_ui.js`.
 
-The portalled menu in `web/ui.js` leaves keyboard focus on its trigger. Tab order can
-traverse unrelated page controls before reaching the newly opened menu.
+## Fixed — unavailable Proxmox connections need an explicit disabled state
 
-Recommended fix: expose `aria-haspopup`/`aria-expanded`, focus the first enabled item,
-support ArrowUp/ArrowDown/Home/End/Escape, and restore trigger focus on close.
+Connections carry a persisted `disabled` flag (Settings toggle, audited as
+`connection.enable`/`connection.disable`), distinct from enabled-but-
+unreachable. Disabling keeps the connection config and all VM records; its VMs
+leave normal inventory and dashboards, nothing polls it (/state probes,
+capacity, cached-image listings, worker reconciliation), and it is refused as
+a target for deploys, rebuilds, destroys, power actions, consoles, snapshots,
+image syncs, and template locations. A job still queued when its source is
+disabled fails with a clear message instead of contacting it. Re-enabling
+reconciles the previously known VMs without deleting or duplicating them.
+Regression: `tests/test_wave50.py`.
 
-## Important — activity drawer lacks modal focus management
+## Fixed — missing upstream VMs need a local-only cleanup path
 
-The activity overlay in `web/shell.js` does not move or trap focus, close on Escape,
-advertise dialog semantics, or restore focus to its opener. Keyboard users can move
-through background controls while the drawer is open.
-
-Recommended fix: implement dialog focus entry/trapping, Escape dismissal, and opener
-focus restoration with regression coverage.
-
-## Important — unavailable Proxmox connections need an explicit disabled state
-
-An administrator may intentionally stop using a Proxmox source because it is
-offline, under maintenance, retired, or otherwise unavailable. Connection settings
-currently need a persistent enabled/disabled control so this situation is not
-treated as an endless connection failure.
-
-When a Proxmox connection is disabled:
-
-- Keep its connection configuration and known VM records so it can be re-enabled
-  without reconfiguration or data loss.
-- Hide all VMs associated with that connection from normal VM inventory and
-  dashboard views.
-- Stop background inventory polling and other automatic operations against that
-  connection.
-- Do not offer the disabled connection or its nodes as targets for new operations.
-- Make the disabled state visible in Settings, with a clear way to enable the
-  connection again and refresh its inventory.
-
-The disabled state must be distinct from a connection that is enabled but
-temporarily unreachable. Re-enabling should not silently delete or duplicate its
-previously known VMs; the first successful refresh should reconcile them.
-
-Recommended fix: add a persisted enabled flag to Proxmox connections, enforce it in
-polling and operation scheduling, and exclude associated VM records from normal
-inventory responses while preserving them in the database.
-
-## Important — missing upstream VMs need a local-only cleanup path
-
-A VM may be deleted directly in Proxmox while GoblinDock still has a database record
-for it. GoblinDock then shows the stale VM as offline. Using the normal Delete action
-launches a Proxmox deletion for a VM that no longer exists, which fails and leaves
-the stale local record in place.
-
-The VM actions need an explicit **Clean up** or **Delete locally only** option with
-these semantics:
-
-- Never send a delete request to Proxmox; remove only GoblinDock's local VM record
-  and the local relationships that prevent that record from disappearing.
-- Keep the existing normal Delete action for VMs that still exist: delete upstream
-  first and remove the local record only after upstream deletion succeeds.
-- Clearly warn that local-only deletion does not delete a real VM from Proxmox.
-- If Proxmox is reachable and confirms the VM is missing, present cleanup as the
-  natural recovery action.
-- If the Proxmox source is disabled or unreachable, still permit local-only cleanup
-  when explicitly confirmed, but explain that GoblinDock cannot verify whether the
-  VM still exists upstream.
-- Record the local cleanup in activity/audit history so an administrator can tell it
-  apart from a successful Proxmox deletion.
-
-Recommended fix: add a dedicated local-only deletion endpoint and guarded UI action
-rather than overloading normal deletion or treating every Proxmox error as proof that
-the VM is gone. Add coverage for a confirmed upstream 404/not-found response, an
-unreachable source, a disabled source, and a VM that still exists upstream.
+`POST /deployments/{id}/cleanup_local` (UI: "Clean up (local only)" on the
+dashboard row menu and VM detail page, behind an explicit warning dialog)
+removes only GoblinDock's record and its IP reservation — it never sends a
+delete to Proxmox. When the source is reachable it first runs a read-only
+inventory probe and refuses if the VM still exists (the normal Delete stays
+upstream-first); on a disabled or unreachable source the cleanup proceeds when
+confirmed, flagged as unverified. Every cleanup writes a `vm.cleanup_local`
+audit entry an operator can tell apart from a completed upstream destroy.
+Regression: `tests/test_wave50.py`.
