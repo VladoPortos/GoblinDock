@@ -269,6 +269,74 @@
       h('span', { className: (mono ? 'mono ' : '') + (copy ? 'copy' : ''), style: { fontSize: 12.5, fontWeight: 600, textAlign: 'right', wordBreak: 'break-all' } }, v || '—'));
   }
 
+  // Day-2 CPU/RAM resize — mirrors Proxmox: applies only to a STOPPED VM, so the
+  // submit is gated (not just refused server-side) while the VM runs.
+  function ResizeConfigModal({ depId, d, onClose, onDone }) {
+    const cfg = d.config || {};
+    const [cores, setCores] = useState(String(cfg.cores || d.reqCpu || 1));
+    const [ram, setRam] = useState(String(
+      cfg.memoryMb ? Math.max(1, Math.round(cfg.memoryMb / 1024)) : (d.reqRam || 1)));
+    const [busy, setBusy] = useState(false);
+    const running = !!(d.live && d.live.status === 'running');
+    const submit = async () => {
+      const c = parseInt(cores, 10);
+      const r = parseInt(ram, 10);
+      if (!Number.isFinite(c) || c < 1 || !Number.isFinite(r) || r < 1) {
+        toast('Enter whole numbers ≥ 1', 'err');
+        return;
+      }
+      setBusy(true);
+      try {
+        await window.API.vmResize(depId, { cores: c, ramGb: r });
+        toast('Resized — ' + c + ' vCPU · ' + r + ' GB take effect on next start', 'ok');
+        onDone();
+      } catch (e) { toast(e.message || 'failed', 'err'); }
+      setBusy(false);
+    };
+    return h(FormModal, {
+      title: 'Resize ' + d.name, icon: 'sliders', onClose, onSubmit: submit,
+      busy: busy || running, submitLabel: running ? 'VM must be stopped' : 'Apply',
+    },
+      running && h('div', {
+        className: 'mono', role: 'alert',
+        style: { padding: '9px 11px', borderRadius: 8, fontSize: 12,
+          color: 'var(--warn, var(--err))', background: 'var(--err-ghost)' },
+      }, 'The VM is running — stop it first. Like in Proxmox, CPU/memory changes apply to a stopped VM.'),
+      h(Field, { label: 'vCPU (cores)', type: 'number', mono: true, value: cores, onChange: setCores }),
+      h(Field, { label: 'Memory (GB)', type: 'number', mono: true, value: ram, onChange: setRam,
+        hint: 'Applied straight to the Proxmox config — no job, no rebuild, disk untouched.' }));
+  }
+
+  // Day-2 disk grow — online-safe in Proxmox, grow-only. The guest's
+  // partition/filesystem is deliberately NOT touched.
+  function DiskGrowModal({ depId, disk, onClose, onDone }) {
+    const current = disk.sizeGb != null ? disk.sizeGb : null;
+    const [size, setSize] = useState(String(current != null ? current + 1 : ''));
+    const [busy, setBusy] = useState(false);
+    const submit = async () => {
+      const target = parseInt(size, 10);
+      if (!Number.isFinite(target) || (current != null && target <= current)) {
+        toast('Grow only — enter a size above ' + (current != null ? current + ' G' : 'the current size'), 'err');
+        return;
+      }
+      setBusy(true);
+      try {
+        await window.API.vmDiskResize(depId, disk.key, { sizeGb: target });
+        toast(disk.key + ' grown to ' + target + ' G — grow the partition/filesystem inside the OS yourself', 'ok');
+        onDone();
+      } catch (e) { toast(e.message || 'failed', 'err'); }
+      setBusy(false);
+    };
+    return h(FormModal, {
+      title: 'Grow ' + disk.key, icon: 'disk', onClose, onSubmit: submit,
+      busy, submitLabel: 'Grow disk',
+    },
+      h(Field, { label: 'New size (GB)' + (current != null ? ' · currently ' + current + ' G' : ''),
+        type: 'number', mono: true, value: size, onChange: setSize,
+        hint: 'Grow only — Proxmox cannot shrink a disk. Works while the VM runs; '
+          + 'the partition/filesystem inside the OS is not resized by GoblinDock.' }));
+  }
+
   function Card(title, children, extra) {
     return h('div', { className: 'card card-pad', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
       h('div', { className: 'row', style: { marginBottom: 4 } }, h('span', { className: 'panel-title' }, title), extra), children);
@@ -282,6 +350,7 @@
     const [conMode, setConMode] = useState('vnc');
     const [tall, setTall] = useState(false);
     const [confirm, setConfirm] = useState(false);
+    const [resize, setResize] = useState(null);   // 'config' | { disk row } | null
     const [busy, setBusy] = useState('');
     const [cred, setCred] = useState(null);
     const revealCred = async () => {
@@ -433,7 +502,28 @@
             h(Row, { k: 'OS type', v: cfg.ostype, mono: true }),
             h(Row, { k: 'Network', v: (cfg.net0 || '—').split(',')[0], mono: true }),
             h(Row, { k: 'Guest agent', v: live.agentRunning ? 'running' : (cfg.agent ? 'enabled' : 'off'), mono: true }),
-            h(Row, { k: 'Serial console', v: cfg.serial0 ? 'enabled' : 'not set', mono: true }))),
+            h(Row, { k: 'Serial console', v: cfg.serial0 ? 'enabled' : 'not set', mono: true })),
+            !locked && d.vmid && h('button', {
+              className: 'btn ghost sm', style: { marginLeft: 'auto' },
+              title: 'Change vCPU / RAM (VM must be stopped — like in Proxmox)',
+              onClick: () => setResize('config'),
+            }, h(Icon, { name: 'sliders', size: 14 }), 'Resize')),
+          (d.disks || []).length > 0 && Card('Disks', h('div', null,
+            d.disks.map((disk) => h('div', {
+              key: disk.key, className: 'row',
+              style: { gap: 10, padding: '5px 0', alignItems: 'center' },
+            },
+              h('span', { className: 'mono', style: { fontSize: 12.5, fontWeight: 600, minWidth: 56 } }, disk.key),
+              h('span', { className: 'hint mono', style: { fontSize: 11.5 } }, disk.storage),
+              h('span', { className: 'mono', style: { fontSize: 12.5, marginLeft: 'auto' } },
+                disk.sizeGb != null ? disk.sizeGb + ' G' : '—'),
+              !locked && h('button', {
+                className: 'btn ghost sm',
+                title: 'Grow this disk (online-safe; Proxmox cannot shrink)',
+                onClick: () => setResize({ disk }),
+              }, h(Icon, { name: 'plus', size: 13 }), 'Grow'))),
+            h('p', { className: 'hint', style: { fontSize: 11, marginTop: 6 } },
+              'Grow only. GoblinDock resizes the Proxmox disk — growing the partition/filesystem inside the OS is up to you.'))),
           d.hasRootPassword && Card('Access', h('div', null,
             h(Row, { k: 'Console user', v: d.credUser || 'root', mono: true }),
             h('div', { className: 'row', style: { justifyContent: 'space-between', gap: 12, padding: '5px 0' } },
@@ -464,6 +554,15 @@
           h(Snapshots, { depId, running, locked }),
           Card('Deployment log', h(DeployLog, { jobId: d.jobId }),
             d.jobId && h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => go('job', { jobId: d.jobId }) }, 'Open full log')))),
+
+      resize === 'config' && h(ResizeConfigModal, {
+        depId, d, onClose: () => setResize(null),
+        onDone: () => { setResize(null); load(); window.GDStore.refresh().catch(() => {}); },
+      }),
+      resize && resize.disk && h(DiskGrowModal, {
+        depId, disk: resize.disk, onClose: () => setResize(null),
+        onDone: () => { setResize(null); load(); window.GDStore.refresh().catch(() => {}); },
+      }),
 
       confirm === 'local'
         ? h(ConfirmModal, {

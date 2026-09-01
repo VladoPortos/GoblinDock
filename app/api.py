@@ -1394,6 +1394,153 @@ def _vm_cleanup_local_transaction(dep_id: int, user: User, session: Session):
     return {"ok": True, "verified": verified}
 
 
+_DISK_KEY_RE = re.compile(r"^(scsi|virtio|sata|ide)\d+$")
+
+
+def _parse_disk_entries(cfg: dict) -> list[dict]:
+    """Resizable disks from a VM config: every scsi/virtio/sata/ide entry that is
+    not a cdrom and not a cloud-init volume, with its size parsed to GB."""
+    out = []
+    for key in sorted(cfg or {}):
+        if not _DISK_KEY_RE.match(key):
+            continue
+        raw = str(cfg.get(key) or "")
+        if "media=cdrom" in raw or "cloudinit" in raw:
+            continue
+        size_gb = None
+        m = re.search(r"(?:^|,)size=(\d+(?:\.\d+)?)([MGT]?)", raw)
+        if m:
+            value = float(m.group(1))
+            unit = m.group(2) or "G"
+            size_gb = value / 1024 if unit == "M" else value * 1024 if unit == "T" else value
+            size_gb = int(size_gb) if size_gb == int(size_gb) else round(size_gb, 1)
+        out.append({
+            "key": key,
+            "storage": raw.split(":", 1)[0],
+            "sizeGb": size_gb,
+            "raw": raw,
+        })
+    return out
+
+
+def _resizable_deployment(session: Session, dep_id: int, user: User) -> tuple[Deployment, Connection]:
+    """Shared admission for the fire-and-forget resize calls: owned, quiescent
+    (no lifecycle job, not cleanup_pending), provisioned, and on a live source."""
+    dep = _owned_deployment(session, dep_id, user)
+    _reject_cleanup_pending(dep)
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
+    conn = session.get(Connection, dep.connection_id) if dep.connection_id else None
+    if not conn or not dep.vmid:
+        raise HTTPException(400, "VM not provisioned")
+    _reject_disabled_connection(conn)
+    return dep, conn
+
+
+class VmResizeBody(BaseModel):
+    cores: Optional[int] = Field(default=None, ge=1, le=256)
+    ramGb: Optional[int] = Field(default=None, ge=1, le=4096)
+
+
+class DiskResizeBody(BaseModel):
+    sizeGb: int = Field(ge=1, le=65536)
+
+
+@router.post("/deployments/{dep_id}/resize")
+def vm_resize_config(dep_id: int, body: VmResizeBody, user: User = Depends(current_user),
+                     session: Session = Depends(get_session)):
+    """Day-2 CPU/RAM resize — a direct Proxmox config write, no job. Gated on the
+    VM being STOPPED (like Proxmox's own pending-change model, minus the pending
+    state: the gate keeps GoblinDock's view and the hypervisor's identical)."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep, conn = _resizable_deployment(session, dep_id, user)
+        if body.cores is None and body.ramGb is None:
+            raise HTTPException(400, "nothing to resize — supply cores and/or ramGb")
+        # Same per-VM ceiling authority as deploy: the connection's caps, 0 = unlimited.
+        if body.cores is not None and conn.max_cores and body.cores > conn.max_cores:
+            raise HTTPException(400, f"cores above this connection's per-VM limit ({conn.max_cores})")
+        if body.ramGb is not None and conn.max_ram_mb and body.ramGb * 1024 > conn.max_ram_mb:
+            raise HTTPException(400, f"RAM above this connection's per-VM limit ({conn.max_ram_mb // 1024} GB)")
+        px = Proxmox(conn)
+        node = dep.node or conn.node
+        try:
+            status = str((px.vm_current(dep.vmid, node) or {}).get("status") or "").lower()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        if status != "stopped":
+            raise HTTPException(409, "stop the VM first — CPU/memory changes apply "
+                                     "to a stopped VM (same as Proxmox)")
+        params: dict = {}
+        if body.cores is not None:
+            params["cores"] = body.cores
+        if body.ramGb is not None:
+            params["memory"] = body.ramGb * 1024
+        try:
+            px.set_config(dep.vmid, node=node, **params)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        changes = []
+        if body.cores is not None:
+            changes.append(f"cores {dep.cpu}→{body.cores}")
+            dep.cpu = body.cores
+        if body.ramGb is not None:
+            changes.append(f"ram {dep.ram}G→{body.ramGb}G")
+            dep.ram = body.ramGb
+        session.add(dep)
+        record_audit(session, user, "vm.resize", "deployment", dep.id,
+                     f"{dep.name} — " + " · ".join(changes))
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "cores": dep.cpu, "ramGb": dep.ram}
+
+
+@router.post("/deployments/{dep_id}/disks/{disk}/resize")
+def vm_disk_resize(dep_id: int, disk: str, body: DiskResizeBody,
+                   user: User = Depends(current_user), session: Session = Depends(get_session)):
+    """Day-2 disk GROW — online-safe (qemu block resize), grow-only (Proxmox
+    cannot shrink). Partition/filesystem growth inside the guest is the guest's
+    business — GoblinDock only drives the hypervisor."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep, conn = _resizable_deployment(session, dep_id, user)
+        if not _DISK_KEY_RE.match(disk):
+            raise HTTPException(400, "unknown disk")
+        px = Proxmox(conn)
+        node = dep.node or conn.node
+        try:
+            cfg = px.vm_config(dep.vmid, node)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        entry = next((e for e in _parse_disk_entries(cfg) if e["key"] == disk), None)
+        if entry is None:
+            raise HTTPException(400, f"disk {disk!r} not found "
+                                     "(cdrom/cloud-init volumes cannot be resized)")
+        current = entry["sizeGb"]
+        if current is not None and body.sizeGb <= current:
+            raise HTTPException(400, f"grow only — {disk} is already {current}G "
+                                     "and Proxmox cannot shrink a disk")
+        if conn.max_disk_gb and body.sizeGb > conn.max_disk_gb:
+            raise HTTPException(400, f"disk above this connection's per-VM limit "
+                                     f"({conn.max_disk_gb} GB)")
+        try:
+            px.resize_disk(dep.vmid, disk, f"{body.sizeGb}G", node=node)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        if disk == "scsi0":
+            # the deploy-managed root disk — keep the row's size truthful
+            dep.disk = body.sizeGb
+            session.add(dep)
+        record_audit(session, user, "vm.disk_resize", "deployment", dep.id,
+                     f"{dep.name} — {disk} {current if current is not None else '?'}G→{body.sizeGb}G")
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "disk": disk, "sizeGb": body.sizeGb}
+
+
 def _iface_summary(ifaces) -> list:
     out = []
     for i in ifaces or []:
@@ -1459,6 +1606,7 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
                 "scsi0": cfg.get("scsi0", ""),
                 "agent": cfg.get("agent", ""), "serial0": cfg.get("serial0", ""),
             }
+            out["disks"] = _parse_disk_entries(cfg)
             out["consoleReady"] = running
             if running and cur.get("agent"):
                 out["agent"] = {"os": px.agent_osinfo(dep.vmid, node),
