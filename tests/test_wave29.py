@@ -113,16 +113,18 @@ def test_probe_reuses_stored_verify_tls_when_unset():
 # --------------------------------------------------------------------------- #
 def test_backup_files_owner_only():
     dest = backup.backup_now("test")
-    fmode = stat.S_IMODE(os.stat(dest).st_mode)
-    dmode = stat.S_IMODE(os.stat(dest.parent).st_mode)
-    assert fmode == 0o600, f"backup file must be 0o600, got {oct(fmode)}"
-    assert dmode == 0o700, f"backup dir must be 0o700, got {oct(dmode)}"
+    if os.name == "posix":
+        fmode = stat.S_IMODE(os.stat(dest).st_mode)
+        dmode = stat.S_IMODE(os.stat(dest.parent).st_mode)
+        assert fmode == 0o600, f"backup file must be 0o600, got {oct(fmode)}"
+        assert dmode == 0o700, f"backup dir must be 0o700, got {oct(dmode)}"
     print("test_backup_files_owner_only OK")
 
 
 def test_db_file_owner_only():
-    mode = stat.S_IMODE(os.stat(_DB).st_mode)
-    assert mode == 0o600, f"DB file must be 0o600, got {oct(mode)}"
+    if os.name == "posix":
+        mode = stat.S_IMODE(os.stat(_DB).st_mode)
+        assert mode == 0o600, f"DB file must be 0o600, got {oct(mode)}"
     print("test_db_file_owner_only OK")
 
 

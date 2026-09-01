@@ -7,18 +7,27 @@ This is the "worker" of the design's web+worker split, collapsed into one proces
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import threading
 import time
 import traceback
-from datetime import datetime, timezone
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
 from typing import Optional
 
 from sqlmodel import select
 
 from .config import settings
 from .db import session_scope
+from .execution_plan import (
+    build_execution_plan,
+    materialize_execution_plan,
+    open_deploy_inputs,
+    open_execution_plan,
+    seal_execution_plan,
+)
 from .ansible_exec import run_playbook
 from .models import (
     Block,
@@ -33,14 +42,18 @@ from .models import (
     Secret,
     User,
     Variable,
+    ensure_utc,
     utcnow,
 )
 from .proxmox import (
+    VM_ABSENT,
+    VM_PRESENT,
+    VM_UNKNOWN,
     JobCancelled,
     Proxmox,
-    ProxmoxError,
     base_disk_filename,
     delete_snippet_over_ssh,
+    probe_vm_presence as _probe_vm_presence,
     write_snippet_over_ssh,
 )
 from .recipes import (
@@ -48,15 +61,34 @@ from .recipes import (
     compile_ansible,
     compile_cloudinit,
     has_ansible_blocks,
-    load_recipe,
-    merge_deploy_inputs,
 )
 from .security import crypt_sha512, decrypt, encrypt, gen_vm_password
-from .appsettings import auto_root_password_enabled
+from .appsettings import auto_root_password_enabled, get_setting, set_setting
 from . import statebus
 
 _worker_thread: Optional[threading.Thread] = None
+_waiting_thread: Optional[threading.Thread] = None
 _stop = threading.Event()
+WAITING_TIMEOUT = timedelta(minutes=30)
+
+
+class JobDeferred(Exception):
+    """Control-flow signal: the job is durably waiting and is not terminal."""
+
+
+def _defer_for_guest_ip(ctx: "JobCtx") -> None:
+    """Persist a resumable post-boot wait before unwinding the active execution."""
+    with session_scope() as s:
+        job = s.get(Job, ctx.job_id)
+        if not job:
+            raise RuntimeError("missing job while deferring for guest IP")
+        job.status = "waiting"
+        job.waiting_since = job.waiting_since or utcnow()
+        job.phase = "Waiting for guest IP"
+        job.finished_at = None
+        s.add(job)
+    ctx.log(f"[{_ts()}] waiting for guest IP before applying Ansible…", "l-dim")
+    raise JobDeferred()
 
 
 # --------------------------------------------------------------------------- #
@@ -292,12 +324,11 @@ def _managed_keypair() -> tuple[str, str]:
     return p, pubk
 
 
-def _run_ansible_phase(ctx: "JobCtx", recipe: list, owner_id, ip: str, managed_priv: str,
+def _run_ansible_phase(ctx: "JobCtx", recipe: list, blocks: dict[str, Block], owner_id, ip: str, managed_priv: str,
                        label: str, *, allow_global: bool = False) -> None:
     """Run the post-boot ansible-phase blocks of a recipe against a live VM."""
     if not (recipe and ip):
         return
-    blocks = _blocks_by_key()
     if not has_ansible_blocks(recipe, blocks):
         return
     # Collect resolved secret values while compiling so we can redact them from the
@@ -367,12 +398,18 @@ def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str],
     script = [c for c in recipe_cmds if c.strip() and c.strip() != "set -e"]
     if script:
         lines += ["write_files:", "  - path: /opt/goblindock-recipe.sh",
-                  "    permissions: '0755'", "    content: |",
-                  "      #!/bin/bash", "      set -e"]
+                  "    permissions: '0700'", "    content: |",
+                  "      #!/bin/bash", "      set -e",
+                  "      trap 'rm -f -- \"$0\"' EXIT"]
         lines += ["      " + ln for ln in script]
     lines += ["runcmd:", "  - [systemctl, enable, --now, qemu-guest-agent]"]
     if script:
-        lines += ["  - [/bin/bash, /opt/goblindock-recipe.sh]"]
+        # The fixed outer shell removes the secret-bearing child even when the
+        # child has a parse error, exits non-zero, replaces itself, or changes traps.
+        lines += [
+            "  - [/bin/bash, -c, \"trap 'rm -f -- /opt/goblindock-recipe.sh' "
+            "EXIT; /bin/bash /opt/goblindock-recipe.sh\"]"
+        ]
     lines += ["  - touch /run/goblindock-ready"]
     return "\n".join(lines) + "\n"
 
@@ -380,22 +417,69 @@ def _deploy_cloud_config(name: str, pubkeys: list[str], recipe_cmds: list[str],
 # --------------------------------------------------------------------------- #
 # Job implementations                                                          #
 # --------------------------------------------------------------------------- #
+def _base_disk_validation_marker(
+    px: Proxmox, node: str, filename: str, checksum: str, checksum_algorithm: str,
+) -> tuple[str, str]:
+    """Stable DB marker for one connection/node/storage cache target."""
+    conn = getattr(px, "conn", None)
+    identity = "\0".join((
+        str(getattr(conn, "id", "") or ""),
+        str(getattr(conn, "host", "") or ""),
+        str(getattr(conn, "port", "") or ""),
+        str(node or ""),
+        str(getattr(px, "iso_storage", "") or getattr(conn, "iso_storage", "") or "local"),
+        filename,
+    ))
+    key = "image_cache_validation:" + hashlib.sha256(identity.encode()).hexdigest()
+    digest = (checksum or "").strip().lower()
+    algorithm = (checksum_algorithm or "").strip().lower()
+    value = f"verified:{algorithm}:{digest}" if digest else "downloaded"
+    return key, value
+
+
+def _discard_base_disk(px: Proxmox, node: str, filename: str, *, required: bool) -> None:
+    """Remove a target that may be partial; optionally fail unless absence is known."""
+    try:
+        upid = px.delete_storage_volume(filename, node=node)
+        if isinstance(upid, str) and upid:
+            px.wait_task(upid, node=node, timeout=120)
+        if px.storage_has_volume(filename, node=node):
+            raise RuntimeError(f"untrusted cache target {filename} is still present")
+    except Exception as exc:  # noqa: BLE001
+        if required:
+            raise RuntimeError(f"could not remove untrusted cache target {filename}: {exc}") from exc
+
+
 def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
     """Make sure the base cloud image is cached on the node's image storage.
-    Returns the cached filename. Tolerates a concurrent download of the same
-    file (deploy + sync racing is fine); raises on real download/checksum failures."""
+    Returns the cached filename. Checksum-bearing entries are reusable only after
+    this installation durably recorded successful Proxmox validation."""
     src_url = cfg.get("src_url")
     if not src_url:
         raise RuntimeError("no base image source URL")
-    filename = base_disk_filename(src_url)
+    checksum = cfg.get("checksum", "")
+    checksum_algorithm = cfg.get("checksum_algorithm", "")
+    filename = base_disk_filename(src_url, checksum, checksum_algorithm)
+    marker_key, verified_value = _base_disk_validation_marker(
+        px, node, filename, checksum, checksum_algorithm,
+    )
+    marker = get_setting(marker_key)
     if px.storage_has_volume(filename, node=node):
-        ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
-        return filename
+        trusted = marker == verified_value
+        if (checksum and not trusted) or marker == "untrusted":
+            ctx.log(f"[{_ts()}] removing untrusted cache target {filename}", "l-warn")
+            _discard_base_disk(px, node, filename, required=True)
+        else:
+            ctx.log(f"[{_ts()}] {filename} already present on node — skipping download", "l-dim")
+            return filename
+    # Commit distrust before submitting work: cancellation, process death, task
+    # failure, or checksum mismatch can then never make a leftover reusable.
+    set_setting(marker_key, "untrusted")
     try:
         ctx.log(f"[{_ts()}] downloading {filename} — large images can take several minutes", "l-acc")
         upid = px.download_url(filename, src_url, node=node,
-                               checksum=cfg.get("checksum", ""),
-                               checksum_algorithm=cfg.get("checksum_algorithm", ""))
+                               checksum=checksum,
+                               checksum_algorithm=checksum_algorithm)
         _last = {"line": None, "tick": 0}
 
         def _progress(_st):
@@ -419,12 +503,16 @@ def _ensure_base_disk(ctx: "JobCtx", px: Proxmox, node: str, cfg: dict) -> str:
                     ctx.phase_note(f"downloading {m.group(1)}%")
 
         px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=3600, on_poll=_progress)
+        set_setting(marker_key, verified_value)
         ctx.log(f"[{_ts()}] ✓ downloaded {filename}", "l-ok")
+    except JobCancelled:
+        _discard_base_disk(px, node, filename, required=False)
+        raise
     except Exception as e:  # noqa: BLE001
-        if px.storage_has_volume(filename, node=node):
-            ctx.log(f"[{_ts()}] download reported '{e}' but {filename} is present — continuing", "l-warn")
-        else:
-            raise RuntimeError(f"image download/verification failed: {e}") from e
+        # A target appearing after a failed task may be partial or checksum-invalid.
+        # Only a successful Proxmox task is evidence that the cache entry is usable.
+        _discard_base_disk(px, node, filename, required=False)
+        raise RuntimeError(f"image download/verification failed: {e}") from e
     return filename
 
 
@@ -441,6 +529,125 @@ def _load_job_targets(job: Job) -> tuple[Connection, Deployment]:
     return conn, dep
 
 
+def _load_materialized_job_plan(job: Job, dep: Deployment) -> tuple[dict, list[dict], dict[str, Block]]:
+    """Load the immutable job snapshot, creating one once for legacy queued jobs."""
+    ciphertext = job.execution_plan_enc
+    if not ciphertext and dep.template_id:
+        with session_scope() as s:
+            stored_job = s.get(Job, job.id)
+            stored_dep = s.get(Deployment, dep.id)
+            if stored_job and stored_job.execution_plan_enc:
+                ciphertext = stored_job.execution_plan_enc
+            elif stored_job and stored_dep:
+                template = s.get(Template, stored_dep.template_id)
+                if not template:
+                    raise RuntimeError("missing template for legacy execution plan")
+                try:
+                    deploy_inputs_json = open_deploy_inputs(stored_dep.deploy_inputs_enc)
+                except ValueError as exc:
+                    raise RuntimeError("stored deployment answers cannot be "
+                                       "decrypted — key mismatch") from exc
+                ciphertext = seal_execution_plan(build_execution_plan(
+                    s, template, stored_dep.owner_id, deploy_inputs_json,
+                ))
+                stored_job.execution_plan_enc = ciphertext
+                s.add(stored_job)
+    if not ciphertext:
+        return {"owner_id": dep.owner_id}, [], {}
+    try:
+        plan = open_execution_plan(ciphertext)
+    except ValueError as exc:
+        raise RuntimeError("invalid execution plan") from exc
+    if plan["owner_id"] != dep.owner_id:
+        raise RuntimeError("execution plan owner mismatch")
+    recipe, blocks = materialize_execution_plan(plan)
+    return plan, recipe, blocks
+
+
+@dataclass(frozen=True)
+class DeployPreflight:
+    """Cloud-init material prepared and, when required, delivered before create."""
+    config: dict
+    managed_private_key: str
+    root_password: str
+    credential_user: str
+    snippet_volume: str = ""
+
+
+def _preflight_deploy_cloud_init(
+    ctx: JobCtx, px: Proxmox, conn: Connection, dep: Deployment, node: str, vmid: int,
+    cfg: dict, recipe_cmds: list[str], user_pubkey: str, recipe_requires_snippet: bool,
+) -> DeployPreflight:
+    """Prepare native cloud-init or prove required snippet delivery before create."""
+    managed_private_key, managed_pubkey = _managed_keypair()
+    pubkeys = [key for key in (user_pubkey, managed_pubkey) if key]
+    effective_recipe = recipe_requires_snippet or any(
+        cmd.strip() and cmd.strip() != "set -e" for cmd in recipe_cmds
+    )
+    # Keep the established no-key/native path credential-free: native cloud-init
+    # would expose a plaintext cipassword. When a snippet channel is selected, a
+    # generated root credential is safe because only its hash is delivered.
+    root_password = gen_vm_password() if auto_root_password_enabled() and (
+        effective_recipe or conn.ssh_key_path
+    ) else ""
+    credential_user = ""
+    import urllib.parse
+    params = {
+        "name": dep.name,
+        "cores": _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores),
+        "memory": _clamp_resource(int(cfg.get("ram", 2)) * 1024, conn.max_ram_mb),
+        "ipconfig0": "ip=dhcp" if cfg.get("network_mode", "dhcp") == "dhcp" else cfg.get("ipconfig0", "ip=dhcp"),
+        "agent": "enabled=1",
+        "serial0": "socket",
+        "vga": "std",
+    }
+    bridge = cfg.get("bridge")
+    if bridge:
+        net0 = f"virtio,bridge={bridge}"
+        if cfg.get("vlan"):
+            net0 += f",tag={int(cfg['vlan'])}"
+        params["net0"] = net0
+    if cfg.get("dns"):
+        params["nameserver"] = cfg["dns"]
+
+    if not (effective_recipe or root_password):
+        params["ciuser"] = "goblin"
+        if pubkeys:
+            params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
+        return DeployPreflight(params, managed_private_key, root_password, credential_user)
+
+    volid = ""
+    try:
+        cloud_config = _deploy_cloud_config(
+            dep.name, pubkeys, recipe_cmds,
+            root_pw_hash=crypt_sha512(root_password) if root_password else "",
+        )
+        volid = write_snippet_over_ssh(conn, f"gd-deploy-{vmid}.yml", cloud_config)
+        px.validate_snippet_volume(volid, node=node)
+    except Exception:
+        if volid:
+            try:
+                delete_snippet_over_ssh(conn, f"gd-deploy-{vmid}.yml")
+            except Exception:  # noqa: BLE001
+                pass
+        raise
+    params["cicustom"] = f"user={volid}"
+    credential_user = "root" if root_password else ""
+    ctx.log(f"[{_ts()}] cloud-init: guest-agent + first-boot blocks via snippet {volid}", "l-acc")
+    return DeployPreflight(params, managed_private_key, root_password, credential_user, volid)
+
+
+def _clear_selected_vmid(dep_id: Optional[int], vmid: int) -> None:
+    """Undo a local VMID choice that was never accepted by Proxmox."""
+    if not dep_id:
+        return
+    with session_scope() as s:
+        dep = s.get(Deployment, dep_id)
+        if dep and dep.vmid == vmid:
+            dep.vmid = None
+            s.add(dep)
+
+
 def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5) -> None:
     # phase_base/phase_total let a rebuild present this as a continuation (e.g. phases
     # 2..6 of 6) instead of resetting the progress bar to "Phase 1 of 5".
@@ -448,7 +655,8 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
         return phase_base + n
     cfg = json.loads(job.context_json or "{}")
     conn, dep = _load_job_targets(job)
-    secret_owner_id, allow_global_secrets = _owner_secret_context(dep.owner_id)
+    plan, recipe, blocks = _load_materialized_job_plan(job, dep)
+    secret_owner_id, allow_global_secrets = _owner_secret_context(plan["owner_id"])
     # Clamp before the create request so a stale queued context cannot reserve more
     # than the connection's current limits even temporarily.
     cores = _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores)
@@ -471,120 +679,69 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ctx.log(f"[{_ts()}] goblindock: allocated VMID {new_vmid} on {node}", "l-dim")
     ctx.finish_step(st, t)
 
-    ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")
-    st = ctx.add_step("Ensure base cloud image on node storage")
-    t = ctx.start_step(st)
-    filename = _ensure_base_disk(ctx, px, node, cfg)
-    ctx.finish_step(st, t)
-
-    ctx.progress(20, f"Phase {_ph(3)} of {phase_total} · Create")
-    st = ctx.add_step(f"Create VM and import base disk → {dep.name}")
-    t = ctx.start_step(st)
-    import_path = px.iso_volume_path(filename)
-    ctx.log(f"[{_ts()}] create vm {new_vmid} import-from {import_path}", "l-acc")
-    create_submitted = False
-    try:
-        upid = px.create_vm_import(new_vmid, dep.name, import_path,
-                                   cores=cores, ram_mb=ram_mb, node=node)
-        create_submitted = True
-        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
-    except Exception:
-        # A pre-submission failure can be a collision with a VM we do not own.
-        if create_submitted:
-            try:
-                px.destroy(new_vmid, node=node)
-            except Exception:  # noqa: BLE001
-                pass
-        raise
-    ctx.log(f"[{_ts()}] ✓ disk imported", "l-ok")
-    ctx.finish_step(st, t)
+    # Persist the candidate before delivery so an accepted create request always has
+    # an identity for later reconciliation. Pre-submission failures clear it below.
     with session_scope() as s:
         d = s.get(Deployment, dep.id)
         d.vmid = new_vmid
         d.node = node
         s.add(d)
 
+    user_pubkey = _ssh_pubkey(secret_owner_id, allow_global=allow_global_secrets)
+    recipe_cmds = compile_cloudinit(
+        recipe, blocks,
+        _secret_lookup_factory(secret_owner_id, allow_global=allow_global_secrets),
+    ) if recipe else []
+    recipe_requires_snippet = bool(recipe and has_ansible_blocks(recipe, blocks))
+    preflight: Optional[DeployPreflight] = None
+    create_submitted = False
+    try:
+        preflight = _preflight_deploy_cloud_init(
+            ctx, px, conn, dep, node, new_vmid, cfg, recipe_cmds, user_pubkey,
+            recipe_requires_snippet,
+        )
+
+        ctx.progress(8, f"Phase {_ph(2)} of {phase_total} · Prepare image")
+        st = ctx.add_step("Ensure base cloud image on node storage")
+        t = ctx.start_step(st)
+        filename = _ensure_base_disk(ctx, px, node, cfg)
+        ctx.finish_step(st, t)
+
+        ctx.progress(20, f"Phase {_ph(3)} of {phase_total} · Create")
+        st = ctx.add_step(f"Create VM and import base disk → {dep.name}")
+        t = ctx.start_step(st)
+        import_path = px.iso_volume_path(filename)
+        ctx.log(f"[{_ts()}] create vm {new_vmid} import-from {import_path}", "l-acc")
+        upid = px.create_vm_import(new_vmid, dep.name, import_path,
+                                   cores=cores, ram_mb=ram_mb, node=node)
+        create_submitted = True
+        px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=900)
+    except Exception:
+        # A failure before a UPID can be a collision with a VM we do not own. Undo
+        # only our uploaded snippet and local candidate; an accepted request retains
+        # its identity for reconciliation rather than risking a destructive guess.
+        if not create_submitted:
+            if preflight and preflight.snippet_volume:
+                try:
+                    delete_snippet_over_ssh(conn, f"gd-deploy-{new_vmid}.yml")
+                except Exception:  # noqa: BLE001
+                    pass
+            _clear_selected_vmid(dep.id, new_vmid)
+        raise
+    ctx.log(f"[{_ts()}] ✓ disk imported", "l-ok")
+    ctx.finish_step(st, t)
     ctx.progress(45, f"Phase {_ph(4)} of {phase_total} · Configure")
     st = ctx.add_step("Apply cloud-init (name, SSH key, network, size)")
     t = ctx.start_step(st)
-    user_pubkey = _ssh_pubkey(secret_owner_id, allow_global=allow_global_secrets)
-    managed_priv, managed_pub = _managed_keypair()
-    pubkeys = [k for k in (user_pubkey, managed_pub) if k]
-    root_pw = gen_vm_password() if auto_root_password_enabled() else ""
-    cred_user = ""
-    import urllib.parse
-    params = {
-        "name": dep.name,
-        "cores": cores,
-        "memory": ram_mb,
-        "ipconfig0": "ip=dhcp" if cfg.get("network_mode", "dhcp") == "dhcp" else cfg.get("ipconfig0", "ip=dhcp"),
-        "agent": "enabled=1",
-        "serial0": "socket",   # serial console (xterm); Ubuntu cloud images use ttyS0
-        "vga": "std",          # real VGA framebuffer so the GRAPHICAL console = the display
-    }
-    # Apply the chosen network's bridge + VLAN tag (the imported VM otherwise keeps the
-    # create-time net0) and DNS, so the operator-configured network is actually honoured
-    # rather than silently dropped. NOTE: exercise on real Proxmox hardware.
-    _bridge = cfg.get("bridge")
-    if _bridge:
-        _net0 = f"virtio,bridge={_bridge}"
-        if cfg.get("vlan"):
-            _net0 += f",tag={int(cfg['vlan'])}"
-        params["net0"] = _net0
-    if cfg.get("dns"):
-        params["nameserver"] = cfg["dns"]
-    # The optional template (applied on top of every deploy). Split into the
-    # first-boot (cloud-init) part and the post-boot (ansible) part. Ask-on-deploy
-    # answers live on the deployment row so a REBUILD re-applies them too.
-    with session_scope() as s:
-        tpl = s.get(Template, dep.template_id) if dep.template_id else None
-        recipe_json = tpl.recipe_json if tpl else "[]"
-    recipe = load_recipe(recipe_json)
-    try:
-        overrides = json.loads(dep.deploy_inputs_json or "{}")
-    except (json.JSONDecodeError, TypeError):
-        overrides = {}
-    if recipe and overrides:
-        recipe = merge_deploy_inputs(recipe, overrides)
-    recipe_cmds = compile_cloudinit(
-        recipe, _blocks_by_key(),
-        _secret_lookup_factory(secret_owner_id, allow_global=allow_global_secrets),
-    ) if recipe else []
-
-    used_snippet = False
-    if conn.ssh_key_path:
-        try:
-            cc = _deploy_cloud_config(dep.name, pubkeys, recipe_cmds,
-                                      root_pw_hash=crypt_sha512(root_pw) if root_pw else "")
-            volid = write_snippet_over_ssh(conn, f"gd-deploy-{new_vmid}.yml", cc)
-            params["cicustom"] = f"user={volid}"
-            used_snippet = True
-            if root_pw:
-                cred_user = "root"
-            ctx.log(f"[{_ts()}] cloud-init: guest-agent + first-boot blocks via snippet {volid}", "l-acc")
-        except Exception as e:  # noqa: BLE001
-            ctx.log(f"[{_ts()}] snippet unavailable ({e}); using native cloud-init", "l-warn")
-    if not used_snippet:
-        params["ciuser"] = "goblin"
-        if root_pw:
-            # The hashed-snippet path was unavailable (no SSH key on the connection), and
-            # native cloud-init can only take a cipassword in PLAINTEXT in the VM config
-            # (readable via `qm config`). Rather than persist a plaintext credential, skip
-            # it: there is no audited console password on this fallback path.
-            ctx.log(f"[{_ts()}] console password unavailable — connection has no SSH key for the hashed cloud-init snippet", "l-warn")
-            root_pw = ""
-            cred_user = ""
-        if pubkeys:
-            params["sshkeys"] = urllib.parse.quote("\n".join(pubkeys), safe="")
-    px.set_config(new_vmid, node=node, **params)
+    px.set_config(new_vmid, node=node, **preflight.config)
     ctx.log(f"[{_ts()}] cloud-init: hostname={dep.name} cores={cores} mem={ram_mb}MB", "l-dim")
     # Persist the VM credential as soon as cloud-init config is applied, so a later failure
     # (especially on a rebuild, whose old VM is already destroyed) can never leave a stale
     # password on the row — the stored credential always matches what was pushed to this VMID.
     with session_scope() as s:
         d = s.get(Deployment, dep.id)
-        d.root_password_enc = encrypt(root_pw) if root_pw else ""
-        d.cred_user = cred_user
+        d.root_password_enc = encrypt(preflight.root_password) if preflight.root_password else ""
+        d.cred_user = preflight.credential_user
         s.add(d)
     # resize disk (grow only). Track success so the deployment records the VM's REAL
     # disk size rather than the requested grow target when the resize silently failed.
@@ -607,13 +764,29 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     ip = _wait_for_ip(ctx, px, new_vmid, node, timeout=260) or ip_static
     ctx.finish_step(st, t)
 
-    # Post-boot: apply the ansible-phase blocks of the runtime recipe (if any).
-    if recipe and ip and has_ansible_blocks(recipe, _blocks_by_key()):
+    # Persist the accepted VM's identity and resource facts before post-boot Ansible.
+    # If the guest agent is slow, the durable waiting job must still retain everything
+    # needed to identify and reconcile the VM after a process restart.
+    with session_scope() as s:
+        d = s.get(Deployment, dep.id)
+        d.ip = ip or ""
+        d.mac = px.mac_of(new_vmid, node) or d.mac
+        d.cpu = cores
+        d.ram = ram_mb // 1024
+        d.disk = _effective_disk_gb(resize_ok, disk_gb, _scsi0_size_gb(px, new_vmid, node))
+        s.add(d)
+
+    # Post-boot: apply the ansible-phase blocks of the immutable runtime recipe.
+    requires_ansible = bool(recipe and has_ansible_blocks(recipe, blocks))
+    if requires_ansible and not ip:
+        ctx.add_step("Apply recipe (ansible, post-boot)")
+        _defer_for_guest_ip(ctx)
+    if requires_ansible:
         st = ctx.add_step("Apply recipe (ansible, post-boot)")
         t = ctx.start_step(st)
         try:
             _run_ansible_phase(
-                ctx, recipe, secret_owner_id, ip, managed_priv, dep.name,
+                ctx, recipe, blocks, secret_owner_id, ip, preflight.managed_private_key, dep.name,
                 allow_global=allow_global_secrets,
             )
             ctx.finish_step(st, t)
@@ -623,13 +796,10 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
 
     with session_scope() as s:
         d = s.get(Deployment, dep.id)
-        d.ip = ip or ""
-        d.mac = px.mac_of(new_vmid, node) or d.mac
-        d.cpu = cores
-        d.ram = ram_mb // 1024
-        d.disk = _effective_disk_gb(resize_ok, disk_gb, _scsi0_size_gb(px, new_vmid, node))
         d.status = "running"
         d.error = ""
+        d.cleanup_origin = None
+        d.cleanup_last_attempt_at = None
         s.add(d)
 
     ctx.progress(100, "Complete")
@@ -657,6 +827,27 @@ def _wait_for_ip(ctx: JobCtx, px: Proxmox, vmid: int, node: str, timeout: int = 
     return None
 
 
+def _stop_vm_for_lifecycle(ctx: JobCtx, px: Proxmox, vmid: int, node: str) -> bool:
+    """Stop a confirmed-present VM when needed and wait for the stop task.
+
+    False means the inventory probe confirmed that the VM is already absent.
+    """
+    try:
+        status = (px.vm_current(vmid, node) or {}).get("status")
+    except Exception as e:  # noqa: BLE001
+        presence, detail = _probe_vm_presence(px, vmid, node)
+        if presence == VM_ABSENT:
+            return False
+        if presence == VM_UNKNOWN:
+            raise RuntimeError(f"could not inspect VM {vmid} before stop: {detail}") from e
+        status = "unknown"
+    if status == "stopped":
+        return True
+    upid = px.stop(vmid, node=node)
+    px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
+    return True
+
+
 def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     conn, dep = _load_job_targets(job)
     # rebuild destroys the existing VM first — honour a cancel that landed after claim
@@ -670,26 +861,27 @@ def _run_rebuild(ctx: JobCtx, job: Job) -> None:
     t = ctx.start_step(st)
     old_vmid = dep.vmid
     if old_vmid:
-        try:
-            px.stop(old_vmid, node=node)
-            time.sleep(3)
-        except Exception:  # noqa: BLE001
-            pass
-        try:
-            upid = px.destroy(old_vmid, node=node)
-            px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
-        except JobCancelled:
-            # A cancel during the pre-rebuild destroy: do NOT recreate — propagate so
-            # _execute reconciles the cancel against the VM's actual state.
-            raise
-        except Exception as e:  # noqa: BLE001
-            # The old VM may simply be gone already (then we continue), but if it
-            # SURVIVED we must NOT recreate over it: reusing the VMID would collide on
-            # create, and the create-failure cleanup would then destroy this very VM.
-            if _vm_exists(px, old_vmid, node):
-                raise RuntimeError(
-                    f"rebuild aborted: could not destroy old VM {old_vmid}: {e}") from e
+        if _stop_vm_for_lifecycle(ctx, px, old_vmid, node):
+            try:
+                upid = px.destroy(old_vmid, node=node)
+                px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
+            except JobCancelled:
+                # A cancel during the pre-rebuild destroy: do NOT recreate — propagate so
+                # _execute reconciles the cancel against the VM's actual state.
+                raise
+            except Exception as e:  # noqa: BLE001
+                # The old VM may simply be gone already (then we continue), but if it
+                # SURVIVED we must NOT recreate over it: reusing the VMID would collide on
+                # create, and the create-failure cleanup would then destroy this very VM.
+                if _vm_exists(px, old_vmid, node):
+                    raise RuntimeError(
+                        f"rebuild aborted: could not destroy old VM {old_vmid}: {e}") from e
+                ctx.log(f"[{_ts()}] old VM {old_vmid} already absent; continuing", "l-dim")
+        else:
             ctx.log(f"[{_ts()}] old VM {old_vmid} already absent; continuing", "l-dim")
+        presence, detail = _probe_vm_presence(px, old_vmid, node)
+        if presence != VM_ABSENT:
+            raise RuntimeError(f"rebuild aborted: old VM {old_vmid} absence not confirmed: {detail}")
     ctx.log(f"[{_ts()}] keeping identity: name={dep.name} ip={dep.ip or 'dhcp'}", "l-dim")
     ctx.finish_step(st, t)
 
@@ -711,18 +903,15 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
     ctx.progress(10, "Stopping")
     st = ctx.add_step(f"Stop {dep.name}")
     t = ctx.start_step(st)
+    vm_present = True
     if dep.vmid:
-        try:
-            px.stop(dep.vmid, node=node)
-            time.sleep(3)
-        except Exception:  # noqa: BLE001
-            pass
+        vm_present = _stop_vm_for_lifecycle(ctx, px, dep.vmid, node)
     ctx.finish_step(st, t)
 
     ctx.progress(50, "Destroying")
     st = ctx.add_step(f"Destroy {dep.name} (purge disk)")
     t = ctx.start_step(st)
-    if dep.vmid:
+    if dep.vmid and vm_present:
         try:
             upid = px.destroy(dep.vmid, node=node)
             px.wait_task(upid, node=node, cancelled=ctx.cancelled, timeout=300)
@@ -732,6 +921,9 @@ def _run_destroy(ctx: JobCtx, job: Job) -> None:
             if isinstance(e, JobCancelled) or _vm_exists(px, dep.vmid, node):
                 raise
             ctx.log(f"[{_ts()}] {dep.name} (vmid {dep.vmid}) already absent — treating as destroyed", "l-warn")
+    presence, detail = _probe_vm_presence(px, dep.vmid, node)
+    if presence != VM_ABSENT:
+        raise RuntimeError(f"destroy cleanup requires confirmed VM absence: {detail}")
     ctx.log(f"[{_ts()}] ✓ destroyed {dep.name}", "l-ok")
     ctx.finish_step(st, t)
 
@@ -775,6 +967,7 @@ _DISPATCH = {
 # --------------------------------------------------------------------------- #
 def _claim_next_job() -> Optional[int]:
     canceled_id = None
+    failed_id = None
     with session_scope() as s:
         job = s.exec(
             select(Job).where(Job.status == "queued").order_by(Job.id)
@@ -788,15 +981,29 @@ def _claim_next_job() -> Optional[int]:
             job.finished_at = utcnow()
             s.add(job)
             canceled_id = job.id
+        elif (job.connection_id
+              and (conn := s.get(Connection, job.connection_id)) is not None
+              and conn.disabled):
+            # The admin disabled the source after this job was queued. Admission
+            # blocks new jobs on disabled connections; a stranded queued one must
+            # not silently start talking to a target the operator switched off.
+            job.status = "failed"
+            job.error = (f"Proxmox connection {conn.name!r} was disabled while this "
+                         "job was queued — enable it and retry")
+            job.finished_at = utcnow()
+            s.add(job)
+            failed_id = job.id
         else:
             job.status = "running"
             job.started_at = utcnow()
             s.add(job)
             statebus.bump()
             return job.id
-    # A queued job was cancelled: reconcile its deployment so it isn't stranded in
-    # "working" with a leaked IP reservation (see _reconcile_canceled_job).
+    # A queued job was cancelled/failed pre-start: reconcile its deployment so it
+    # isn't stranded in "working" with a leaked IP reservation.
     _reconcile_canceled_job(canceled_id)
+    if failed_id:
+        _reconcile_failed_job(failed_id)
     statebus.bump()
     return None
 
@@ -819,6 +1026,10 @@ def _execute(job_id: int) -> None:
             job.pct = 100
             job.finished_at = utcnow()
             s.add(job)
+        statebus.bump()
+    except JobDeferred:
+        # The job and VM facts were committed before this control-flow signal. It is
+        # active, not successful or failed, and the idle loop will resume it later.
         statebus.bump()
     except Exception as e:  # noqa: BLE001
         # Cancellation is identified by TYPE, never by error text — a genuine failure
@@ -852,12 +1063,22 @@ def _execute(job_id: int) -> None:
 
 
 def _vm_exists(px: Proxmox, vmid: int, node: Optional[str]) -> bool:
-    """Is `vmid` still present on the node? On a listing failure assume it EXISTS
-    (fail safe) — a rebuild must never recreate over a possibly-live VM."""
+    """Fail-safe compatibility helper used by rebuild's post-destroy check."""
+    state, _detail = _probe_vm_presence(px, vmid, node)
+    return state != VM_ABSENT
+
+
+def _probe_vm_runtime_status(
+    px: Proxmox, vmid: int, node: Optional[str],
+) -> tuple[Optional[str], str]:
+    """Read a present VM's actionable power state without inventing a default."""
     try:
-        return vmid in {int(v["vmid"]) for v in px.list_qemu(node)}
-    except Exception:  # noqa: BLE001
-        return True
+        status = str((px.vm_current(vmid, node) or {}).get("status") or "").lower()
+    except Exception as exc:  # noqa: BLE001
+        return None, f"VM runtime status probe failed: {exc}"
+    if status in ("running", "stopped"):
+        return status, f"VM {vmid} reports {status}"
+    return None, f"VM runtime status was unavailable ({status or 'empty response'})"
 
 
 def _px_for_conn(conn_id: Optional[int]) -> Optional[Proxmox]:
@@ -868,6 +1089,11 @@ def _px_for_conn(conn_id: Optional[int]) -> Optional[Proxmox]:
     try:
         with session_scope() as s:
             conn = s.get(Connection, conn_id)
+            # An admin-disabled source must never be contacted, even by cancel/
+            # cleanup reconciliation — callers treat None as "inventory unknown"
+            # and keep ownership, which is the fail-safe outcome.
+            if conn is not None and conn.disabled:
+                return None
             conn = Connection(**conn.model_dump()) if conn else None
         return Proxmox(conn) if conn else None
     except Exception:  # noqa: BLE001
@@ -884,10 +1110,39 @@ def _drop_deployment(dep_id: int) -> None:
             s.delete(d)
 
 
-def _set_dep_status(dep_id: int, status: str, error: str = "") -> None:
+def _drop_deployment_if_matches(
+    dep_id: int, vmid: Optional[int], required_status: Optional[str] = None
+) -> None:
+    """Drop only the same ownership record that was externally proven absent."""
     with session_scope() as s:
         d = s.get(Deployment, dep_id)
-        if d:
+        if not d or d.vmid != vmid or (required_status and d.status != required_status):
+            return
+        for allocation in s.exec(
+            select(IpAllocation).where(IpAllocation.deployment_id == dep_id)
+        ).all():
+            s.delete(allocation)
+        s.delete(d)
+
+
+def _set_dep_status(
+    dep_id: int,
+    status: str,
+    error: str,
+    expected_vmid: Optional[int],
+    cleanup_origin: Optional[str] = None,
+) -> None:
+    with session_scope() as s:
+        d = s.get(Deployment, dep_id)
+        if d and d.vmid == expected_vmid:
+            if status == "cleanup_pending":
+                if cleanup_origin in ("deploy", "destroy"):
+                    if d.status != "cleanup_pending" or d.cleanup_origin != cleanup_origin:
+                        d.cleanup_last_attempt_at = None
+                    d.cleanup_origin = cleanup_origin
+            else:
+                d.cleanup_origin = None
+                d.cleanup_last_attempt_at = None
             d.status = status
             d.error = error[:300] if error else ""
             s.add(d)
@@ -949,24 +1204,7 @@ def _effective_disk_gb(resize_ok: bool, requested: int, actual: Optional[int]) -
 
 
 def _reconcile_canceled_job(job_id: Optional[int]) -> None:
-    """Leave a cancelled job's deployment consistent — reconciled against the VM's
-    ACTUAL Proxmox state, because a cancel can land after the (irreversible) destroy
-    task was already submitted, so we must never just assume the VM survived.
-
-    deploy  → nothing should survive: best-effort destroy any half-built VM, free the
-              IP reservation, and delete the deployment row ("undo").
-    rebuild
-    destroy → probe the VM:
-              • still present  → keep it + its IP; take the deployment out of "working"
-                so /state live-probes its real run state again (serialize.vm_dict skips
-                the probe while status == "working").
-              • gone, destroy  → the destroy effectively completed: free the IP and
-                delete the deployment row.
-              • gone, rebuild  → the old VM was removed before the recreate was
-                cancelled: mark the deployment "error" (rebuild again to recreate) and
-                KEEP its IP reservation so the retry reuses the same address.
-              If the VM's state can't be determined, fail safe = assume present (keep).
-    """
+    """Reconcile cancellation without releasing ownership on ambiguous inventory."""
     if not job_id:
         return
     with session_scope() as s:
@@ -979,32 +1217,57 @@ def _reconcile_canceled_job(job_id: Optional[int]) -> None:
         job_type = job.type
         vmid, node, conn_id, dep_id = dep.vmid, dep.node, dep.connection_id, dep.id
 
-    if job_type == "deploy":
+    if job_type == "deploy" and vmid is not None:
         _best_effort_destroy(conn_id, vmid, node)
+
+    px = _px_for_conn(conn_id) if vmid is not None else None
+    presence, detail = _probe_vm_presence(px, vmid, node)
+
+    if presence == VM_ABSENT:
         _best_effort_delete_snippet(conn_id, vmid)
-        _drop_deployment(dep_id)
+        if job_type in ("deploy", "destroy"):
+            _drop_deployment_if_matches(dep_id, vmid)
+        else:
+            _set_dep_status(
+                dep_id,
+                "error",
+                "rebuild canceled after the old VM was removed — rebuild again to recreate",
+                expected_vmid=vmid,
+            )
         return
 
-    # rebuild / destroy: reconcile against ground truth
-    if vmid:
-        px = _px_for_conn(conn_id)
-        vm_present = _vm_exists(px, vmid, node) if px is not None else True
-    else:
-        vm_present = False   # nothing was ever provisioned
+    if presence == VM_PRESENT and job_type in ("rebuild", "destroy"):
+        runtime_status, runtime_detail = _probe_vm_runtime_status(px, vmid, node)
+        if runtime_status:
+            _set_dep_status(dep_id, runtime_status, "", expected_vmid=vmid)
+        else:
+            _set_dep_status(
+                dep_id,
+                "error",
+                f"canceled {job_type} VM status not confirmed: {runtime_detail}",
+                expected_vmid=vmid,
+            )
+        return
 
-    if vm_present:
-        _set_dep_status(dep_id, "stopped")           # un-stick; live-probe corrects it
-    elif job_type == "destroy":
-        _drop_deployment(dep_id)                     # destroy effectively completed
-    else:  # rebuild whose old VM is gone, recreate cancelled
-        _set_dep_status(dep_id, "error",
-                        "rebuild canceled after the old VM was removed — rebuild again to recreate")
+    if job_type in ("deploy", "destroy"):
+        _set_dep_status(
+            dep_id,
+            "cleanup_pending",
+            f"canceled {job_type} cleanup not confirmed: {detail}",
+            expected_vmid=vmid,
+            cleanup_origin=job_type,
+        )
+    else:
+        _set_dep_status(
+            dep_id,
+            "error",
+            f"rebuild canceled while VM presence is unknown: {detail}",
+            expected_vmid=vmid,
+        )
 
 
 def _reconcile_failed_job(job_id: int) -> None:
-    """Mark a failed job's deployment as errored. Only a failed DEPLOY produced no
-    surviving VM, so only it releases the IP reservation; a failed rebuild/destroy
-    leaves the existing VM (and therefore its reserved IP) in place."""
+    """Mark a failure visible while releasing ownership only on proven absence."""
     with session_scope() as s:
         job = s.get(Job, job_id)
         if not job or not job.deployment_id:
@@ -1012,12 +1275,74 @@ def _reconcile_failed_job(job_id: int) -> None:
         dep = s.get(Deployment, job.deployment_id)
         if not dep:
             return
+        job_type, job_error = job.type, job.error or ""
+        dep_id, conn_id, vmid, node = dep.id, dep.connection_id, dep.vmid, dep.node
+
+    px = _px_for_conn(conn_id) if vmid is not None else None
+    presence, _detail = _probe_vm_presence(px, vmid, node)
+
+    if presence == VM_ABSENT:
+        _best_effort_delete_snippet(conn_id, vmid)
+        if job_type == "destroy":
+            _drop_deployment_if_matches(dep_id, vmid)
+            return
+
+    with session_scope() as s:
+        dep = s.get(Deployment, dep_id)
+        if not dep or dep.vmid != vmid:
+            return
         dep.status = "error"
-        dep.error = (job.error or "")[:300]
+        dep.error = job_error[:300]
+        dep.cleanup_origin = None
+        dep.cleanup_last_attempt_at = None
         s.add(dep)
-        if job.type == "deploy":
-            for a in s.exec(select(IpAllocation).where(IpAllocation.deployment_id == dep.id)).all():
-                s.delete(a)
+        if job_type == "deploy" and presence == VM_ABSENT:
+            for allocation in s.exec(
+                select(IpAllocation).where(IpAllocation.deployment_id == dep.id)
+            ).all():
+                s.delete(allocation)
+
+
+def _retry_cleanup_pending(now: Optional[datetime] = None) -> None:
+    """Retry ambiguous cleanup at most once per minute, outside DB transactions."""
+    with session_scope() as s:
+        dep_ids = [dep.id for dep in s.exec(
+            select(Deployment).where(
+                Deployment.status == "cleanup_pending"
+            ).order_by(Deployment.id)
+        ).all()]
+
+    for dep_id in dep_ids:
+        attempt_at = ensure_utc(now) or utcnow()
+        cutoff = attempt_at - timedelta(seconds=60)
+        with session_scope() as s:
+            dep = s.get(Deployment, dep_id)
+            if not dep or dep.status != "cleanup_pending":
+                continue
+            last_attempt = ensure_utc(dep.cleanup_last_attempt_at)
+            if last_attempt is not None and last_attempt > cutoff:
+                continue
+            dep.cleanup_last_attempt_at = attempt_at
+            s.add(dep)
+            target = (dep.id, dep.connection_id, dep.vmid, dep.node, dep.cleanup_origin or "")
+
+        dep_id, conn_id, vmid, node, job_type = target
+        if job_type == "deploy" and vmid is not None:
+            _best_effort_destroy(conn_id, vmid, node)
+        px = _px_for_conn(conn_id) if vmid is not None else None
+        presence, detail = _probe_vm_presence(px, vmid, node)
+        if presence == VM_ABSENT:
+            _best_effort_delete_snippet(conn_id, vmid)
+            _drop_deployment_if_matches(dep_id, vmid, required_status="cleanup_pending")
+        elif presence == VM_PRESENT and job_type == "destroy":
+            _set_dep_status(dep_id, "stopped", "", expected_vmid=vmid)
+        else:
+            _set_dep_status(
+                dep_id,
+                "cleanup_pending",
+                f"cleanup not confirmed: {detail}",
+                expected_vmid=vmid,
+            )
 
 
 def _reconcile_ips() -> None:
@@ -1043,10 +1368,195 @@ def _reconcile_ips() -> None:
                     s.add(d)
 
 
+def _waiting_ansible_step(job_id: int) -> int:
+    """Return the pending Ansible step, repairing old/test waits without one."""
+    name = "Apply recipe (ansible, post-boot)"
+    with session_scope() as s:
+        steps = s.exec(
+            select(JobStep).where(JobStep.job_id == job_id).order_by(JobStep.seq)
+        ).all()
+        for step in reversed(steps):
+            if step.name == name and step.state in ("pending", "running"):
+                return step.seq
+        seq = max((step.seq for step in steps), default=0) + 1
+        s.add(JobStep(job_id=job_id, seq=seq, name=name, state="pending"))
+        return seq
+
+
+def _resume_waiting_ansible(job_id: int, ip: str) -> None:
+    """Run only the captured Ansible plan and complete one durable waiting job."""
+    with session_scope() as s:
+        stored_job = s.get(Job, job_id)
+        if not stored_job or stored_job.status != "waiting":
+            return
+        if not stored_job.execution_plan_enc:
+            raise RuntimeError("waiting job has no captured execution plan")
+        job = Job(**stored_job.model_dump())
+        dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
+        if not dep:
+            raise RuntimeError("waiting job deployment is missing")
+        dep_id, dep_name, dep_owner_id = dep.id, dep.name, dep.owner_id
+        dep.ip = ip
+        s.add(dep)
+
+    try:
+        plan = open_execution_plan(job.execution_plan_enc)
+    except ValueError as exc:
+        raise RuntimeError("invalid execution plan") from exc
+    if plan["owner_id"] != dep_owner_id:
+        raise RuntimeError("execution plan owner mismatch")
+    recipe, blocks = materialize_execution_plan(plan)
+    if not has_ansible_blocks(recipe, blocks):
+        raise RuntimeError("waiting job captured no Ansible plan")
+
+    owner_id, allow_global = _owner_secret_context(plan["owner_id"])
+    managed_private_key, _managed_public_key = _managed_keypair()
+    ctx = JobCtx(job_id)
+    step = _waiting_ansible_step(job_id)
+    ctx.progress(90, "Apply recipe (ansible, post-boot)")
+    started = ctx.start_step(step)
+    try:
+        _run_ansible_phase(
+            ctx, recipe, blocks, owner_id, ip, managed_private_key, dep_name,
+            allow_global=allow_global,
+        )
+        ctx.finish_step(step, started)
+    except Exception:
+        ctx.finish_step(step, started, state="failed")
+        raise
+
+    with session_scope() as s:
+        job_row = s.get(Job, job_id)
+        dep_row = s.get(Deployment, dep_id)
+        if not job_row or job_row.status != "waiting" or not dep_row:
+            return
+        dep_row.ip = ip
+        dep_row.status = "running"
+        dep_row.error = ""
+        dep_row.cleanup_origin = None
+        dep_row.cleanup_last_attempt_at = None
+        job_row.status = "succeeded"
+        job_row.pct = 100
+        job_row.phase = "Complete"
+        job_row.finished_at = utcnow()
+        s.add(dep_row)
+        s.add(job_row)
+    ctx.log(f"[{_ts()}] ✓ {dep_name} ready at {ip}", "l-ok")
+    statebus.bump()
+
+
+def _finish_waiting_error(job_id: int, exc: Exception) -> None:
+    """Finish a resumed wait through the same failure/cancel reconciliation invariant."""
+    cancelled = isinstance(exc, JobCancelled)
+    ctx = JobCtx(job_id)
+    ctx.log(f"[{_ts()}] ✗ {'canceled' if cancelled else exc}", "l-err")
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if not job or job.status != "waiting":
+            return
+        job.status = "canceled" if cancelled else "failed"
+        job.error = "canceled" if cancelled else str(exc)
+        job.finished_at = utcnow()
+        s.add(job)
+        has_dep = job.deployment_id is not None
+    if has_dep:
+        if cancelled:
+            _reconcile_canceled_job(job_id)
+        else:
+            _reconcile_failed_job(job_id)
+    statebus.bump()
+
+
+def _timeout_waiting_job(job_id: int) -> None:
+    """Fail an expired IP wait without releasing its VM or reserved IP ownership."""
+    error = "guest IP was not reported within 30 minutes"
+    cancel_requested = False
+    with session_scope() as s:
+        job = s.get(Job, job_id)
+        if not job or job.status != "waiting":
+            return
+        cancel_requested = job.cancel_requested
+        if not cancel_requested:
+            job.status = "failed"
+            job.error = error
+            job.finished_at = utcnow()
+            s.add(job)
+            dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
+            if dep:
+                dep.status = "error"
+                dep.error = error
+                dep.cleanup_origin = None
+                dep.cleanup_last_attempt_at = None
+                s.add(dep)
+    if cancel_requested:
+        _finish_waiting_error(job_id, JobCancelled())
+        return
+    JobCtx(job_id).log(f"[{_ts()}] ✗ {error}", "l-err")
+    statebus.bump()
+
+
+def _poll_waiting_job(job_id: int, poll_at: datetime) -> None:
+    """Reload and process one waiting row without retaining its DB session."""
+    with session_scope() as s:
+        stored = s.get(Job, job_id)
+        if not stored or stored.status != "waiting":
+            return
+        job = Job(**stored.model_dump())
+        dep = s.get(Deployment, job.deployment_id) if job.deployment_id else None
+        conn = s.get(Connection, job.connection_id) if job.connection_id else None
+        dep = Deployment(**dep.model_dump()) if dep else None
+        conn = Connection(**conn.model_dump()) if conn else None
+
+    if job.cancel_requested:
+        _finish_waiting_error(job.id, JobCancelled())
+        return
+
+    if not dep or not conn or dep.vmid is None:
+        _finish_waiting_error(job.id, RuntimeError("waiting job target is missing"))
+        return
+    try:
+        ip = Proxmox(conn).agent_ipv4(dep.vmid, dep.node or conn.node)
+    except Exception:  # noqa: BLE001
+        ip = None
+    if not ip:
+        waiting_since = (
+            ensure_utc(job.waiting_since)
+            or ensure_utc(job.started_at)
+            or ensure_utc(job.created_at)
+        )
+        if waiting_since is not None and poll_at >= waiting_since + WAITING_TIMEOUT:
+            _timeout_waiting_job(job.id)
+        return
+    try:
+        _resume_waiting_ansible(job.id, ip)
+    except Exception as exc:  # noqa: BLE001
+        _finish_waiting_error(job.id, exc)
+
+
+def _poll_waiting_jobs(now: Optional[datetime] = None) -> bool:
+    """Poll an ordered snapshot of durable waits independently of queued work."""
+    poll_at = ensure_utc(now) or utcnow()
+    with session_scope() as s:
+        waiting_ids = s.exec(
+            select(Job.id).where(Job.status == "waiting")
+            .order_by(Job.waiting_since, Job.id)
+        ).all()
+    if not waiting_ids:
+        return False
+
+    for job_id in waiting_ids:
+        try:
+            _poll_waiting_job(job_id, poll_at)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+    return True
+
+
 def _recover_orphans() -> None:
     """Crash recovery: a job left 'running' by a previous process is dead. Fail it AND
     reconcile the resource it was mutating — otherwise the deployment stays "working"
     forever (serialize skips live-polling 'working') and the image stays "building"."""
+    deployment_job_ids = []
     with session_scope() as s:
         for job in s.exec(select(Job).where(Job.status == "running")).all():
             job.status = "failed"
@@ -1054,24 +1564,15 @@ def _recover_orphans() -> None:
             job.finished_at = utcnow()
             s.add(job)
             if job.deployment_id:
-                dep = s.get(Deployment, job.deployment_id)
-                if dep and dep.status == "working":
-                    dep.status = "error"
-                    dep.error = "interrupted by restart"
-                    s.add(dep)
-                    # Only an interrupted initial deploy produced no stable VM identity.
-                    # Rebuild/destroy recovery keeps the live VM's reservation so it
-                    # cannot be handed to another deployment after a process restart.
-                    if job.type == "deploy":
-                        for a in s.exec(select(IpAllocation).where(
-                                IpAllocation.deployment_id == dep.id)).all():
-                            s.delete(a)
+                deployment_job_ids.append(job.id)
             if job.image_id:
                 img = s.get(Image, job.image_id)
                 if img and img.build_status == "building":
                     # keep template_vmid so an admin can identify and manually clean up the ghost on the node
                     img.build_status = "failed"
                     s.add(img)
+    for job_id in deployment_job_ids:
+        _reconcile_failed_job(job_id)
 
 
 def _loop() -> None:
@@ -1084,6 +1585,7 @@ def _loop() -> None:
                 idle += 1
                 if idle % 15 == 0:  # ~ every 15s while idle
                     _reconcile_ips()
+                    _retry_cleanup_pending()
                 time.sleep(1.0)
                 continue
             idle = 0
@@ -1093,16 +1595,40 @@ def _loop() -> None:
             time.sleep(2.0)
 
 
+def _waiting_loop() -> None:
+    """Keep durable guest-IP waits moving while the main worker is busy."""
+    while not _stop.is_set():
+        try:
+            _poll_waiting_jobs()
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+        _stop.wait(1.0)
+
+
 def start_worker() -> None:
-    global _worker_thread
-    if _worker_thread and _worker_thread.is_alive():
-        return
+    global _worker_thread, _waiting_thread
     _stop.clear()
-    _worker_thread = threading.Thread(target=_loop, name="gd-worker", daemon=True)
-    _worker_thread.start()
+    if not _worker_thread or not _worker_thread.is_alive():
+        _worker_thread = threading.Thread(target=_loop, name="gd-worker", daemon=True)
+        _worker_thread.start()
+    if not _waiting_thread or not _waiting_thread.is_alive():
+        _waiting_thread = threading.Thread(
+            target=_waiting_loop, name="gd-waiting-worker", daemon=True,
+        )
+        _waiting_thread.start()
+
+
+def worker_health() -> dict:
+    """Liveness of the two background threads, for the admin Health page."""
+    return {
+        "jobWorkerAlive": bool(_worker_thread and _worker_thread.is_alive()),
+        "waitingWorkerAlive": bool(_waiting_thread and _waiting_thread.is_alive()),
+    }
 
 
 def stop_worker(join_timeout: float = 30) -> None:
     _stop.set()
     if _worker_thread and _worker_thread.is_alive():
         _worker_thread.join(timeout=join_timeout)
+    if _waiting_thread and _waiting_thread.is_alive():
+        _waiting_thread.join(timeout=join_timeout)

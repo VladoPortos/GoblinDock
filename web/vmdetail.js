@@ -3,7 +3,8 @@
   const { useState, useEffect, useRef } = React;
   const Icon = window.Icon;
   const { OSGlyph, ConfirmModal, StatusBadge, FormModal, Field, Toggle, Menu,
-          copyToClipboard, readClipboard, fmtBytes, useFetched } = window.UI;
+          copyToClipboard, readClipboard, fmtBytes, useFetched,
+          isVmLifecycleLocked } = window.UI;
   const h = React.createElement;
   const toast = (m, t) => window.GDStore.toast(m, t);
   // Transitional uptime-box label while a power action is in flight, until the live
@@ -192,7 +193,7 @@
         'Snapshots live on the Proxmox node next to the VM disk. Rolling back discards everything written since.'));
   }
 
-  function Snapshots({ depId, running }) {
+  function Snapshots({ depId, running, locked }) {
     const [bump, setBump] = useState(0);
     const [taking, setTaking] = useState(false);
     const [confirm, setConfirm] = useState(null);   // { kind: 'rollback' | 'delete', snap }
@@ -232,7 +233,7 @@
             s.current && h('span', { className: 'badge accent', style: { fontSize: 10 } }, 'current'),
             s.vmstate && h('span', { className: 'badge', style: { fontSize: 10 } }, 'RAM')),
           h('div', { className: 'hint', style: { fontSize: 11 } }, s.created, s.description ? ' · ' + s.description : '')),
-        h(Menu, { items: [
+        !locked && h(Menu, { items: [
           { label: 'Roll back', icon: 'history', onClick: () => { setStartAfter(true); setConfirm({ kind: 'rollback', snap: s }); } },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm({ kind: 'delete', snap: s }) },
@@ -240,10 +241,10 @@
 
     return h(React.Fragment, null,
       Card('Snapshots', body,
-        h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTaking(true),
+        !locked && h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTaking(true),
           disabled: !!(data && data.error) }, h(Icon, { name: 'plus', size: 13 }), 'Take snapshot')),
-      taking && h(SnapModal, { depId, running, onClose: () => setTaking(false), onDone: () => { setTaking(false); reload(); } }),
-      confirm && h(ConfirmModal, {
+      !locked && taking && h(SnapModal, { depId, running, onClose: () => setTaking(false), onDone: () => { setTaking(false); reload(); } }),
+      !locked && confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null),
         tone: 'danger',
         icon: confirm.kind === 'rollback' ? 'history' : 'trash',
@@ -268,6 +269,74 @@
       h('span', { className: (mono ? 'mono ' : '') + (copy ? 'copy' : ''), style: { fontSize: 12.5, fontWeight: 600, textAlign: 'right', wordBreak: 'break-all' } }, v || '—'));
   }
 
+  // Day-2 CPU/RAM resize — mirrors Proxmox: applies only to a STOPPED VM, so the
+  // submit is gated (not just refused server-side) while the VM runs.
+  function ResizeConfigModal({ depId, d, onClose, onDone }) {
+    const cfg = d.config || {};
+    const [cores, setCores] = useState(String(cfg.cores || d.reqCpu || 1));
+    const [ram, setRam] = useState(String(
+      cfg.memoryMb ? Math.max(1, Math.round(cfg.memoryMb / 1024)) : (d.reqRam || 1)));
+    const [busy, setBusy] = useState(false);
+    const running = !!(d.live && d.live.status === 'running');
+    const submit = async () => {
+      const c = parseInt(cores, 10);
+      const r = parseInt(ram, 10);
+      if (!Number.isFinite(c) || c < 1 || !Number.isFinite(r) || r < 1) {
+        toast('Enter whole numbers ≥ 1', 'err');
+        return;
+      }
+      setBusy(true);
+      try {
+        await window.API.vmResize(depId, { cores: c, ramGb: r });
+        toast('Resized — ' + c + ' vCPU · ' + r + ' GB take effect on next start', 'ok');
+        onDone();
+      } catch (e) { toast(e.message || 'failed', 'err'); }
+      setBusy(false);
+    };
+    return h(FormModal, {
+      title: 'Resize ' + d.name, icon: 'sliders', onClose, onSubmit: submit,
+      busy: busy || running, submitLabel: running ? 'VM must be stopped' : 'Apply',
+    },
+      running && h('div', {
+        className: 'mono', role: 'alert',
+        style: { padding: '9px 11px', borderRadius: 8, fontSize: 12,
+          color: 'var(--warn, var(--err))', background: 'var(--err-ghost)' },
+      }, 'The VM is running — stop it first. Like in Proxmox, CPU/memory changes apply to a stopped VM.'),
+      h(Field, { label: 'vCPU (cores)', type: 'number', mono: true, value: cores, onChange: setCores }),
+      h(Field, { label: 'Memory (GB)', type: 'number', mono: true, value: ram, onChange: setRam,
+        hint: 'Applied straight to the Proxmox config — no job, no rebuild, disk untouched.' }));
+  }
+
+  // Day-2 disk grow — online-safe in Proxmox, grow-only. The guest's
+  // partition/filesystem is deliberately NOT touched.
+  function DiskGrowModal({ depId, disk, onClose, onDone }) {
+    const current = disk.sizeGb != null ? disk.sizeGb : null;
+    const [size, setSize] = useState(String(current != null ? current + 1 : ''));
+    const [busy, setBusy] = useState(false);
+    const submit = async () => {
+      const target = parseInt(size, 10);
+      if (!Number.isFinite(target) || (current != null && target <= current)) {
+        toast('Grow only — enter a size above ' + (current != null ? current + ' G' : 'the current size'), 'err');
+        return;
+      }
+      setBusy(true);
+      try {
+        await window.API.vmDiskResize(depId, disk.key, { sizeGb: target });
+        toast(disk.key + ' grown to ' + target + ' G — grow the partition/filesystem inside the OS yourself', 'ok');
+        onDone();
+      } catch (e) { toast(e.message || 'failed', 'err'); }
+      setBusy(false);
+    };
+    return h(FormModal, {
+      title: 'Grow ' + disk.key, icon: 'disk', onClose, onSubmit: submit,
+      busy, submitLabel: 'Grow disk',
+    },
+      h(Field, { label: 'New size (GB)' + (current != null ? ' · currently ' + current + ' G' : ''),
+        type: 'number', mono: true, value: size, onChange: setSize,
+        hint: 'Grow only — Proxmox cannot shrink a disk. Works while the VM runs; '
+          + 'the partition/filesystem inside the OS is not resized by GoblinDock.' }));
+  }
+
   function Card(title, children, extra) {
     return h('div', { className: 'card card-pad', style: { display: 'flex', flexDirection: 'column', gap: 6 } },
       h('div', { className: 'row', style: { marginBottom: 4 } }, h('span', { className: 'panel-title' }, title), extra), children);
@@ -281,6 +350,7 @@
     const [conMode, setConMode] = useState('vnc');
     const [tall, setTall] = useState(false);
     const [confirm, setConfirm] = useState(false);
+    const [resize, setResize] = useState(null);   // 'config' | { disk row } | null
     const [busy, setBusy] = useState('');
     const [cred, setCred] = useState(null);
     const revealCred = async () => {
@@ -301,7 +371,7 @@
     useEffect(() => {
       if (!pending) return;
       const st = (d && d.live && d.live.status) || (d && d.status);
-      if (pending === 'stop' ? st !== 'running' : st === 'running') setPending('');
+      if (pending === 'stop' ? st === 'stopped' : st === 'running') setPending('');
     }, [d, pending]);
 
     const act = async (action) => {
@@ -319,6 +389,19 @@
       try { const r = await window.API.vmDestroy(depId); go('job', { jobId: r.jobId }); }
       catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
     };
+    const cleanupLocal = async () => {
+      try {
+        const r = await window.API.vmCleanupLocal(depId);
+        // drop the row before landing on the dashboard — a stale in-flight
+        // /state response must not show the just-removed VM there
+        window.GDStore.removeVm(depId);
+        window.GDStore.toast(r.verified
+          ? 'Local record removed (VM confirmed absent in Proxmox)'
+          : 'Local record removed — upstream could not be verified', r.verified ? 'ok' : 'warn');
+        window.GDStore.refresh({ fresh: true }).catch(() => {});
+        go('dashboard');
+      } catch (e) { window.GDStore.toast(e.message || 'failed', 'err'); }
+    };
 
     if (err && !d) return h('div', { className: 'page fadein' },
       h('div', { className: 'card' }, h('div', { className: 'empty' },
@@ -330,7 +413,11 @@
     const live = d.live || {};
     const cfg = d.config || {};
     const running = live.status === 'running';
-    const statusTone = running ? 'running' : (d.status === 'working') ? 'working' : (d.status === 'error') ? 'error' : 'stopped';
+    const powerUnavailable = live.status === 'unknown';
+    const locked = isVmLifecycleLocked(d);
+    const statusTone = running ? 'running' : (d.status === 'working') ? 'working'
+      : (d.status === 'error' || d.status === 'cleanup_pending') ? 'error'
+        : powerUnavailable ? 'unknown' : 'stopped';
     const memPct = live.memMax ? Math.round(live.memUsed / live.memMax * 100) : null;
     const diskPct = live.diskMax ? Math.round(live.diskUsed / live.diskMax * 100) : null;
 
@@ -343,17 +430,40 @@
             h(OSGlyph, { os: d.os, size: 26 }),
             h('h1', { className: 'page-title' }, d.name),
             h('span', { className: 'badge ' + statusTone }, h('span', { className: 'dot ' + statusTone }),
-              d.status === 'working' ? 'Working' : d.status === 'error' ? 'Error' : running ? 'Running' : 'Stopped')),
+              d.status === 'working' ? 'Working' : d.status === 'cleanup_pending' ? 'Cleanup pending'
+                : d.status === 'error' ? 'Error' : running ? 'Running'
+                  : powerUnavailable ? 'Unknown' : 'Stopped')),
           h('div', { className: 'page-sub mono' }, 'vmid ', d.vmid || '—', ' · ', d.node, d.ip ? ' · ' + d.ip : '')),
         h('div', { className: 'spacer' }),
-        h('div', { className: 'row', style: { gap: 8 } },
-          running
-            ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
-            : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy || d.status === 'working' }, h(Icon, { name: 'play', size: 14 }), 'Start'),
-          h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
-          h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
-          h('button', { className: 'btn danger sm', onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 }))),
+        h('div', { className: 'row vm-detail-actions', style: { gap: 8 } },
+          !locked && (running
+            ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy || powerUnavailable }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
+            : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy || powerUnavailable }, h(Icon, { name: 'play', size: 14 }), 'Start')),
+          !locked && h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
+          !locked && h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
+          !locked && h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
+            onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 })),
+          // recovery path for a record whose VM is gone / unreachable upstream:
+          // offered when the source is disabled, live status is unavailable, or the
+          // VM is stuck in an error/cleanup state — never for a healthy VM.
+          !locked && (d.connectionDisabled || powerUnavailable || d.liveError
+              || d.status === 'error' || d.status === 'cleanup_pending')
+            && h('button', { type: 'button', className: 'btn ghost sm', 'aria-label': 'Clean up local record',
+              title: 'Remove GoblinDock\'s record only — never touches Proxmox',
+              onClick: () => setConfirm('local') }, h(Icon, { name: 'cancel', size: 14 }), 'Clean up')),
       ),
+
+      d.err && h('div', {
+        className: 'mono',
+        style: { marginBottom: 16, padding: '10px 12px', borderRadius: 9,
+          color: 'var(--err)', background: 'var(--err-ghost)', fontSize: 12.5 },
+      }, d.err),
+
+      d.liveError && h('div', {
+        className: 'mono', role: 'status',
+        style: { marginBottom: 16, padding: '10px 12px', borderRadius: 9,
+          color: 'var(--text-dim)', background: 'var(--surface-2)', fontSize: 12.5 },
+      }, d.liveError, '. Power controls are disabled until the connection recovers.'),
 
       // live metrics
       h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 14, marginBottom: 16 } },
@@ -367,7 +477,7 @@
             : '—' })),
 
       // console (toggle between the Proxmox graphical console and the serial console)
-      showConsole && h('div', { className: 'card card-pad', style: { marginBottom: 16 } },
+      !locked && showConsole && h('div', { className: 'card card-pad', style: { marginBottom: 16 } },
         h('div', { className: 'row', style: { marginBottom: 12 } },
           h('div', { className: 'seg' },
             h('button', { className: conMode === 'vnc' ? 'active' : '', onClick: () => setConMode('vnc') }, h(Icon, { name: 'server', size: 14 }), 'Graphical'),
@@ -376,7 +486,7 @@
             h(Icon, { name: tall ? 'collapse' : 'width', size: 14 }), tall ? 'Compact' : 'Expand')),
         conMode === 'vnc' ? h(VncConsole, { key: 'vnc', depId, tall }) : h(VmConsole, { key: 'serial', depId, tall })),
 
-      h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, alignItems: 'start' } },
+      h('div', { className: 'vm-detail-columns', style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 16, alignItems: 'start' } },
         // left column
         h('div', { style: { display: 'flex', flexDirection: 'column', gap: 16 } },
           Card('Overview', h('div', null,
@@ -395,7 +505,28 @@
             h(Row, { k: 'OS type', v: cfg.ostype, mono: true }),
             h(Row, { k: 'Network', v: (cfg.net0 || '—').split(',')[0], mono: true }),
             h(Row, { k: 'Guest agent', v: live.agentRunning ? 'running' : (cfg.agent ? 'enabled' : 'off'), mono: true }),
-            h(Row, { k: 'Serial console', v: cfg.serial0 ? 'enabled' : 'not set', mono: true }))),
+            h(Row, { k: 'Serial console', v: cfg.serial0 ? 'enabled' : 'not set', mono: true })),
+            !locked && d.vmid && h('button', {
+              className: 'btn ghost sm', style: { marginLeft: 'auto' },
+              title: 'Change vCPU / RAM (VM must be stopped — like in Proxmox)',
+              onClick: () => setResize('config'),
+            }, h(Icon, { name: 'sliders', size: 14 }), 'Resize')),
+          (d.disks || []).length > 0 && Card('Disks', h('div', null,
+            d.disks.map((disk) => h('div', {
+              key: disk.key, className: 'row',
+              style: { gap: 10, padding: '5px 0', alignItems: 'center' },
+            },
+              h('span', { className: 'mono', style: { fontSize: 12.5, fontWeight: 600, minWidth: 56 } }, disk.key),
+              h('span', { className: 'hint mono', style: { fontSize: 11.5 } }, disk.storage),
+              h('span', { className: 'mono', style: { fontSize: 12.5, marginLeft: 'auto' } },
+                disk.sizeGb != null ? disk.sizeGb + ' G' : '—'),
+              !locked && h('button', {
+                className: 'btn ghost sm',
+                title: 'Grow this disk (online-safe; Proxmox cannot shrink)',
+                onClick: () => setResize({ disk }),
+              }, h(Icon, { name: 'plus', size: 13 }), 'Grow'))),
+            h('p', { className: 'hint', style: { fontSize: 11, marginTop: 6 } },
+              'Grow only. GoblinDock resizes the Proxmox disk — growing the partition/filesystem inside the OS is up to you.'))),
           d.hasRootPassword && Card('Access', h('div', null,
             h(Row, { k: 'Console user', v: d.credUser || 'root', mono: true }),
             h('div', { className: 'row', style: { justifyContent: 'space-between', gap: 12, padding: '5px 0' } },
@@ -423,16 +554,36 @@
                       h('div', { className: 'copy mono', style: { fontSize: 11.5 } }, (ifc.ips || []).join(', ') || '—')))))
             : Card('Guest agent', h('div', { className: 'hint', style: { fontSize: 12.5, padding: '4px 0' } },
                 running ? 'Waiting for qemu-guest-agent… (installed by GoblinDock on first boot)' : 'Start the VM to read guest info.')),
-          h(Snapshots, { depId, running }),
+          h(Snapshots, { depId, running, locked }),
           Card('Deployment log', h(DeployLog, { jobId: d.jobId }),
             d.jobId && h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => go('job', { jobId: d.jobId }) }, 'Open full log')))),
 
-      confirm && h(ConfirmModal, {
-        onClose: () => setConfirm(false), tone: 'danger', icon: 'trash',
-        title: 'Delete ' + d.name + '?',
-        body: 'This destroys the VM and its disk on ' + d.node + '. The IP returns to the pool. This cannot be undone.',
-        confirmLabel: 'Delete VM', onConfirm: destroy,
-      }));
+      resize === 'config' && h(ResizeConfigModal, {
+        depId, d, onClose: () => setResize(null),
+        onDone: () => { setResize(null); load(); window.GDStore.refresh().catch(() => {}); },
+      }),
+      resize && resize.disk && h(DiskGrowModal, {
+        depId, disk: resize.disk, onClose: () => setResize(null),
+        onDone: () => { setResize(null); load(); window.GDStore.refresh().catch(() => {}); },
+      }),
+
+      confirm === 'local'
+        ? h(ConfirmModal, {
+            onClose: () => setConfirm(false), tone: 'danger', icon: 'warn',
+            title: 'Clean up ' + d.name + ' locally?',
+            body: 'Removes only GoblinDock\'s record of this VM — NOTHING is deleted in Proxmox.'
+              + (d.connectionDisabled
+                ? ' Its connection is disabled, so GoblinDock cannot verify whether the VM still exists upstream.'
+                : ' GoblinDock refuses the cleanup if it can confirm the VM still exists upstream.')
+              + ' If the VM still exists on the node it keeps running unmanaged.',
+            confirmLabel: 'Remove local record', onConfirm: cleanupLocal,
+          })
+        : confirm && h(ConfirmModal, {
+            onClose: () => setConfirm(false), tone: 'danger', icon: 'trash',
+            title: 'Delete ' + d.name + '?',
+            body: 'This destroys the VM and its disk on ' + d.node + '. The IP returns to the pool. This cannot be undone.',
+            confirmLabel: 'Delete VM', onConfirm: destroy,
+          }));
   }
 
   window.VmDetail = VmDetail;

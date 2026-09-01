@@ -50,9 +50,16 @@ jobs:
         with:
           node-version: "20"
 
-      - name: JS syntax check
+      - name: JS syntax and UI behavior
         run: |
-          for f in web/*.js; do node --check "$f"; done
+          js_files=(web/*.js tests/test_wave37_ui.js tests/test_wave39_ui.js)
+          if [ "${#js_files[@]}" -ne 20 ]; then
+            echo "expected exactly 18 web scripts plus 2 UI test scripts; found ${#js_files[@]}" >&2
+            exit 1
+          fi
+          for f in "${js_files[@]}"; do node --check "$f"; done
+          node tests/test_wave37_ui.js
+          node tests/test_wave39_ui.js
 
   docker:
     name: docker build (verify Dockerfile)

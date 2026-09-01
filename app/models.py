@@ -32,6 +32,9 @@ class User(SQLModel, table=True):
     password_hash: str
     role: str = "user"  # admin | user
     disabled: bool = False
+    # Deleted accounts remain as inert tombstones so their integer primary keys can
+    # never be reused by SQLite (session cookies and historical ownership reference it).
+    deleted_at: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
     last_login: Optional[datetime] = None
     # bumped on every password change/reset → invalidates sessions signed under the old
@@ -66,10 +69,14 @@ class Connection(SQLModel, table=True):
     ssh_host: str = ""
     ssh_user: str = "root"
     ssh_key_path: str = ""  # optional; enables cloud-init snippet baking
-    # Per-target resource ceilings per VM (0 = inherit the global default).
+    # Per-target resource ceilings per VM (0 = unlimited).
     max_cores: int = 0
     max_ram_mb: int = 0
     max_disk_gb: int = 0
+    # Admin's persisted choice: a disabled source keeps its config and VM records but
+    # is never polled, offered as a target, or shown in normal inventory. Distinct
+    # from an ENABLED connection that is merely unreachable right now.
+    disabled: bool = False
     created_by: Optional[int] = None
     created_at: datetime = Field(default_factory=utcnow)
 
@@ -165,8 +172,10 @@ class Deployment(SQLModel, table=True):
     image_id: Optional[int] = None        # the base image this VM was built from
     template_id: Optional[int] = None     # optional template applied on top
     # ask-on-deploy answers, {"<si>.<bi>": {"<input>": value}} — kept on the row
-    # (not just the job) so a VM rebuild re-applies them.
-    deploy_inputs_json: str = "{}"
+    # (not just the job) so a VM rebuild re-applies them. Answers can hold literal
+    # credentials, so the JSON is Fernet-encrypted at rest ('' = none); see
+    # execution_plan.encrypt_deploy_inputs / open_deploy_inputs.
+    deploy_inputs_enc: str = ""
     vmid: Optional[int] = None
     node: str = ""
     network_id: Optional[int] = None
@@ -175,7 +184,7 @@ class Deployment(SQLModel, table=True):
     disk: int = 20        # GB
     ip: str = ""
     mac: str = ""
-    status: str = "working"  # running | stopped | working | error (live "unknown" serializes as stopped)
+    status: str = "working"  # running | stopped | working | error | cleanup_pending
     tags: str = ""
     notes: str = ""
     error: str = ""
@@ -183,6 +192,8 @@ class Deployment(SQLModel, table=True):
     root_password_enc: str = ""
     # OS user the password is for: 'root' (snippet path) | 'goblin' (native cloud-init fallback).
     cred_user: str = ""
+    cleanup_last_attempt_at: Optional[datetime] = None
+    cleanup_origin: Optional[str] = None  # deploy | destroy; only while cleanup_pending
     created_at: datetime = Field(default_factory=utcnow)
 
 
@@ -194,13 +205,16 @@ class Job(SQLModel, table=True):
     deployment_id: Optional[int] = None
     image_id: Optional[int] = None
     connection_id: Optional[int] = None
-    status: str = "queued"  # queued | running | succeeded | failed | canceled
+    status: str = "queued"  # queued | running | waiting | succeeded | failed | canceled
     pct: int = 0
     phase: str = ""
     created_by: Optional[int] = None
     cancel_requested: bool = False
     error: str = ""
     context_json: str = "{}"
+    # Encrypted admission-time recipe, accepted inputs, and block definitions.
+    execution_plan_enc: str = ""
+    waiting_since: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
     started_at: Optional[datetime] = None
     finished_at: Optional[datetime] = None

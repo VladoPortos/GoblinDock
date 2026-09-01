@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import json
 import logging
+import re
+from copy import deepcopy
 
-from sqlmodel import select
+from sqlmodel import Session, select
 
 from .config import settings
 from .db import session_scope
-from .models import Block, Connection, Image, Network, Template, User
+from .models import Block, Connection, Image, Network, Secret, Template, User
 from .security import encrypt, hash_password, password_problem
 
 log = logging.getLogger("goblindock")
@@ -1116,6 +1118,403 @@ BUILTIN_BLOCKS = [
             "if {disable_default}; then chmod -x /etc/update-motd.d/10-help-text /etc/update-motd.d/50-motd-news 2>/dev/null || true; fi"
         ),
     ),
+
+    # ---- networking (wave 52) ----
+    dict(
+        key="b-wireguard", name="WireGuard", category="Networking", icon="network",
+        section="Install", description="wg0 interface with one peer (site-to-site or road-warrior)",
+        input_schema=[
+            {"name": "address", "type": "text", "default": "10.8.0.2/24", "label": "Interface address (CIDR)"},
+            {"name": "private_key", "type": "secret", "default": "{{ secrets.WIREGUARD_PRIVATE_KEY }}", "label": "Private key"},
+            {"name": "listen_port", "type": "text", "default": "", "label": "Listen port · optional", "optional": True},
+            {"name": "peer_public_key", "type": "text", "default": "", "label": "Peer public key"},
+            {"name": "peer_endpoint", "type": "text", "default": "", "label": "Peer endpoint · host:port (optional)", "optional": True},
+            {"name": "peer_allowed_ips", "type": "text", "default": "0.0.0.0/0", "label": "Peer allowed IPs"},
+        ],
+        ansible=(
+            "- name: Install WireGuard\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard; else (dnf install -y wireguard-tools || yum install -y wireguard-tools); fi\n"
+            "- name: Configure wg0\n"
+            "  ansible.builtin.shell: |\n"
+            "    umask 077\n"
+            "    conf=/etc/wireguard/wg0.conf\n"
+            "    printf '[Interface]\\nAddress = %s\\nPrivateKey = %s\\n' {address_q} {private_key_q} > \"$conf\"\n"
+            "    if [ -n {listen_port_q} ]; then printf 'ListenPort = %s\\n' {listen_port_q} >> \"$conf\"; fi\n"
+            "    if [ -n {peer_public_key_q} ]; then\n"
+            "      printf '\\n[Peer]\\nPublicKey = %s\\nAllowedIPs = %s\\n' {peer_public_key_q} {peer_allowed_ips_q} >> \"$conf\"\n"
+            "      if [ -n {peer_endpoint_q} ]; then printf 'Endpoint = %s\\nPersistentKeepalive = 25\\n' {peer_endpoint_q} >> \"$conf\"; fi\n"
+            "    fi\n"
+            "    systemctl enable --now wg-quick@wg0\n"
+            "    systemctl restart wg-quick@wg0\n"
+            "  when: {private_key_set}"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard; else (dnf install -y wireguard-tools || yum install -y wireguard-tools); fi\n"
+            "umask 077\n"
+            "printf '[Interface]\\nAddress = %s\\nPrivateKey = %s\\n' {address} {private_key} > /etc/wireguard/wg0.conf\n"
+            "if [ -n {listen_port} ]; then printf 'ListenPort = %s\\n' {listen_port} >> /etc/wireguard/wg0.conf; fi\n"
+            "if [ -n {peer_public_key} ]; then printf '\\n[Peer]\\nPublicKey = %s\\nAllowedIPs = %s\\n' {peer_public_key} {peer_allowed_ips} >> /etc/wireguard/wg0.conf; fi\n"
+            "if [ -n {peer_endpoint} ]; then printf 'Endpoint = %s\\nPersistentKeepalive = 25\\n' {peer_endpoint} >> /etc/wireguard/wg0.conf; fi\n"
+            "systemctl enable --now wg-quick@wg0"
+        ),
+    ),
+    dict(
+        key="b-caddy", name="Caddy Reverse Proxy", category="Networking", icon="globe",
+        section="Install", description="automatic-HTTPS reverse proxy · one site → local upstream",
+        input_schema=[
+            {"name": "domain", "type": "text", "default": "", "label": "Site address · domain or :port"},
+            {"name": "upstream", "type": "text", "default": "localhost:8080", "label": "Upstream · host:port"},
+            {"name": "email", "type": "text", "default": "", "label": "ACME email · optional", "optional": True},
+            {"name": "internal_tls", "type": "bool", "default": False, "label": "Internal/self-signed TLS (no public ACME)"},
+        ],
+        ansible=(
+            "- name: Install Caddy\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then\n"
+            "      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg\n"
+            "      curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg\n"
+            "      curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list\n"
+            "      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy\n"
+            "    else\n"
+            "      dnf install -y 'dnf-command(copr)' && dnf copr enable -y @caddy/caddy && dnf install -y caddy\n"
+            "    fi\n"
+            "- name: Configure site\n"
+            "  ansible.builtin.shell: |\n"
+            "    cf=/etc/caddy/Caddyfile\n"
+            "    printf '%s {\\n' {domain_q} > \"$cf\"\n"
+            "    if {internal_tls}; then printf '  tls internal\\n' >> \"$cf\"; elif [ -n {email_q} ]; then printf '  tls %s\\n' {email_q} >> \"$cf\"; fi\n"
+            "    printf '  reverse_proxy %s\\n}\\n' {upstream_q} >> \"$cf\"\n"
+            "    caddy validate --config \"$cf\"\n"
+            "    systemctl enable --now caddy\n"
+            "    systemctl restart caddy\n"
+            "  when: {domain_set}"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy || true; fi\n"
+            "printf '%s {\\n  reverse_proxy %s\\n}\\n' {domain} {upstream} > /etc/caddy/Caddyfile\n"
+            "systemctl enable --now caddy && systemctl restart caddy"
+        ),
+    ),
+    dict(
+        key="b-nginxsite", name="Nginx Reverse Proxy Site", category="Networking", icon="server",
+        section="Install", description="one proxied site on port 80 (later placements overwrite it) · optional basic auth",
+        input_schema=[
+            {"name": "server_name", "type": "text", "default": "", "label": "server_name · domain or _"},
+            {"name": "upstream", "type": "text", "default": "localhost:8080", "label": "Upstream · host:port"},
+            {"name": "basic_user", "type": "text", "default": "", "label": "Basic-auth user · optional", "optional": True},
+            {"name": "basic_password", "type": "secret", "default": "", "label": "Basic-auth password · optional", "optional": True},
+        ],
+        ansible=(
+            "- name: Install nginx\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx; else (dnf install -y nginx || yum install -y nginx); fi\n"
+            "- name: Configure site\n"
+            "  ansible.builtin.shell: |\n"
+            "    cf=/etc/nginx/conf.d/goblindock-site.conf\n"
+            "    rm -f /etc/nginx/sites-enabled/default 2>/dev/null || true\n"
+            "    printf 'server {\\n  listen 80;\\n  server_name %s;\\n  location / {\\n' {server_name_q} > \"$cf\"\n"
+            "    if [ -n {basic_user_q} ] && [ -n {basic_password_q} ]; then\n"
+            "      printf '%s:%s\\n' {basic_user_q} \"$(openssl passwd -apr1 {basic_password_q})\" > /etc/nginx/.gd-htpasswd\n"
+            "      chmod 640 /etc/nginx/.gd-htpasswd; chown root:www-data /etc/nginx/.gd-htpasswd 2>/dev/null || true\n"
+            "      printf '    auth_basic \"Restricted\";\\n    auth_basic_user_file /etc/nginx/.gd-htpasswd;\\n' >> \"$cf\"\n"
+            "    fi\n"
+            "    printf '    proxy_pass http://%s;\\n    proxy_set_header Host $host;\\n    proxy_set_header X-Real-IP $remote_addr;\\n    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;\\n    proxy_set_header X-Forwarded-Proto $scheme;\\n    proxy_http_version 1.1;\\n    proxy_set_header Upgrade $http_upgrade;\\n    proxy_set_header Connection \"upgrade\";\\n  }\\n}\\n' {upstream_q} >> \"$cf\"\n"
+            "    nginx -t\n"
+            "    systemctl enable --now nginx\n"
+            "    systemctl reload nginx\n"
+            "  when: {server_name_set}"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx; else (dnf install -y nginx || yum install -y nginx); fi\n"
+            "printf 'server {\\n  listen 80;\\n  server_name %s;\\n  location / {\\n    proxy_pass http://%s;\\n    proxy_set_header Host $host;\\n  }\\n}\\n' {server_name} {upstream} > /etc/nginx/conf.d/goblindock-site.conf\n"
+            "nginx -t && systemctl enable --now nginx && systemctl reload nginx"
+        ),
+    ),
+    dict(
+        key="b-dns", name="DNS Servers", category="Networking", icon="network",
+        section="Configure", description="internal DNS + search domains (systemd-resolved distros)",
+        input_schema=[
+            {"name": "dns_servers", "type": "text", "default": "", "label": "DNS servers (space-separated)"},
+            {"name": "search_domains", "type": "text", "default": "", "label": "Search domains · optional", "optional": True},
+        ],
+        ansible=(
+            "- name: Configure DNS (systemd-resolved)\n"
+            "  ansible.builtin.shell: |\n"
+            "    mkdir -p /etc/systemd/resolved.conf.d\n"
+            "    conf=/etc/systemd/resolved.conf.d/goblindock.conf\n"
+            "    printf '[Resolve]\\nDNS=%s\\n' {dns_servers_q} > \"$conf\"\n"
+            "    if [ -n {search_domains_q} ]; then printf 'Domains=%s\\n' {search_domains_q} >> \"$conf\"; fi\n"
+            "    systemctl restart systemd-resolved || true\n"
+            "  when: {dns_servers_set}"
+        ),
+        cloudinit=(
+            "mkdir -p /etc/systemd/resolved.conf.d\n"
+            "printf '[Resolve]\\nDNS=%s\\n' {dns_servers} > /etc/systemd/resolved.conf.d/goblindock.conf\n"
+            "if [ -n {search_domains} ]; then printf 'Domains=%s\\n' {search_domains} >> /etc/systemd/resolved.conf.d/goblindock.conf; fi\n"
+            "systemctl restart systemd-resolved || true"
+        ),
+    ),
+    dict(
+        key="b-chrony", name="NTP (Chrony)", category="Networking", icon="clock",
+        section="Configure", description="sync time from your own NTP servers (isolated LANs)",
+        input_schema=[
+            {"name": "ntp_servers", "type": "text", "default": "", "label": "NTP servers (space-separated)"},
+        ],
+        ansible=(
+            "- name: Install chrony\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else (dnf install -y chrony || yum install -y chrony); fi\n"
+            "- name: Configure NTP sources\n"
+            "  ansible.builtin.shell: |\n"
+            "    conf=/etc/chrony/chrony.conf; [ -f \"$conf\" ] || conf=/etc/chrony.conf\n"
+            "    sed -i '/# BEGIN goblindock/,/# END goblindock/d' \"$conf\"\n"
+            "    { echo '# BEGIN goblindock'; for s in {ntp_servers}; do echo \"server $s iburst\"; done; echo '# END goblindock'; } >> \"$conf\"\n"
+            "    systemctl enable --now chronyd 2>/dev/null || systemctl enable --now chrony\n"
+            "    systemctl restart chronyd 2>/dev/null || systemctl restart chrony\n"
+            "  when: {ntp_servers_set}"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else (dnf install -y chrony || yum install -y chrony); fi\n"
+            "conf=/etc/chrony/chrony.conf; [ -f \"$conf\" ] || conf=/etc/chrony.conf\n"
+            "for s in {ntp_servers}; do echo \"server $s iburst\" >> \"$conf\"; done\n"
+            "systemctl restart chronyd 2>/dev/null || systemctl restart chrony"
+        ),
+    ),
+
+    # ---- monitoring (wave 52) ----
+    dict(
+        key="b-nodeexporter", name="Prometheus Node Exporter", category="Monitoring", icon="activity",
+        section="Install", description="host metrics on :9100 · optionally firewalled to your scrape host",
+        input_schema=[
+            {"name": "allow_from", "type": "text", "default": "",
+             "label": "Allow scrapes only from (CIDR/host, needs ufw) · optional", "optional": True},
+        ],
+        ansible=(
+            "- name: Install Node Exporter\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq prometheus-node-exporter; else (dnf install -y golang-github-prometheus-node_exporter || dnf install -y node_exporter || yum install -y node_exporter); fi\n"
+            "    systemctl enable --now prometheus-node-exporter 2>/dev/null || systemctl enable --now node_exporter\n"
+            "- name: Restrict scrape access\n"
+            "  ansible.builtin.shell: ufw allow from {allow_from_q} to any port 9100 proto tcp\n"
+            "  when: {allow_from_set}"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq prometheus-node-exporter; else (dnf install -y node_exporter || yum install -y node_exporter); fi\n"
+            "systemctl enable --now prometheus-node-exporter 2>/dev/null || systemctl enable --now node_exporter"
+        ),
+    ),
+    dict(
+        key="b-netdata", name="Netdata", category="Monitoring", icon="spark",
+        section="Install", description="full-host dashboard on :19999 · optional Netdata Cloud claim",
+        input_schema=[
+            {"name": "claim_token", "type": "secret", "default": "", "label": "Cloud claim token · optional", "optional": True},
+            {"name": "claim_rooms", "type": "text", "default": "", "label": "Cloud room id(s) · optional", "optional": True},
+            {"name": "claim_url", "type": "text", "default": "https://app.netdata.cloud", "label": "Cloud URL"},
+        ],
+        ansible=(
+            "- name: Install Netdata\n"
+            "  ansible.builtin.shell: |\n"
+            "    curl -fsSL https://get.netdata.cloud/kickstart.sh > /tmp/netdata-kickstart.sh\n"
+            "    if [ -n {claim_token_q} ] && [ -n {claim_rooms_q} ]; then\n"
+            "      sh /tmp/netdata-kickstart.sh --stable-channel --non-interactive --claim-token {claim_token_q} --claim-rooms {claim_rooms_q} --claim-url {claim_url_q}\n"
+            "    elif [ -n {claim_token_q} ]; then\n"
+            "      sh /tmp/netdata-kickstart.sh --stable-channel --non-interactive --claim-token {claim_token_q} --claim-url {claim_url_q}\n"
+            "    else\n"
+            "      sh /tmp/netdata-kickstart.sh --stable-channel --non-interactive\n"
+            "    fi\n"
+            "    rm -f /tmp/netdata-kickstart.sh"
+        ),
+        cloudinit=(
+            "curl -fsSL https://get.netdata.cloud/kickstart.sh > /tmp/netdata-kickstart.sh\n"
+            "sh /tmp/netdata-kickstart.sh --stable-channel --non-interactive\n"
+            "rm -f /tmp/netdata-kickstart.sh"
+        ),
+    ),
+    dict(
+        key="b-promtail", name="Log Shipping (Promtail)", category="Monitoring", icon="file",
+        section="Install", description="ship the systemd journal to a Loki endpoint",
+        input_schema=[
+            {"name": "loki_url", "type": "text", "default": "", "label": "Loki push URL · http://host:3100/loki/api/v1/push"},
+            {"name": "tenant", "type": "text", "default": "", "label": "Tenant id (X-Scope-OrgID) · optional", "optional": True},
+        ],
+        ansible=(
+            "- name: Install Promtail\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then\n"
+            "      mkdir -p /etc/apt/keyrings\n"
+            "      curl -fsSL https://apt.grafana.com/gpg.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/grafana.gpg\n"
+            "      echo 'deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main' > /etc/apt/sources.list.d/grafana.list\n"
+            "      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq promtail\n"
+            "    else\n"
+            "      printf '[grafana]\\nname=grafana\\nbaseurl=https://rpm.grafana.com\\nrepo_gpgcheck=1\\nenabled=1\\ngpgcheck=1\\ngpgkey=https://rpm.grafana.com/gpg.key\\n' > /etc/yum.repos.d/grafana.repo\n"
+            "      dnf install -y promtail || yum install -y promtail\n"
+            "    fi\n"
+            "- name: Configure Promtail\n"
+            "  ansible.builtin.shell: |\n"
+            "    mkdir -p /etc/promtail /var/lib/promtail\n"
+            "    f=/etc/promtail/config.yml\n"
+            "    {\n"
+            "      printf 'server:\\n  http_listen_port: 9080\\n  grpc_listen_port: 0\\n'\n"
+            "      printf 'positions:\\n  filename: /var/lib/promtail/positions.yaml\\n'\n"
+            "      printf 'clients:\\n  - url: %s\\n' {loki_url_q}\n"
+            "      if [ -n {tenant_q} ]; then printf '    tenant_id: %s\\n' {tenant_q}; fi\n"
+            "      printf 'scrape_configs:\\n  - job_name: journal\\n    journal:\\n      max_age: 12h\\n      labels:\\n        job: systemd-journal\\n    relabel_configs:\\n      - source_labels: [__journal__systemd_unit]\\n        target_label: unit\\n      - source_labels: [__journal__hostname]\\n        target_label: host\\n'\n"
+            "    } > \"$f\"\n"
+            "    systemctl enable --now promtail\n"
+            "    systemctl restart promtail\n"
+            "  when: {loki_url_set}"
+        ),
+        cloudinit=(
+            "echo 'Promtail: use the post-boot (ansible) phase for this block' >&2"
+        ),
+    ),
+
+    # ---- users / ssh + files (wave 52) ----
+    dict(
+        key="b-importsshkeys", name="Import SSH Keys (GitHub/GitLab)", category="Users / SSH", icon="key",
+        section="Configure", description="fetch a user's public keys from github.com / gitlab.com (or self-hosted)",
+        input_schema=[
+            {"name": "provider", "type": "select", "options": ["github", "gitlab"], "default": "github", "label": "Provider"},
+            {"name": "account", "type": "text", "default": "", "label": "Account username"},
+            {"name": "user", "type": "text", "default": "deploy", "label": "Target user"},
+            {"name": "base_url", "type": "text", "default": "", "label": "Self-hosted URL · optional (e.g. https://git.example.com)", "optional": True},
+        ],
+        ansible=(
+            "- name: Import SSH keys\n"
+            "  ansible.builtin.shell: |\n"
+            "    base={base_url_q}\n"
+            "    if [ -z \"$base\" ]; then if [ {provider_q} = gitlab ]; then base=https://gitlab.com; else base=https://github.com; fi; fi\n"
+            "    base=${base%/}\n"
+            "    home=$(getent passwd {user_q} | cut -d: -f6); [ -n \"$home\" ]\n"
+            "    install -d -m700 \"$home/.ssh\"\n"
+            "    curl -fsSL \"$base/\"{account_q}\".keys\" >> \"$home/.ssh/authorized_keys\"\n"
+            "    awk '!seen[$0]++' \"$home/.ssh/authorized_keys\" > \"$home/.ssh/authorized_keys.tmp\"\n"
+            "    mv \"$home/.ssh/authorized_keys.tmp\" \"$home/.ssh/authorized_keys\"\n"
+            "    chmod 600 \"$home/.ssh/authorized_keys\"\n"
+            "    chown -R {user_q}:{user_q} \"$home/.ssh\"\n"
+            "  when: {account_set}"
+        ),
+        cloudinit=(
+            "base={base_url}\n"
+            "if [ -z \"$base\" ]; then if [ {provider} = gitlab ]; then base=https://gitlab.com; else base=https://github.com; fi; fi\n"
+            "home=$(getent passwd {user} | cut -d: -f6)\n"
+            "install -d -m700 \"$home/.ssh\"\n"
+            "curl -fsSL \"$base/\"{account}\".keys\" >> \"$home/.ssh/authorized_keys\"\n"
+            "chmod 600 \"$home/.ssh/authorized_keys\"; chown -R {user}:{user} \"$home/.ssh\""
+        ),
+    ),
+    dict(
+        key="b-gitclient", name="Git Client + Token", category="Files", icon="code",
+        section="Configure", description="git identity + stored HTTPS token for GitHub/GitLab private repos",
+        input_schema=[
+            {"name": "user", "type": "text", "default": "deploy", "label": "Target user"},
+            {"name": "git_name", "type": "text", "default": "", "label": "git user.name"},
+            {"name": "git_email", "type": "text", "default": "", "label": "git user.email"},
+            {"name": "provider", "type": "select", "options": ["github.com", "gitlab.com"], "default": "github.com", "label": "Provider"},
+            {"name": "host", "type": "text", "default": "", "label": "Self-hosted host · optional (overrides provider)", "optional": True},
+            {"name": "account", "type": "text", "default": "", "label": "Account login"},
+            {"name": "token", "type": "secret", "default": "{{ secrets.GIT_TOKEN }}", "label": "Access token (PAT)"},
+        ],
+        ansible=(
+            "- name: Configure git client\n"
+            "  ansible.builtin.shell: |\n"
+            "    home=$(getent passwd {user_q} | cut -d: -f6); [ -n \"$home\" ]\n"
+            "    ghost={host_q}; [ -n \"$ghost\" ] || ghost={provider_q}\n"
+            "    ghost=${ghost#https://}; ghost=${ghost%/}\n"
+            "    command -v git >/dev/null || { if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; else (dnf install -y git || yum install -y git); fi; }\n"
+            "    HOME=\"$home\" git config --global user.name {git_name_q}\n"
+            "    HOME=\"$home\" git config --global user.email {git_email_q}\n"
+            "    HOME=\"$home\" git config --global credential.helper store\n"
+            "    umask 077\n"
+            "    printf 'https://%s:%s@%s\\n' {account_q} {token_q} \"$ghost\" > \"$home/.git-credentials\"\n"
+            "    chown {user_q}:{user_q} \"$home/.gitconfig\" \"$home/.git-credentials\"\n"
+            "    chmod 600 \"$home/.git-credentials\"\n"
+            "  when: {token_set}"
+        ),
+        cloudinit=(
+            "home=$(getent passwd {user} | cut -d: -f6)\n"
+            "ghost={host}; [ -n \"$ghost\" ] || ghost={provider}\n"
+            "HOME=\"$home\" git config --global user.name {git_name}\n"
+            "HOME=\"$home\" git config --global user.email {git_email}\n"
+            "HOME=\"$home\" git config --global credential.helper store\n"
+            "umask 077\n"
+            "printf 'https://%s:%s@%s\\n' {account} {token} \"$ghost\" > \"$home/.git-credentials\"\n"
+            "chown {user}:{user} \"$home/.gitconfig\" \"$home/.git-credentials\"; chmod 600 \"$home/.git-credentials\""
+        ),
+    ),
+    dict(
+        key="b-nfsexport", name="NFS Export", category="Files", icon="disk",
+        section="Install", description="export a directory over NFS (server-side of Mount Network Share)",
+        input_schema=[
+            {"name": "path", "type": "text", "default": "/srv/share", "label": "Directory to export"},
+            {"name": "clients", "type": "text", "default": "192.168.1.0/24", "label": "Allowed clients · CIDR or host"},
+            {"name": "options", "type": "text", "default": "rw,sync,no_subtree_check", "label": "Export options"},
+        ],
+        ansible=(
+            "- name: Install NFS server\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server; else (dnf install -y nfs-utils || yum install -y nfs-utils); fi\n"
+            "- name: Export directory\n"
+            "  ansible.builtin.shell: |\n"
+            "    mkdir -p {path_q}\n"
+            "    touch /etc/exports\n"
+            "    awk -v p={path_q} '$1 != p' /etc/exports > /etc/exports.tmp\n"
+            "    printf '%s %s(%s)\\n' {path_q} {clients_q} {options_q} >> /etc/exports.tmp\n"
+            "    mv /etc/exports.tmp /etc/exports\n"
+            "    systemctl enable --now nfs-server 2>/dev/null || systemctl enable --now nfs-kernel-server\n"
+            "    exportfs -ra"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server; else (dnf install -y nfs-utils || yum install -y nfs-utils); fi\n"
+            "mkdir -p {path}\n"
+            "printf '%s %s(%s)\\n' {path} {clients} {options} >> /etc/exports\n"
+            "systemctl enable --now nfs-server 2>/dev/null || systemctl enable --now nfs-kernel-server\n"
+            "exportfs -ra"
+        ),
+    ),
+    dict(
+        key="b-sambashare", name="Samba Share", category="Files", icon="disk",
+        section="Install", description="SMB share for Windows/macOS clients · password auth or guest",
+        input_schema=[
+            {"name": "share_name", "type": "text", "default": "share", "label": "Share name (letters/digits)"},
+            {"name": "path", "type": "text", "default": "/srv/share", "label": "Directory to share"},
+            {"name": "smb_user", "type": "text", "default": "deploy", "label": "Samba user (existing account)"},
+            {"name": "smb_password", "type": "secret", "default": "{{ secrets.SMB_PASSWORD }}", "label": "Samba password"},
+            {"name": "writable", "type": "bool", "default": True, "label": "Writable"},
+            {"name": "guest", "type": "bool", "default": False, "label": "Guest access (no auth)"},
+        ],
+        ansible=(
+            "- name: Install Samba\n"
+            "  ansible.builtin.shell: |\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq samba; else (dnf install -y samba || yum install -y samba); fi\n"
+            "- name: Configure share\n"
+            "  ansible.builtin.shell: |\n"
+            "    mkdir -p {path_q}\n"
+            "    conf=/etc/samba/smb.conf\n"
+            "    sn=$(printf '%s' {share_name_q} | tr -c 'A-Za-z0-9_' '_')\n"
+            "    sed -i \"/^# BEGIN gd-$sn\\$/,/^# END gd-$sn\\$/d\" \"$conf\"\n"
+            "    {\n"
+            "      printf '# BEGIN gd-%s\\n[%s]\\n  path = %s\\n' \"$sn\" {share_name_q} {path_q}\n"
+            "      if {writable}; then printf '  read only = no\\n'; else printf '  read only = yes\\n'; fi\n"
+            "      if {guest}; then printf '  guest ok = yes\\n  map to guest = Bad User\\n'; else printf '  guest ok = no\\n  valid users = %s\\n' {smb_user_q}; fi\n"
+            "      printf '# END gd-%s\\n' \"$sn\"\n"
+            "    } >> \"$conf\"\n"
+            "    if ! {guest} && [ -n {smb_user_q} ] && [ -n {smb_password_q} ]; then\n"
+            "      printf '%s\\n%s\\n' {smb_password_q} {smb_password_q} | smbpasswd -s -a {smb_user_q}\n"
+            "    fi\n"
+            "    testparm -s >/dev/null\n"
+            "    systemctl enable --now smbd 2>/dev/null || systemctl enable --now smb\n"
+            "    systemctl restart smbd 2>/dev/null || systemctl restart smb"
+        ),
+        cloudinit=(
+            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq samba; else (dnf install -y samba || yum install -y samba); fi\n"
+            "mkdir -p {path}\n"
+            "printf '[%s]\\n  path = %s\\n  read only = no\\n  guest ok = no\\n  valid users = %s\\n' {share_name} {path} {smb_user} >> /etc/samba/smb.conf\n"
+            "printf '%s\\n%s\\n' {smb_password} {smb_password} | smbpasswd -s -a {smb_user}\n"
+            "systemctl restart smbd 2>/dev/null || systemctl restart smb"
+        ),
+    ),
 ]
 
 
@@ -1125,7 +1524,84 @@ BUILTIN_BLOCKS = [
 _CLOUDINIT_BLOCKS = {"b-os", "b-clean", "b-conpw", "b-swap"}
 
 
+def _migrate_b_ssh_recipe(recipe: list[dict]) -> tuple[list[dict], bool]:
+    """Move legacy ``b-ssh`` placements to the unified ``b-user`` contract.
+
+    Recipes are user-authored JSON, so preserve their complete placement/section
+    envelopes and only rewrite a well-formed placement whose reference is exactly
+    ``b-ssh``.  The returned recipe is always a deep copy, including when no
+    migration is needed.
+    """
+    migrated = deepcopy(recipe)
+    allowed_asks = {
+        "user", "password", "public_key", "groups", "home", "shell",
+        "sudoers", "nopasswd", "ssh_password_login",
+    }
+    changed = False
+    if not isinstance(migrated, list):
+        return migrated, changed
+
+    for section in migrated:
+        if not isinstance(section, dict):
+            continue
+        blocks = section.get("blocks")
+        if not isinstance(blocks, list):
+            continue
+        for placed in blocks:
+            if not isinstance(placed, dict) or placed.get("ref") != "b-ssh":
+                continue
+            inputs = placed.get("inputs")
+            if not isinstance(inputs, dict):
+                continue
+            asks = placed.get("ask")
+            if "ask" in placed and not isinstance(asks, list):
+                continue
+
+            placed["ref"] = "b-user"
+            placed["inputs"] = {
+                "user": inputs.get("user", ""),
+                "password": inputs.get("password", ""),
+                "public_key": inputs.get("public_key", ""),
+                "ssh_password_login": inputs.get("ssh_password_login", False),
+                "shell": "/bin/bash",
+                "home": "",
+                "groups": ["sudo"],
+                "sudoers": True,
+                "nopasswd": inputs.get("sudo", False),
+            }
+            if "ask" in placed:
+                placed["ask"] = [
+                    "nopasswd" if name == "sudo" else name
+                    for name in asks
+                    if isinstance(name, str)
+                    and (name == "sudo" or name in allowed_asks)
+                ]
+            changed = True
+    return migrated, changed
+
+
 def seed_blocks() -> None:
+    # Migrate persisted recipes before pruning the old b-ssh Block row. This must
+    # not depend on the legacy row still existing in the catalog.
+    with session_scope() as s:
+        migrated_any = False
+        for template in s.exec(select(Template)).all():
+            try:
+                recipe = json.loads(template.recipe_json or "[]")
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if not isinstance(recipe, list):
+                continue
+            migrated, changed = _migrate_b_ssh_recipe(recipe)
+            if changed:
+                template.recipe_json = json.dumps(migrated)
+                s.add(template)
+                migrated_any = True
+        if migrated_any:
+            # Commit separately so the repaired recipe is durable before the
+            # subsequent transaction removes obsolete built-in metadata.
+            s.commit()
+
     with session_scope() as s:
         existing = {b.key: b for b in s.exec(select(Block)).all()}
         # Prune built-in blocks that were removed from the catalog (e.g. b-ssh, merged
@@ -1205,9 +1681,11 @@ def seed_base_image() -> None:
 
 def maybe_seed_admin() -> None:
     with session_scope() as s:
-        if s.exec(select(User)).first():
+        if s.exec(select(User.id).where(User.deleted_at.is_(None))).first():
             return
-        if settings.admin_email and settings.admin_password:
+        email = (settings.admin_email or "").strip().lower()
+        name = (settings.admin_name or "").strip() or "Admin"
+        if email and settings.admin_password:
             # Hold the env-seeded admin to the same password policy as every interactive
             # path (web setup, /users, resets). A weak bootstrap password would otherwise
             # create an unchecked internet-facing admin. Rather than fail boot, skip the
@@ -1221,7 +1699,7 @@ def maybe_seed_admin() -> None:
                     "the env admin; fix the value or use first-run web setup instead.")
                 return
             s.add(User(
-                email=settings.admin_email, name=settings.admin_name,
+                email=email, name=name,
                 password_hash=hash_password(settings.admin_password), role="admin",
             ))
 
@@ -1249,17 +1727,57 @@ def maybe_seed_proxmox() -> None:
         ))
 
 
+def backfill_starter_template_location(session: Session) -> bool:
+    """Assign a deterministic compatible location to the system starter only.
+
+    The caller owns flush/commit. Existing connection choices are operator state and
+    therefore never repaired here, even when their network is absent or invalid.
+    """
+    with session.no_autoflush:
+        starter = session.exec(select(Template).where(
+            Template.name == "AI Dev Box",
+            Template.owner_id.is_(None),
+        ).order_by(Template.id)).first()
+        if starter is None or starter.connection_id is not None:
+            return False
+
+        if starter.network_id is not None:
+            network = session.get(Network, starter.network_id)
+            if network is None:
+                return False
+            connection = session.get(Connection, network.connection_id)
+            if connection is None:
+                return False
+            starter.connection_id = connection.id
+            return True
+
+        connection = session.exec(select(Connection).order_by(Connection.id)).first()
+        if connection is None:
+            return False
+        network = session.exec(select(Network).where(
+            Network.connection_id == connection.id,
+        ).order_by(Network.id)).first()
+        if network is None:
+            return False
+
+        starter.connection_id = connection.id
+        starter.network_id = network.id
+        return True
+
+
 def seed_templates() -> None:
     """A public starter template so AI dev boxes are one click away. The hostname
     block is ask-on-deploy — the demo shows off deploy-time prompts out of the box.
-    Wired to the seeded Ubuntu base image; deployable the moment a Proxmox connection
-    exists (the dev seed's connection is linked when present)."""
+    Wired to the seeded Ubuntu base image. Location remains null until startup has
+    ensured that a compatible connection/network pair exists."""
     with session_scope() as s:
-        if s.exec(select(Template).where(Template.name == "AI Dev Box")).first():
+        if s.exec(select(Template).where(
+                Template.name == "AI Dev Box",
+                Template.owner_id.is_(None),
+        ).order_by(Template.id)).first():
             return
         base = s.exec(select(Image).where(
             Image.kind == "base", Image.os_family == "ubuntu")).first()
-        conn = s.exec(select(Connection)).first()
         recipe = [
             {"id": "s-os", "name": "OS Setup", "blocks": [
                 {"ref": "b-hostname", "name": "Set Hostname",
@@ -1282,7 +1800,6 @@ def seed_templates() -> None:
             description="Node.js + Claude Code + OpenAI Codex + a global CLAUDE.md — a ready-to-code box.",
             os_family="ubuntu", recipe_json=json.dumps(recipe),
             base_image_id=base.id if base else None,
-            connection_id=conn.id if conn else None,
             default_cpu=1, default_ram=2, default_disk=20, public=True, owner_id=None,
         ))
 
@@ -1298,10 +1815,87 @@ def seed_default_networks() -> None:
                               bridge=c.bridge or "vmbr0", created_by=c.created_by))
 
 
+def migrate_template_literal_secrets() -> None:
+    """2026-09: literal values typed into password/secret template inputs used to sit
+    in plaintext in templates.recipe_json (and every backup of it). Move each literal
+    into the owner's encrypted Secret store and leave a ``{{ secrets.NAME }}``
+    reference in the recipe. Idempotent: references and empty values are skipped, so
+    a migrated recipe never matches again."""
+    from .recipes import is_deployer_secret_ref, load_recipe, normalize_input_schema
+
+    with session_scope() as s:
+        templates = s.exec(select(Template)).all()
+        if not templates:
+            return
+        blocks = {b.key: b for b in s.exec(select(Block)).all()}
+        migrated = 0
+        for tpl in templates:
+            recipe = load_recipe(tpl.recipe_json)
+            changed = False
+            for si, section in enumerate(recipe):
+                if not isinstance(section, dict):
+                    continue
+                placements = section.get("blocks") or []
+                if not isinstance(placements, list):
+                    continue
+                for bi, placed in enumerate(placements):
+                    if not isinstance(placed, dict):
+                        continue
+                    block = blocks.get(placed.get("ref"))
+                    if not block:
+                        continue
+                    try:
+                        schema = normalize_input_schema(
+                            json.loads(block.input_schema_json or "[]"))
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+                    sensitive = {
+                        field.get("name") for field in schema
+                        if isinstance(field, dict)
+                        and isinstance(field.get("name"), str)
+                        and field.get("type") in ("password", "secret")
+                    }
+                    inputs = placed.get("inputs")
+                    if not sensitive or not isinstance(inputs, dict):
+                        continue
+                    for name in sorted(sensitive):
+                        value = inputs.get(name)
+                        if (not isinstance(value, str) or not value
+                                or is_deployer_secret_ref(value)):
+                            continue
+                        scope = "user" if tpl.owner_id is not None else "global"
+                        base_name = re.sub(
+                            r"[^A-Za-z0-9_]", "_", f"TPL{tpl.id}_{name}",
+                        ).upper()
+                        secret_name = base_name
+                        counter = 2
+                        while s.exec(select(Secret).where(
+                                Secret.name == secret_name, Secret.scope == scope,
+                                Secret.owner_id == tpl.owner_id)).first():
+                            secret_name = f"{base_name}_{counter}"
+                            counter += 1
+                        s.add(Secret(
+                            name=secret_name, value_enc=encrypt(value), scope=scope,
+                            owner_id=tpl.owner_id, created_by=tpl.owner_id,
+                        ))
+                        inputs[name] = "{{ secrets." + secret_name + " }}"
+                        changed = True
+                        migrated += 1
+            if changed:
+                tpl.recipe_json = json.dumps(recipe)
+                s.add(tpl)
+        if migrated:
+            log.info("migrated: %d literal template credential(s) moved into the "
+                     "encrypted secret store", migrated)
+
+
 def run_all_seeds() -> None:
     seed_blocks()
     seed_base_image()
     maybe_seed_admin()
     maybe_seed_proxmox()
-    seed_templates()          # after seed_base_image + maybe_seed_proxmox so the template can wire both
+    seed_templates()          # definition only; location is assigned after networks exist
     seed_default_networks()   # after maybe_seed_proxmox so the seeded connection gets one
+    migrate_template_literal_secrets()
+    with session_scope() as s:
+        backfill_starter_template_location(s)

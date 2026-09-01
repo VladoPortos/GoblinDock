@@ -8,11 +8,17 @@ import hmac
 import ipaddress
 import json
 import logging
+import os
+import platform
 import re
 import secrets as _secrets
+import shutil
 import socket
 import threading
 import time
+from collections import OrderedDict
+from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from functools import lru_cache
 from typing import Optional
@@ -21,13 +27,20 @@ from urllib.parse import urlparse
 from fastapi import APIRouter, Depends, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import func, or_
+from sqlalchemy import case, func, or_, update
 from sqlmodel import Session, select
 
 from .config import settings
 from .db import engine, get_session
+from .execution_plan import (
+    build_execution_plan,
+    encrypt_deploy_inputs,
+    open_deploy_inputs,
+    seal_execution_plan,
+)
 from .deps import current_user, require_admin, widget_key_user
 from .netutil import client_ip, current_request_ip
+from .network_pool import StaticPool, StaticPoolError, parse_static_pool
 from .models import (
     Audit,
     Block,
@@ -45,8 +58,28 @@ from .models import (
     ensure_utc,
     utcnow,
 )
-from .proxmox import Proxmox, base_disk_filename
-from .recipes import ask_map, compile_playbook, lint_block, load_recipe
+from .proxmox import (
+    VM_ABSENT,
+    VM_PRESENT,
+    VM_UNKNOWN,
+    Proxmox,
+    base_disk_filename,
+    probe_vm_presence,
+)
+from .recipes import (
+    ask_map,
+    compile_playbook,
+    input_schema_problems,
+    lint_block,
+    load_recipe,
+    normalize_input_schema,
+    reject_cross_owner_hidden_references,
+    validate_public_sensitive_inputs,
+)
+from .seed import backfill_starter_template_location
+from .scheduler import scheduler_health
+from .worker import worker_health
+from . import __version__
 from . import backup
 from . import statebus
 from .security import (
@@ -143,6 +176,19 @@ def _has_control_chars(s: str) -> bool:
 _CHECKSUM_ALGO = {32: "md5", 40: "sha1", 64: "sha256", 96: "sha384", 128: "sha512"}
 
 
+def _clean_checksum(value: str) -> str:
+    checksum = (value or "").strip().lower()
+    if not checksum:
+        return ""
+    if len(checksum) not in _CHECKSUM_ALGO or not re.fullmatch(r"[0-9a-f]+", checksum):
+        raise HTTPException(
+            400,
+            "invalid checksum: enter a bare hexadecimal digest with "
+            "32, 40, 64, 96 or 128 characters",
+        )
+    return checksum
+
+
 def _checksum_algo(checksum: str) -> str:
     cs = (checksum or "").strip().lower()
     return _CHECKSUM_ALGO.get(len(cs), "") if re.fullmatch(r"[0-9a-f]*", cs) else ""
@@ -216,35 +262,65 @@ def default_network_for(session: Session, conn: Connection, user_id) -> Network:
 _ip_alloc_lock = threading.Lock()
 
 
+def _static_pool(net: Network) -> StaticPool:
+    try:
+        return parse_static_pool(
+            net.subnet_cidr, net.range_start, net.range_end, net.gateway,
+        )
+    except StaticPoolError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
 def allocate_ip(session: Session, net: Network, deployment_id: int) -> Optional[str]:
     """Static-pool allocation: next free IP in range, remembered on the deployment."""
-    if net.mode != "static" or not net.range_start:
+    if net.mode != "static":
         return None
+    pool = _static_pool(net)
     with _ip_alloc_lock:
         # reuse an existing reservation for this deployment (rebuild keeps the IP)
         existing = session.exec(select(IpAllocation).where(
             IpAllocation.network_id == net.id, IpAllocation.deployment_id == deployment_id)).first()
         if existing:
-            return existing.ip
-        taken = {a.ip for a in session.exec(select(IpAllocation).where(
-            IpAllocation.network_id == net.id, IpAllocation.state == "reserved")).all()}
-        try:
-            start = ipaddress.ip_address(net.range_start)
-            end = ipaddress.ip_address(net.range_end or net.range_start)
-        except ValueError:
-            return None
-        cur = start
-        while int(cur) <= int(end):
-            ip = str(cur)
-            if ip not in taken:
-                session.add(IpAllocation(network_id=net.id, ip=ip,
-                                         deployment_id=deployment_id, state="reserved"))
+            try:
+                existing_address = ipaddress.ip_address(existing.ip)
+            except ValueError:
+                existing_address = None
+            if existing.state == "reserved" and existing_address is not None and \
+                    existing_address.version == pool.network.version and \
+                    pool.start <= existing_address <= pool.end and \
+                    not pool.is_reserved(existing_address):
+                return existing.ip
+
+        allocations = session.exec(select(IpAllocation).where(
+            IpAllocation.network_id == net.id)).all()
+        taken = set()
+        for allocation in allocations:
+            if existing is not None and allocation.id == existing.id:
+                continue
+            try:
+                address = ipaddress.ip_address(allocation.ip)
+            except ValueError:
+                continue
+            if address.version == pool.network.version:
+                taken.add(address)
+        for address in pool.iter_usable():
+            if address not in taken:
+                ip = str(address)
+                if existing is None:
+                    session.add(IpAllocation(
+                        network_id=net.id, ip=ip,
+                        deployment_id=deployment_id, state="reserved",
+                    ))
+                else:
+                    existing.ip = ip
+                    existing.state = "reserved"
+                    session.add(existing)
                 # Join the caller's transaction. Deployment admission holds
-                # `_deploy_lock` until its final commit, so the next waiter cannot read
-                # past this uncommitted reservation in the single-process runtime.
+                # `_lifecycle_admission_lock` until its final commit, so the next
+                # waiter cannot read past this uncommitted reservation in the
+                # single-process runtime.
                 session.flush()
                 return ip
-            cur = cur + 1
         raise HTTPException(409, "static IP pool exhausted")
 
 
@@ -256,11 +332,15 @@ def _network_ctx(session: Session, net: Network, dep_id: int) -> dict:
     re-acquires the same address."""
     ctx: dict = {"network_mode": net.mode}
     if net.mode == "static":
-        ip = allocate_ip(session, net, dep_id)   # commits the reservation internally
-        if ip:
-            ctx["static_ip"] = ip
-            cidr = net.subnet_cidr.split("/")[-1] if "/" in (net.subnet_cidr or "") else "24"
-            ctx["ipconfig0"] = f"ip={ip}/{cidr},gw={net.gateway}"
+        pool = _static_pool(net)
+        ip = allocate_ip(session, net, dep_id)
+        ctx["static_ip"] = ip
+        ip_key = "ip6" if pool.network.version == 6 else "ip"
+        gateway_key = "gw6" if pool.network.version == 6 else "gw"
+        ipconfig0 = f"{ip_key}={ip}/{pool.network.prefixlen}"
+        if pool.gateway is not None:
+            ipconfig0 += f",{gateway_key}={pool.gateway}"
+        ctx["ipconfig0"] = ipconfig0
     if net.vlan:
         ctx["vlan"] = net.vlan
     if net.bridge:
@@ -285,6 +365,8 @@ def _build_job_ctx(session: Session, base: Image, cpu: int, ram: int, disk: int,
 # helpers                                                                      #
 # --------------------------------------------------------------------------- #
 def _maps(session: Session):
+    # Keep tombstones in this reference map so historical VMs/jobs/templates retain a
+    # stable, scrubbed owner rather than becoming detached from a reused integer ID.
     users = {u.id: u for u in session.exec(select(User)).all()}
     conns = {c.id: c for c in session.exec(select(Connection)).all()}
     return users, conns
@@ -293,11 +375,23 @@ def _maps(session: Session):
 def _px_cache(conns: dict) -> dict:
     cache = {}
     for cid, c in conns.items():
+        if c.disabled:
+            continue  # an admin-disabled source is never probed or targeted
         try:
             cache[cid] = Proxmox(c)
         except Exception:  # noqa: BLE001
             pass
     return cache
+
+
+def _reject_disabled_connection(conn: Optional[Connection], *, detail: str = "") -> None:
+    """New operations must not target an admin-disabled Proxmox source. Distinct
+    from an unreachable connection: this is a persisted operator choice."""
+    if conn is not None and conn.disabled:
+        raise HTTPException(
+            409, detail or f"Proxmox connection {conn.name!r} is disabled — "
+                           "enable it in Settings first",
+        )
 
 
 # Short-TTL cache for the per-connection /version probe on /state. SSE-driven refetches
@@ -354,22 +448,11 @@ def _owned_deployment(session: Session, dep_id: int, user: User) -> Deployment:
     return dep
 
 
-def _active_job_for(session: Session, dep_id: int) -> Optional[Job]:
-    """The queued/running job for a deployment, if any. Used to reject a second
-    lifecycle job for the same VM — the single worker drains jobs serially, so an
-    unbounded flood of rebuild/destroy jobs for one deployment would otherwise starve
-    every other tenant's work (and grow the jobs table without bound)."""
-    return session.exec(
-        select(Job).where(Job.deployment_id == dep_id,
-                          Job.status.in_(("queued", "running"))).order_by(Job.id.desc())
-    ).first()
-
-
 # --------------------------------------------------------------------------- #
 # auth                                                                          #
 # --------------------------------------------------------------------------- #
 class LoginBody(BaseModel):
-    email: str
+    email: str = Field(max_length=320)
     password: str
 
 
@@ -384,13 +467,18 @@ class SetupBody(BaseModel):
 def auth_status(request: Request, session: Session = Depends(get_session)):
     # Always 200 (never 401), so the client can cheaply re-verify after a stray 401
     # without that very check tripping the "drop to login" path.
-    has_users = session.exec(select(User)).first() is not None
+    has_users = session.exec(
+        select(User.id).where(User.deleted_at.is_(None))
+    ).first() is not None
     uid = request.session.get("uid")
     authed = False
     if uid:
         u = session.get(User, uid)
         # mirror current_user: a stale session epoch (post password-change) is NOT authed
-        authed = bool(u and not u.disabled and request.session.get("sv", 0) == u.session_epoch)
+        authed = bool(
+            u and not u.disabled and u.deleted_at is None
+            and request.session.get("sv", 0) == u.session_epoch
+        )
     return {"needsSetup": not has_users, "authenticated": authed}
 
 
@@ -437,7 +525,7 @@ def announce_setup_token(session: Session) -> None:
 def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get_session)):
     global _setup_token
     with _setup_lock:
-        if session.exec(select(User)).first():
+        if session.exec(select(User.id).where(User.deleted_at.is_(None))).first():
             raise HTTPException(400, "already initialised")
         # Gate the unauthenticated first-run window with the log-only token (prod only).
         if not settings.dev_mode:
@@ -459,36 +547,71 @@ def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get
 
 
 # Tiny in-memory login throttle (per email+ip). Resets on restart — fine for v1.
-_login_attempts: dict[str, list[float]] = {}
+_login_attempts: OrderedDict[str, list[float]] = OrderedDict()
+_login_attempts_lock = threading.Lock()
 _MAX_THROTTLE_KEYS = 10_000
 
 
 def _throttle(key: str) -> None:
     now = time.time()
-    window = [t for t in _login_attempts.get(key, []) if now - t < 300]
-    if window:
-        _login_attempts[key] = window
-    else:
-        # Don't keep empty windows around — the key is f"{email}|{ip}" with an
-        # unvalidated email, so a stream of unique emails would otherwise grow the
-        # dict without bound (unauthenticated memory-growth DoS).
-        _login_attempts.pop(key, None)
-    # Opportunistic sweep once the dict is large: drop every key whose window is empty
-    # or fully outside the 5-min horizon. Keeps memory bounded under an attack.
-    if len(_login_attempts) > _MAX_THROTTLE_KEYS:
-        for k, ts in list(_login_attempts.items()):
-            if not ts or now - ts[-1] >= 300:
-                _login_attempts.pop(k, None)
-    if len(window) >= 8:
-        raise HTTPException(429, "too many attempts — try again in a few minutes")
+    with _login_attempts_lock:
+        window = [t for t in _login_attempts.get(key, []) if now - t < 300]
+        if window:
+            _login_attempts[key] = window
+            _login_attempts.move_to_end(key)
+        else:
+            _login_attempts.pop(key, None)
+        # `_record_attempt` enforces this after every public mutation. Retain a
+        # defensive trim for tests/diagnostics or accidental direct mutation, removing
+        # expired entries before evicting the least-recently-used live windows.
+        if len(_login_attempts) > _MAX_THROTTLE_KEYS:
+            for stale_key, timestamps in list(_login_attempts.items()):
+                if not timestamps or now - timestamps[-1] >= 300:
+                    _login_attempts.pop(stale_key, None)
+            while len(_login_attempts) > _MAX_THROTTLE_KEYS:
+                _login_attempts.popitem(last=False)
+        if len(window) >= 8:
+            raise HTTPException(429, "too many attempts — try again in a few minutes")
 
 
 def _record_attempt(key: str) -> None:
-    _login_attempts.setdefault(key, []).append(time.time())
+    with _login_attempts_lock:
+        _login_attempts.setdefault(key, []).append(time.time())
+        _login_attempts.move_to_end(key)
+        while len(_login_attempts) > _MAX_THROTTLE_KEYS:
+            _login_attempts.popitem(last=False)
+
+
+def _clear_login_attempts(key: str) -> None:
+    with _login_attempts_lock:
+        _login_attempts.pop(key, None)
 
 
 _LOCK_THRESHOLD = 5      # consecutive failures before a temporary lock
 _LOCK_MINUTES = 15
+
+
+def _record_account_login_failure(session: Session, user_id: int, now: datetime) -> None:
+    next_failures = func.coalesce(User.failed_logins, 0) + 1
+    session.exec(
+        update(User)
+        .where(User.id == user_id)
+        .values(
+            failed_logins=case(
+                (next_failures >= _LOCK_THRESHOLD, 0),
+                else_=next_failures,
+            ),
+            locked_until=case(
+                (
+                    next_failures >= _LOCK_THRESHOLD,
+                    now + timedelta(minutes=_LOCK_MINUTES),
+                ),
+                else_=User.locked_until,
+            ),
+        )
+        .execution_options(synchronize_session=False)
+    )
+    session.commit()
 
 
 @lru_cache(maxsize=1)
@@ -506,7 +629,9 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     email = body.email.strip().lower()
     key = f"{email}|{ip}"
     _throttle(key)
-    user = session.exec(select(User).where(User.email == email)).first()
+    user = session.exec(select(User).where(
+        User.email == email, User.deleted_at.is_(None),
+    )).first()
     # Per-account lockout — persists across restarts (unlike the in-memory IP throttle),
     # blunting password-spray and proxy-IP-collapsed brute force. SQLite returns the
     # stored datetime as naive, so normalise to UTC before comparing with utcnow().
@@ -523,16 +648,11 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     if not ok:
         _record_attempt(key)
         if active:
-            user.failed_logins = (user.failed_logins or 0) + 1
-            if user.failed_logins >= _LOCK_THRESHOLD:
-                user.locked_until = utcnow() + timedelta(minutes=_LOCK_MINUTES)
-                user.failed_logins = 0
-            session.add(user)
-            session.commit()
+            _record_account_login_failure(session, user.id, utcnow())
         # One identical response for every failure mode (unknown email, wrong password,
         # disabled, locked) — no status/message oracle to enumerate accounts with.
         raise HTTPException(401, "invalid email or password")
-    _login_attempts.pop(key, None)
+    _clear_login_attempts(key)
     user.failed_logins = 0
     user.locked_until = None
     user.last_login = utcnow()
@@ -583,26 +703,82 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     if user.role != "admin":
         deps_q = deps_q.where(Deployment.owner_id == user.id)
     deps = session.exec(deps_q).all()
+    # An admin-disabled source keeps its VM records (re-enable loses nothing) but
+    # they are hidden from normal inventory and never live-probed. Settings still
+    # shows the connection itself, including how many VMs it holds.
+    disabled_conn_ids = {cid for cid, c in conns.items() if c.disabled}
+    if disabled_conn_ids:
+        deps = [d for d in deps if d.connection_id not in disabled_conn_ids]
     # Batch the active-job lookup once instead of one SELECT per deployment (N+1 on the
     # /state hot path). Highest id wins per deployment (matches the per-dep query order).
     active_by_dep: dict[int, Job] = {}
     if deps:
         for j in session.exec(
             select(Job).where(Job.deployment_id.in_([d.id for d in deps]),
-                              Job.status.in_(["queued", "running"])).order_by(Job.id.desc())
+                              Job.status.in_(["queued", "running", "waiting"])).order_by(Job.id.desc())
         ).all():
             active_by_dep.setdefault(j.deployment_id, j)
+    # Prime live VM status once per connection/node. An unavailable Proxmox target now
+    # costs one bounded connection probe, not one full timeout for every VM in /state.
+    conn_statuses: dict[int, dict] = {}
+    status_groups: dict[tuple[int, str], list[int]] = {}
+    for dep in deps:
+        if dep.vmid and dep.status not in ("working", "error", "cleanup_pending"):
+            conn = conns.get(dep.connection_id)
+            if conn:
+                status_groups.setdefault(
+                    (conn.id, dep.node or conn.node), [],
+                ).append(dep.vmid)
+    for (conn_id, node), vmids in status_groups.items():
+        px = px_cache.get(conn_id)
+        status = _conn_status(px, conn_id) if px else {"status": "unknown"}
+        conn_statuses[conn_id] = status
+        S.prime_live_statuses(
+            px, conn_id, node, vmids, online=status.get("status") == "online",
+        )
+
     vms = [S.vm_dict(session, d, user, px_cache, users, conns, active_by_dep) for d in deps]
 
-    base = [S.base_image_dict(i) for i in session.exec(select(Image).where(Image.kind == "base")).all()]
-    tpls = session.exec(select(Template).order_by(Template.id)).all()
+    all_tpls = session.exec(select(Template).order_by(Template.id)).all()
+    template_image_refs = {t.base_image_id for t in all_tpls if t.base_image_id is not None}
+    template_block_refs = {
+        placed.get("ref")
+        for template in all_tpls
+        for section in load_recipe(template.recipe_json)
+        if isinstance(section, dict)
+        for placed in (section.get("blocks") or [])
+        if isinstance(placed, dict) and isinstance(placed.get("ref"), str)
+    }
+    deployed_image_refs = {
+        image_id for image_id in session.exec(
+            select(Deployment.image_id).where(Deployment.image_id.is_not(None))
+        ).all()
+        if image_id is not None
+    }
+    is_admin = user.role == "admin"
+    base = [
+        S.base_image_dict(
+            image,
+            include_source_url=is_admin,
+            can_delete=(is_admin and image.id not in template_image_refs
+                        and image.id not in deployed_image_refs),
+        )
+        for image in session.exec(select(Image).where(Image.kind == "base")).all()
+    ]
+    tpls = all_tpls
     if user.role != "admin":
         tpls = [t for t in tpls if t.public or t.owner_id == user.id]
     templates = [S.template_dict(session, t, viewer=user) for t in tpls]
     blocks_all = session.exec(select(Block).order_by(Block.id)).all()
     if user.role != "admin":
         blocks_all = [b for b in blocks_all if b.builtin or b.owner_id == user.id]
-    blocks = [S.block_dict(b) for b in blocks_all]
+    blocks = [
+        S.block_dict(
+            block,
+            can_delete=(not block.builtin and block.key not in template_block_refs),
+        )
+        for block in blocks_all
+    ]
 
     secrets_q = session.exec(select(Secret)).all()
     if user.role != "admin":
@@ -616,11 +792,14 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     variables = [S.variable_dict(v, users) for v in variables_q]
 
     conn_list = list(conns.values())
-    is_admin = user.role == "admin"
     connections = []
     for c in conn_list:
         px = px_cache.get(c.id)
-        st = _conn_status(px, c.id) if px else None
+        st = conn_statuses.get(c.id)
+        if c.disabled:
+            st = {"status": "disabled"}   # operator choice — no probe, ever
+        elif st is None:
+            st = _conn_status(px, c.id) if px else {"status": "unknown"}
         # Non-admins get a REDACTED connection (target name + node + sizing only) — never
         # the Proxmox host / token id / SSH paths / storage backends, which are admin-only
         # config. They still need this much to pick a build/deploy target and size a VM.
@@ -630,7 +809,9 @@ def state(request: Request, user: User = Depends(current_user), session: Session
     networks = S.network_dicts(session, conn_list, public=not is_admin)
     # The full user directory (names, emails, roles, last-login) is admin-only — a
     # non-admin never needs it (their own identity comes from `me`) and it must not leak.
-    users_list = [S.user_dict(session, u) for u in users.values()] if is_admin else []
+    users_list = [
+        S.user_dict(session, u) for u in users.values() if u.deleted_at is None
+    ] if is_admin else []
 
     jobs_q = select(Job).where(Job.dismissed == False).order_by(Job.id.desc()).limit(20)  # noqa: E712
     if user.role != "admin":
@@ -680,7 +861,7 @@ def widget_summary(user: User = Depends(widget_key_user),
     def _count(*names: str) -> int:
         return sum(1 for st in statuses if st in names)
 
-    job_q = select(Job.id).where(Job.status.in_(("queued", "running")))
+    job_q = select(Job.id).where(Job.status.in_(("queued", "running", "waiting")))
     if not is_admin:
         job_q = job_q.where(Job.created_by == user.id)
     jobs_active = len(session.exec(job_q).all())
@@ -740,7 +921,10 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
             schema = json.loads(blk.input_schema_json or "[]") if blk else []
         except (json.JSONDecodeError, TypeError):
             schema = []
-        ftypes = {f.get("name"): f.get("type", "text") for f in schema if isinstance(f, dict)}
+        fields = {
+            f.get("name"): f for f in schema
+            if isinstance(f, dict) and isinstance(f.get("name"), str)
+        }
         answers = supplied.get(addr) or {}
         if not isinstance(answers, dict):
             raise HTTPException(400, f"deployInputs: {addr!r} must be an object")
@@ -749,9 +933,10 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                 raise HTTPException(400, f"deployInputs: {name!r} is not ask-on-deploy")
         out = {}
         for name in names:
-            if name not in ftypes:
+            if name not in fields:
                 continue  # ask references an input the block no longer has — ignore
-            ftype = ftypes.get(name, "text")
+            field = fields[name]
+            ftype = field.get("type", "text")
             if name in answers:
                 v = answers[name]
                 if ftype in ("bool", "boolean", "toggle") and not isinstance(v, bool):
@@ -760,6 +945,15 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
                     raise HTTPException(400, f"deployInputs: {name!r} must be a list")
                 if ftype not in ("bool", "boolean", "toggle", "tags", "list") and not isinstance(v, str):
                     raise HTTPException(400, f"deployInputs: {name!r} must be a string")
+                if ftype == "select":
+                    options = field.get("options")
+                    if (not isinstance(options, list)
+                            or any(not isinstance(option, str) for option in options)
+                            or v not in options):
+                        raise HTTPException(
+                            400,
+                            f"deployInputs: {name!r} must be one of its configured options",
+                        )
                 # Reject control chars / newlines in non-code answers: a multi-line scalar
                 # could inject sibling keys into the rendered module-arg dict. 'code' (Run
                 # Script) is intentionally free-form shell on the deployer's own VM.
@@ -781,6 +975,81 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
     return json.dumps(cleaned)
 
 
+def _validate_cross_owner_execution_plan(plan: dict) -> None:
+    """Admit a cross-owner plan using only its immutable block-schema snapshots."""
+    try:
+        template_owner_id = plan["template_owner_id"]
+        deployment_owner_id = plan["deployment_owner_id"]
+    except (KeyError, TypeError):
+        raise HTTPException(409, "template execution plan is invalid")
+    if template_owner_id == deployment_owner_id:
+        return
+    schemas_by_ref = {}
+    try:
+        for ref, snapshot in plan["blocks"].items():
+            schema = json.loads(snapshot["input_schema_json"] or "[]")
+            if input_schema_problems(schema, require_type=True):
+                raise ValueError
+            schemas_by_ref[ref] = schema
+    except (AttributeError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+        raise HTTPException(409, "template execution plan has an unavailable block schema")
+    try:
+        validate_public_sensitive_inputs(
+            plan["recipe"], schemas_by_ref,
+            deploy_inputs=plan["deploy_inputs"], cross_owner=True, reject_unknown=True,
+        )
+        reject_cross_owner_hidden_references(
+            plan["recipe"], schemas_by_ref,
+            {
+                ref: (snapshot.get("ansible_template"), snapshot.get("cloudinit_template"))
+                for ref, snapshot in plan["blocks"].items()
+            },
+            deploy_inputs=plan["deploy_inputs"],
+        )
+    except (KeyError, TypeError):
+        raise HTTPException(409, "template execution plan is invalid")
+    except ValueError as exc:
+        raise HTTPException(409, str(exc))
+
+
+def _missing_execution_plan_ref(session: Session, template: Template) -> Optional[str]:
+    refs = {
+        placed.get("ref")
+        for section in load_recipe(template.recipe_json)
+        if isinstance(section, dict)
+        for placed in (section.get("blocks") or [])
+        if isinstance(placed, dict) and isinstance(placed.get("ref"), str)
+    }
+    if not refs:
+        return None
+    known = {
+        block.key for block in session.exec(select(Block).where(Block.key.in_(refs))).all()
+    }
+    return sorted(refs - known)[0] if refs - known else None
+
+
+def _build_admitted_execution_plan(
+    session: Session,
+    template: Template,
+    deployment_owner_id: Optional[int],
+    deploy_inputs_json: str,
+) -> str:
+    try:
+        plan = build_execution_plan(
+            session, template, deployment_owner_id, deploy_inputs_json,
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        missing = _missing_execution_plan_ref(session, template)
+        detail = (f"block {missing!r} is unavailable" if missing
+                  else "template execution plan is invalid")
+        raise HTTPException(409, detail)
+    _validate_cross_owner_execution_plan(plan)
+    try:
+        return seal_execution_plan(plan)
+    except (TypeError, ValueError):
+        raise HTTPException(409, "template execution plan is invalid")
+
+
 def _auto_name(session: Session, base: str = "gd") -> str:
     n = 1
     existing = {d.name for d in session.exec(select(Deployment)).all()}
@@ -789,7 +1058,59 @@ def _auto_name(session: Session, base: str = "gd") -> str:
     return f"{base}-{n}"
 
 
-_deploy_lock = threading.Lock()
+_lifecycle_admission_lock = threading.Lock()
+_ACTIVE_LIFECYCLE_STATUSES = ("queued", "running", "waiting")
+_LIFECYCLE_TYPES = ("deploy", "rebuild", "destroy")
+
+
+@dataclass
+class _DeploymentOperationLock:
+    lock: threading.Lock
+    users: int = 0
+
+
+_deployment_operation_locks_guard = threading.Lock()
+_deployment_operation_locks: dict[int, _DeploymentOperationLock] = {}
+
+
+@contextmanager
+def _deployment_operation_lock(deployment_id: int):
+    """Serialize power work and lifecycle admission for one deployment.
+
+    The registry guard is held only while acquiring or releasing an entry reference;
+    it is never held while waiting for a deployment lock. Entries therefore exist
+    only while an operation owns or waits for them, without serializing unrelated
+    deployments.
+    """
+    with _deployment_operation_locks_guard:
+        entry = _deployment_operation_locks.get(deployment_id)
+        if entry is None:
+            entry = _DeploymentOperationLock(lock=threading.Lock())
+            _deployment_operation_locks[deployment_id] = entry
+        entry.users += 1
+
+    entry.lock.acquire()
+    try:
+        yield
+    finally:
+        entry.lock.release()
+        with _deployment_operation_locks_guard:
+            entry.users -= 1
+            if entry.users == 0 and _deployment_operation_locks.get(deployment_id) is entry:
+                del _deployment_operation_locks[deployment_id]
+
+
+def _active_lifecycle_job(session: Session, deployment_id: int) -> Optional[Job]:
+    return session.exec(select(Job).where(
+        Job.deployment_id == deployment_id,
+        Job.type.in_(_LIFECYCLE_TYPES),
+        Job.status.in_(_ACTIVE_LIFECYCLE_STATUSES),
+    ).order_by(Job.id.desc())).first()
+
+
+def _reject_cleanup_pending(dep: Deployment) -> None:
+    if dep.status == "cleanup_pending":
+        raise HTTPException(409, "VM cleanup is pending — wait for reconciliation to finish")
 
 
 @router.post("/deployments")
@@ -797,7 +1118,7 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
     # Quota admission, deployment row, IP reservation, job and audit must be one
     # serialized transaction. Sync FastAPI handlers run concurrently in a threadpool
     # even with one Uvicorn worker, so an unlocked count-then-insert is racy.
-    with _deploy_lock:
+    with _lifecycle_admission_lock:
         return _deploy_transaction(body, user, session)
 
 
@@ -819,11 +1140,15 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
     conn = session.get(Connection, tpl.connection_id) if tpl.connection_id else None
     if not conn:
         raise HTTPException(400, "template has no location — edit it and pick a Proxmox connection")
+    _reject_disabled_connection(conn)
     # Re-check at deploy: a legacy template (or one whose block author was demoted) must
     # not run a non-admin custom Ansible block on the control node.
     _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
 
     deploy_inputs_json = _validate_deploy_inputs(session, tpl, body.deployInputs)
+    execution_plan_enc = _build_admitted_execution_plan(
+        session, tpl, user.id, deploy_inputs_json,
+    )
 
     # The connection's per-VM ceiling is authoritative; 0 = unlimited for that
     # dimension (CPU, RAM and disk all behave identically). A connection is required
@@ -841,7 +1166,9 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
 
     net = session.get(Network, tpl.network_id) if tpl.network_id else None
     if net and net.connection_id != conn.id:
-        net = None
+        raise HTTPException(400, "template network does not belong to its connection — edit the template")
+    if tpl.network_id and not net:
+        raise HTTPException(400, "template network is missing — edit the template")
     if not net:
         net = default_network_for(session, conn, user.id)
 
@@ -849,13 +1176,14 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
                      image_id=base.id, template_id=tpl.id, cpu=cpu, ram=ram,
                      disk=disk, status="working", node=conn.node,
                      network_id=net.id, tags=body.tags, notes=body.notes,
-                     deploy_inputs_json=deploy_inputs_json)
+                     deploy_inputs_enc=encrypt_deploy_inputs(deploy_inputs_json))
     session.add(dep)
     session.flush()
 
     job = Job(type="deploy", title=f"Deploying {name}", deployment_id=dep.id,
               connection_id=conn.id, created_by=user.id, status="queued",
-              context_json=_build_job_ctx(session, base, cpu, ram, disk, net, dep.id))
+              context_json=_build_job_ctx(session, base, cpu, ram, disk, net, dep.id),
+              execution_plan_enc=execution_plan_enc)
     session.add(job)
     record_audit(session, user, "deploy", "deployment", dep.id, name)
     session.commit()
@@ -871,46 +1199,71 @@ class ActionBody(BaseModel):
 @router.post("/deployments/{dep_id}/action")
 def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
               session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    conn = session.get(Connection, dep.connection_id)
-    if not conn or not dep.vmid:
-        raise HTTPException(400, "VM not provisioned")
-    px = Proxmox(conn)
-    node = dep.node or conn.node
-    try:
-        if body.action == "start":
-            px.start(dep.vmid, node)
-        elif body.action == "stop":
-            px.stop(dep.vmid, node)
-        elif body.action == "restart":
-            px.reboot(dep.vmid, node)
-        else:
-            raise HTTPException(400, "unknown action")
-    except HTTPException:
-        raise
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, f"vm.{body.action}", "deployment", dep.id, dep.name)
-    session.commit()
-    statebus.bump()
-    return {"ok": True}
+    # Preserve the authorization boundary before entering any lock. End this read
+    # transaction before waiting so the guarded re-read observes a lifecycle job
+    # committed by an operation that won the lock first.
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep = _owned_deployment(session, dep_id, user)
+        _reject_cleanup_pending(dep)
+        active = _active_lifecycle_job(session, dep.id)
+        if active:
+            raise HTTPException(409, f"{active.type} job already active for this deployment")
+        conn = session.get(Connection, dep.connection_id)
+        if not conn or not dep.vmid:
+            raise HTTPException(400, "VM not provisioned")
+        _reject_disabled_connection(conn)
+        px = Proxmox(conn)
+        node = dep.node or conn.node
+        try:
+            if body.action == "start":
+                upid = px.start(dep.vmid, node)
+            elif body.action == "stop":
+                upid = px.stop(dep.vmid, node)
+            elif body.action == "restart":
+                upid = px.reboot(dep.vmid, node)
+            else:
+                raise HTTPException(400, "unknown action")
+            px.wait_task(upid, node=node, timeout=120)
+        except HTTPException:
+            raise
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        dep.status = "stopped" if body.action == "stop" else "running"
+        dep.error = ""
+        dep.cleanup_origin = None
+        dep.cleanup_last_attempt_at = None
+        session.add(dep)
+        record_audit(session, user, f"vm.{body.action}", "deployment", dep.id, dep.name)
+        session.commit()
+        statebus.bump()
+        return {"ok": True}
 
 
 @router.post("/deployments/{dep_id}/rebuild")
 def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
     # Rebuild may need to recreate a missing legacy/static allocation. Keep its flush
-    # and final commit inside the same lock used by new deployment admission.
-    with _deploy_lock:
-        return _vm_rebuild_transaction(dep_id, user, session)
+    # and final commit inside the same lock used by new deployment admission. Always
+    # acquire the deployment lock first so waiting on one VM cannot hold the global
+    # admission lock and stall lifecycle admission for a different VM.
+    with _deployment_operation_lock(dep_id):
+        with _lifecycle_admission_lock:
+            return _vm_rebuild_transaction(dep_id, user, session)
 
 
 def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     dep = _owned_deployment(session, dep_id, user)
+    _reject_cleanup_pending(dep)
     # One in-flight lifecycle job per VM — stops a user flooding the single serial
     # worker with unbounded rebuild jobs (cross-tenant starvation / jobs-table growth).
-    if _active_job_for(session, dep.id):
-        raise HTTPException(409, "a job is already in progress for this VM — "
-                                 "wait for it to finish or cancel it first")
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
+    _reject_disabled_connection(session.get(Connection, dep.connection_id)
+                                if dep.connection_id else None)
     if not dep.template_id:
         raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
     tpl = session.get(Template, dep.template_id)
@@ -918,7 +1271,17 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     if not base or base.kind != "base":
         raise HTTPException(400, "template has no base image — edit it first")
     _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
+    try:
+        deploy_inputs_json = open_deploy_inputs(dep.deploy_inputs_enc)
+    except ValueError:
+        raise HTTPException(409, "stored deployment answers cannot be decrypted "
+                                 "— secret key mismatch or corrupt row")
+    execution_plan_enc = _build_admitted_execution_plan(
+        session, tpl, dep.owner_id, deploy_inputs_json,
+    )
     dep.status = "working"
+    dep.cleanup_origin = None
+    dep.cleanup_last_attempt_at = None
     session.add(dep)
     # Preserve the VM's network identity (static IP / VLAN) across the rebuild.
     # The existing IpAllocation row is reused by allocate_ip() inside _network_ctx —
@@ -927,7 +1290,8 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     net = session.get(Network, dep.network_id) if dep.network_id else None
     job = Job(type="rebuild", title=f"Rebuilding {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
-              context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id))
+              context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id),
+              execution_plan_enc=execution_plan_enc)
     session.add(job)
     record_audit(session, user, "vm.rebuild", "deployment", dep.id, dep.name)
     session.commit()
@@ -938,17 +1302,32 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
 
 @router.delete("/deployments/{dep_id}")
 def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        with _lifecycle_admission_lock:
+            return _vm_destroy_transaction(dep_id, user, session)
+
+
+def _vm_destroy_transaction(dep_id: int, user: User, session: Session):
     dep = _owned_deployment(session, dep_id, user)
+    _reject_cleanup_pending(dep)
+    conn = session.get(Connection, dep.connection_id) if dep.connection_id else None
+    _reject_disabled_connection(conn, detail=(
+        f"Proxmox connection {conn.name!r} is disabled — enable it in Settings to "
+        "destroy this VM upstream, or use 'Clean up (local only)' if the VM no "
+        "longer exists in Proxmox" if conn else ""))
     # De-dupe / serialise lifecycle jobs per VM (worker-starvation guard). A destroy
     # already in flight is returned as-is; a deploy/rebuild in flight must finish or be
     # cancelled before a destroy is queued.
-    active = _active_job_for(session, dep.id)
+    active = _active_lifecycle_job(session, dep.id)
     if active:
         if active.type == "destroy":
             return {"ok": True, "jobId": active.id, "deduped": True}
-        raise HTTPException(409, "a job is already in progress for this VM — "
-                                 "wait for it to finish or cancel it first")
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
     dep.status = "working"
+    dep.cleanup_origin = None
+    dep.cleanup_last_attempt_at = None
     session.add(dep)
     job = Job(type="destroy", title=f"Destroying {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
@@ -959,6 +1338,207 @@ def vm_destroy(dep_id: int, user: User = Depends(current_user), session: Session
     session.refresh(job)
     statebus.bump()
     return {"ok": True, "jobId": job.id}
+
+
+@router.post("/deployments/{dep_id}/cleanup_local")
+def vm_cleanup_local(dep_id: int, user: User = Depends(current_user),
+                     session: Session = Depends(get_session)):
+    """Remove GoblinDock's record of a VM WITHOUT deleting anything in Proxmox.
+
+    Recovery path for a VM that was deleted directly in Proxmox (normal Delete
+    would launch an upstream destroy that fails and leave the stale row) and for
+    records stranded on a disabled/unreachable source. At most a read-only
+    inventory probe is sent upstream: a VM confirmed present is refused — the
+    normal Delete flow (upstream first, local record only after success) is the
+    correct tool then."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        with _lifecycle_admission_lock:
+            return _vm_cleanup_local_transaction(dep_id, user, session)
+
+
+def _vm_cleanup_local_transaction(dep_id: int, user: User, session: Session):
+    dep = _owned_deployment(session, dep_id, user)
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
+    conn = session.get(Connection, dep.connection_id) if dep.connection_id else None
+    if conn and not conn.disabled:
+        try:
+            px = Proxmox(conn)
+        except Exception:  # noqa: BLE001
+            px = None
+        presence, detail = probe_vm_presence(px, dep.vmid, dep.node or conn.node)
+    elif conn:
+        presence, detail = VM_UNKNOWN, "Proxmox connection is disabled"
+    else:
+        presence, detail = VM_UNKNOWN, "Proxmox connection no longer exists"
+    if presence == VM_PRESENT:
+        raise HTTPException(409, "the VM still exists in Proxmox — use the normal "
+                                 "Delete action so it is destroyed upstream first")
+    verified = presence == VM_ABSENT
+    for alloc in session.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == dep.id)).all():
+        session.delete(alloc)
+    # Audit must let an operator tell local-only cleanup apart from a completed
+    # upstream destroy, including whether absence was actually confirmed.
+    record_audit(
+        session, user, "vm.cleanup_local", "deployment", dep.id,
+        f"{dep.name} — local record removed, Proxmox untouched "
+        f"({'upstream absence confirmed' if verified else f'unverified: {detail}'})",
+    )
+    session.delete(dep)
+    session.commit()
+    statebus.bump()
+    return {"ok": True, "verified": verified}
+
+
+_DISK_KEY_RE = re.compile(r"^(scsi|virtio|sata|ide)\d+$")
+
+
+def _parse_disk_entries(cfg: dict) -> list[dict]:
+    """Resizable disks from a VM config: every scsi/virtio/sata/ide entry that is
+    not a cdrom and not a cloud-init volume, with its size parsed to GB."""
+    out = []
+    for key in sorted(cfg or {}):
+        if not _DISK_KEY_RE.match(key):
+            continue
+        raw = str(cfg.get(key) or "")
+        if "media=cdrom" in raw or "cloudinit" in raw:
+            continue
+        size_gb = None
+        m = re.search(r"(?:^|,)size=(\d+(?:\.\d+)?)([MGT]?)", raw)
+        if m:
+            value = float(m.group(1))
+            unit = m.group(2) or "G"
+            size_gb = value / 1024 if unit == "M" else value * 1024 if unit == "T" else value
+            size_gb = int(size_gb) if size_gb == int(size_gb) else round(size_gb, 1)
+        out.append({
+            "key": key,
+            "storage": raw.split(":", 1)[0],
+            "sizeGb": size_gb,
+            "raw": raw,
+        })
+    return out
+
+
+def _resizable_deployment(session: Session, dep_id: int, user: User) -> tuple[Deployment, Connection]:
+    """Shared admission for the fire-and-forget resize calls: owned, quiescent
+    (no lifecycle job, not cleanup_pending), provisioned, and on a live source."""
+    dep = _owned_deployment(session, dep_id, user)
+    _reject_cleanup_pending(dep)
+    active = _active_lifecycle_job(session, dep.id)
+    if active:
+        raise HTTPException(409, f"{active.type} job already active for this deployment")
+    conn = session.get(Connection, dep.connection_id) if dep.connection_id else None
+    if not conn or not dep.vmid:
+        raise HTTPException(400, "VM not provisioned")
+    _reject_disabled_connection(conn)
+    return dep, conn
+
+
+class VmResizeBody(BaseModel):
+    cores: Optional[int] = Field(default=None, ge=1, le=256)
+    ramGb: Optional[int] = Field(default=None, ge=1, le=4096)
+
+
+class DiskResizeBody(BaseModel):
+    sizeGb: int = Field(ge=1, le=65536)
+
+
+@router.post("/deployments/{dep_id}/resize")
+def vm_resize_config(dep_id: int, body: VmResizeBody, user: User = Depends(current_user),
+                     session: Session = Depends(get_session)):
+    """Day-2 CPU/RAM resize — a direct Proxmox config write, no job. Gated on the
+    VM being STOPPED (like Proxmox's own pending-change model, minus the pending
+    state: the gate keeps GoblinDock's view and the hypervisor's identical)."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep, conn = _resizable_deployment(session, dep_id, user)
+        if body.cores is None and body.ramGb is None:
+            raise HTTPException(400, "nothing to resize — supply cores and/or ramGb")
+        # Same per-VM ceiling authority as deploy: the connection's caps, 0 = unlimited.
+        if body.cores is not None and conn.max_cores and body.cores > conn.max_cores:
+            raise HTTPException(400, f"cores above this connection's per-VM limit ({conn.max_cores})")
+        if body.ramGb is not None and conn.max_ram_mb and body.ramGb * 1024 > conn.max_ram_mb:
+            raise HTTPException(400, f"RAM above this connection's per-VM limit ({conn.max_ram_mb // 1024} GB)")
+        px = Proxmox(conn)
+        node = dep.node or conn.node
+        try:
+            status = str((px.vm_current(dep.vmid, node) or {}).get("status") or "").lower()
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        if status != "stopped":
+            raise HTTPException(409, "stop the VM first — CPU/memory changes apply "
+                                     "to a stopped VM (same as Proxmox)")
+        params: dict = {}
+        if body.cores is not None:
+            params["cores"] = body.cores
+        if body.ramGb is not None:
+            params["memory"] = body.ramGb * 1024
+        try:
+            px.set_config(dep.vmid, node=node, **params)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        changes = []
+        if body.cores is not None:
+            changes.append(f"cores {dep.cpu}→{body.cores}")
+            dep.cpu = body.cores
+        if body.ramGb is not None:
+            changes.append(f"ram {dep.ram}G→{body.ramGb}G")
+            dep.ram = body.ramGb
+        session.add(dep)
+        record_audit(session, user, "vm.resize", "deployment", dep.id,
+                     f"{dep.name} — " + " · ".join(changes))
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "cores": dep.cpu, "ramGb": dep.ram}
+
+
+@router.post("/deployments/{dep_id}/disks/{disk}/resize")
+def vm_disk_resize(dep_id: int, disk: str, body: DiskResizeBody,
+                   user: User = Depends(current_user), session: Session = Depends(get_session)):
+    """Day-2 disk GROW — online-safe (qemu block resize), grow-only (Proxmox
+    cannot shrink). Partition/filesystem growth inside the guest is the guest's
+    business — GoblinDock only drives the hypervisor."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep, conn = _resizable_deployment(session, dep_id, user)
+        if not _DISK_KEY_RE.match(disk):
+            raise HTTPException(400, "unknown disk")
+        px = Proxmox(conn)
+        node = dep.node or conn.node
+        try:
+            cfg = px.vm_config(dep.vmid, node)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        entry = next((e for e in _parse_disk_entries(cfg) if e["key"] == disk), None)
+        if entry is None:
+            raise HTTPException(400, f"disk {disk!r} not found "
+                                     "(cdrom/cloud-init volumes cannot be resized)")
+        current = entry["sizeGb"]
+        if current is not None and body.sizeGb <= current:
+            raise HTTPException(400, f"grow only — {disk} is already {current}G "
+                                     "and Proxmox cannot shrink a disk")
+        if conn.max_disk_gb and body.sizeGb > conn.max_disk_gb:
+            raise HTTPException(400, f"disk above this connection's per-VM limit "
+                                     f"({conn.max_disk_gb} GB)")
+        try:
+            px.resize_disk(dep.vmid, disk, f"{body.sizeGb}G", node=node)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        if disk == "scsi0":
+            # the deploy-managed root disk — keep the row's size truthful
+            dep.disk = body.sizeGb
+            session.add(dep)
+        record_audit(session, user, "vm.disk_resize", "deployment", dep.id,
+                     f"{dep.name} — {disk} {current if current is not None else '?'}G→{body.sizeGb}G")
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "disk": disk, "sizeGb": body.sizeGb}
 
 
 def _iface_summary(ifaces) -> list:
@@ -980,11 +1560,17 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
     img = session.get(Image, dep.image_id) if dep.image_id else None
     tpl = session.get(Template, dep.template_id) if dep.template_id else None
     owner = session.get(User, dep.owner_id) if dep.owner_id else None
-    job = session.exec(select(Job).where(Job.deployment_id == dep.id).order_by(Job.id.desc())).first()
+    active = _active_lifecycle_job(session, dep.id)
+    job = active or session.exec(
+        select(Job).where(Job.deployment_id == dep.id).order_by(Job.id.desc())
+    ).first()
+    effective_status = (
+        "working" if active and dep.status != "cleanup_pending" else dep.status
+    )
     out = {
         "name": dep.name, "vmid": dep.vmid,
         "node": dep.node or (conn.node if conn else ""),
-        "status": dep.status, "ip": dep.ip, "mac": dep.mac, "tags": dep.tags,
+        "status": effective_status, "ip": dep.ip, "mac": dep.mac, "tags": dep.tags,
         "created": S._rel(dep.created_at), "owner": owner.name if owner else "—",
         "connection": conn.name if conn else "—",
         "baseImage": img.name if img else "—", "template": tpl.name if tpl else None,
@@ -995,8 +1581,12 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
         "live": None, "config": None, "agent": None, "consoleReady": False,
         "hasRootPassword": bool(dep.root_password_enc),
         "credUser": dep.cred_user or "root",
+        **({"err": dep.error}
+           if dep.status in ("error", "cleanup_pending") and dep.error else {}),
     }
-    if conn and dep.vmid and dep.status not in ("working", "error"):
+    out["connectionDisabled"] = bool(conn and conn.disabled)
+    if (conn and not conn.disabled and dep.vmid
+            and effective_status not in ("working", "error", "cleanup_pending")):
         try:
             px = Proxmox(conn)
             node = dep.node or conn.node or px.pick_node()
@@ -1016,12 +1606,15 @@ def vm_detail(dep_id: int, user: User = Depends(current_user), session: Session 
                 "scsi0": cfg.get("scsi0", ""),
                 "agent": cfg.get("agent", ""), "serial0": cfg.get("serial0", ""),
             }
+            out["disks"] = _parse_disk_entries(cfg)
             out["consoleReady"] = running
             if running and cur.get("agent"):
                 out["agent"] = {"os": px.agent_osinfo(dep.vmid, node),
                                 "interfaces": _iface_summary(px.agent_interfaces(dep.vmid, node))}
         except Exception:  # noqa: BLE001
-            pass
+            out["live"] = {"status": "unknown"}
+            out["liveError"] = "Live VM status is unavailable"
+            out["consoleReady"] = False
     return out
 
 
@@ -1045,8 +1638,25 @@ def _snapshot_px(session: Session, dep: Deployment) -> tuple[Proxmox, str]:
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
+    _reject_disabled_connection(conn)
     px = Proxmox(conn)
     return px, dep.node or conn.node or px.pick_node()
+
+
+@contextmanager
+def _snapshot_mutation_deployment(
+    session: Session, dep_id: int, user: User,
+):
+    """Authorize, then lock one VM for a snapshot mutation and its audit commit."""
+    _owned_deployment(session, dep_id, user)
+    session.rollback()
+    with _deployment_operation_lock(dep_id):
+        dep = _owned_deployment(session, dep_id, user)
+        _reject_cleanup_pending(dep)
+        active = _active_lifecycle_job(session, dep.id)
+        if active:
+            raise HTTPException(409, f"{active.type} job already active for this deployment")
+        yield dep
 
 
 @router.get("/vms/{dep_id}/snapshots")
@@ -1076,71 +1686,71 @@ def list_vm_snapshots(dep_id: int, user: User = Depends(current_user),
 @router.post("/vms/{dep_id}/snapshots")
 def create_vm_snapshot(dep_id: int, body: SnapshotBody, user: User = Depends(current_user),
                        session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    name = (body.name or "").strip() or "snap-" + utcnow().strftime("%Y%m%d-%H%M%S")
-    if not _SNAPNAME_RE.fullmatch(name):
-        raise HTTPException(400, "snapshot name must start with a letter and contain only "
-                                 "letters, digits, '-' or '_' (max 40 chars)")
-    px, node = _snapshot_px(session, dep)
-    try:
-        upid = px.create_snapshot(dep.vmid, name, description=(body.description or "")[:200],
-                                  vmstate=body.includeRam, node=node)
-        px.wait_task(upid, node=node, timeout=300)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, "vm.snapshot.create", "deployment", dep.id,
-                 f"{dep.name} · {name}")
-    session.commit()
-    statebus.bump()
-    return {"ok": True, "name": name}
+    with _snapshot_mutation_deployment(session, dep_id, user) as dep:
+        name = (body.name or "").strip() or "snap-" + utcnow().strftime("%Y%m%d-%H%M%S")
+        if not _SNAPNAME_RE.fullmatch(name):
+            raise HTTPException(400, "snapshot name must start with a letter and contain only "
+                                     "letters, digits, '-' or '_' (max 40 chars)")
+        px, node = _snapshot_px(session, dep)
+        try:
+            upid = px.create_snapshot(dep.vmid, name, description=(body.description or "")[:200],
+                                      vmstate=body.includeRam, node=node)
+            px.wait_task(upid, node=node, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        record_audit(session, user, "vm.snapshot.create", "deployment", dep.id,
+                     f"{dep.name} · {name}")
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "name": name}
 
 
 @router.delete("/vms/{dep_id}/snapshots/{snapname}")
 def delete_vm_snapshot(dep_id: int, snapname: str, user: User = Depends(current_user),
                        session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    if not _SNAPNAME_RE.fullmatch(snapname or ""):
-        raise HTTPException(400, "invalid snapshot name")
-    px, node = _snapshot_px(session, dep)
-    try:
-        upid = px.delete_snapshot(dep.vmid, snapname, node=node)
-        px.wait_task(upid, node=node, timeout=300)
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, "vm.snapshot.delete", "deployment", dep.id,
-                 f"{dep.name} · {snapname}")
-    session.commit()
-    statebus.bump()
-    return {"ok": True}
+    with _snapshot_mutation_deployment(session, dep_id, user) as dep:
+        if not _SNAPNAME_RE.fullmatch(snapname or ""):
+            raise HTTPException(400, "invalid snapshot name")
+        px, node = _snapshot_px(session, dep)
+        try:
+            upid = px.delete_snapshot(dep.vmid, snapname, node=node)
+            px.wait_task(upid, node=node, timeout=300)
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        record_audit(session, user, "vm.snapshot.delete", "deployment", dep.id,
+                     f"{dep.name} · {snapname}")
+        session.commit()
+        statebus.bump()
+        return {"ok": True}
 
 
 @router.post("/vms/{dep_id}/snapshots/{snapname}/rollback")
 def rollback_vm_snapshot(dep_id: int, snapname: str, body: Optional[RollbackBody] = None,
                          user: User = Depends(current_user),
                          session: Session = Depends(get_session)):
-    dep = _owned_deployment(session, dep_id, user)
-    if not _SNAPNAME_RE.fullmatch(snapname or ""):
-        raise HTTPException(400, "invalid snapshot name")
-    start_after = body.start if body is not None else True
-    px, node = _snapshot_px(session, dep)
-    started = False
-    try:
-        upid = px.rollback_snapshot(dep.vmid, snapname, node=node)
-        px.wait_task(upid, node=node, timeout=300)
-        # A disk-only snapshot rollback leaves the VM stopped (Proxmox stops a running
-        # VM to revert its disk); a RAM snapshot resumes running on its own. When the
-        # caller asked to start, bring it back up if it isn't already running so they
-        # land on a running VM at the rollback point.
-        if start_after and px.vm_current(dep.vmid, node).get("status") != "running":
-            px.wait_task(px.start(dep.vmid, node=node), node=node, timeout=120)
-            started = True
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
-    record_audit(session, user, "vm.snapshot.rollback", "deployment", dep.id,
-                 f"{dep.name} · {snapname}")
-    session.commit()
-    statebus.bump()
-    return {"ok": True, "started": started}
+    with _snapshot_mutation_deployment(session, dep_id, user) as dep:
+        if not _SNAPNAME_RE.fullmatch(snapname or ""):
+            raise HTTPException(400, "invalid snapshot name")
+        start_after = body.start if body is not None else True
+        px, node = _snapshot_px(session, dep)
+        started = False
+        try:
+            upid = px.rollback_snapshot(dep.vmid, snapname, node=node)
+            px.wait_task(upid, node=node, timeout=300)
+            # A disk-only snapshot rollback leaves the VM stopped (Proxmox stops a running
+            # VM to revert its disk); a RAM snapshot resumes running on its own. When the
+            # caller asked to start, bring it back up if it isn't already running so they
+            # land on a running VM at the rollback point.
+            if start_after and px.vm_current(dep.vmid, node).get("status") != "running":
+                px.wait_task(px.start(dep.vmid, node=node), node=node, timeout=120)
+                started = True
+        except Exception as e:  # noqa: BLE001
+            raise HTTPException(502, f"proxmox: {e}")
+        record_audit(session, user, "vm.snapshot.rollback", "deployment", dep.id,
+                     f"{dep.name} · {snapname}")
+        session.commit()
+        statebus.bump()
+        return {"ok": True, "started": started}
 
 
 def _ws_origin_ok(ws: WebSocket) -> bool:
@@ -1164,11 +1774,64 @@ def _ws_origin_ok(ws: WebSocket) -> bool:
     return origin.rstrip("/").lower() in allow
 
 
-async def _pump_ws(websocket: WebSocket, pve, prefer_bytes: bool) -> None:
+_CONSOLE_AUTH_INTERVAL_S = 3.0
+
+
+@dataclass(frozen=True)
+class _ConsoleGrant:
+    """Detached handshake authorization used by a live console bridge."""
+
+    conn: Connection
+    deployment: Deployment
+    user_id: int
+    session_epoch: int
+
+
+def _console_grant_still_valid(grant: _ConsoleGrant) -> bool:
+    """Re-read every mutable authorization input in a fresh DB session."""
+    try:
+        with Session(engine) as session:
+            user = session.get(User, grant.user_id)
+            dep = session.get(Deployment, grant.deployment.id)
+            return bool(
+                user
+                and not user.disabled
+                and user.session_epoch == grant.session_epoch
+                and dep
+                and (dep.owner_id == user.id or user.role == "admin")
+            )
+    except Exception:  # noqa: BLE001 -- authorization storage errors fail closed
+        return False
+
+
+async def _close_console_pair(websocket: WebSocket, pve, browser_code: int = 1000) -> None:
+    """Best-effort, repeat-safe close of both sides of a console bridge."""
+
+    async def close_browser():
+        try:
+            await websocket.close(code=browser_code)
+        except Exception:  # noqa: BLE001
+            pass
+
+    async def close_pve():
+        try:
+            await pve.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+    await asyncio.gather(close_browser(), close_pve())
+
+
+async def _pump_ws(
+    websocket: WebSocket, pve, prefer_bytes: bool, grant: _ConsoleGrant,
+) -> None:
     """Pipe frames both ways between the browser WS and the Proxmox WS until either
     side closes. `prefer_bytes` picks which field of a Starlette message wins when
     both are present (the serial console is text-first, VNC is binary-first).
-    Shared by vm_console and vm_vnc."""
+    Authorization is periodically re-read and any task completing terminates the
+    whole bridge. Shared by vm_console and vm_vnc."""
+    stopping = asyncio.Event()
+    browser_close_code = 1000
 
     async def browser_to_pve():
         first, second = ("bytes", "text") if prefer_bytes else ("text", "bytes")
@@ -1176,39 +1839,71 @@ async def _pump_ws(websocket: WebSocket, pve, prefer_bytes: bool) -> None:
             while True:
                 m = await websocket.receive()
                 if m.get("type") == "websocket.disconnect":
-                    break
+                    return
                 payload = m.get(first) if m.get(first) is not None else m.get(second)
                 if payload is not None:
+                    if stopping.is_set():
+                        return
                     await pve.send(payload)
         except Exception:  # noqa: BLE001
             pass
         finally:
-            try:
-                await pve.close()
-            except Exception:  # noqa: BLE001
-                pass
+            stopping.set()
 
     async def pve_to_browser():
         try:
             async for data in pve:
+                if stopping.is_set():
+                    return
                 if isinstance(data, (bytes, bytearray)):
                     await websocket.send_bytes(bytes(data))
                 else:
                     await websocket.send_text(data)
         except Exception:  # noqa: BLE001
             pass
+        finally:
+            stopping.set()
 
-    await asyncio.gather(browser_to_pve(), pve_to_browser())
+    async def monitor_authorization():
+        nonlocal browser_close_code
+        while not stopping.is_set():
+            try:
+                await asyncio.wait_for(
+                    stopping.wait(), timeout=_CONSOLE_AUTH_INTERVAL_S,
+                )
+                return
+            except TimeoutError:
+                if _console_grant_still_valid(grant):
+                    continue
+                browser_close_code = 4403
+                stopping.set()
+                await _close_console_pair(websocket, pve, browser_code=4403)
+                return
+
+    tasks = {
+        asyncio.create_task(browser_to_pve()),
+        asyncio.create_task(pve_to_browser()),
+        asyncio.create_task(monitor_authorization()),
+    }
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        stopping.set()
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+        await _close_console_pair(websocket, pve, browser_code=browser_close_code)
 
 
 async def _ws_authorized_dep(websocket: WebSocket, dep_id: int):
     """Shared console-WS handshake guard: origin check + session auth + deployment
     ownership, all BEFORE accepting the upgrade — an unauthorized or cross-site peer
     is rejected at the HTTP layer and never completes the upgrade. Returns a detached
-    (conn, dep) pair, or (None, None) after closing the socket."""
+    frozen detached grant, or None after closing the socket."""
     if not _ws_origin_ok(websocket):
         await websocket.close(code=4403)
-        return None, None
+        return None
     uid = websocket.session.get("uid")
     with Session(engine) as s:
         user = s.get(User, uid) if uid else None
@@ -1216,14 +1911,18 @@ async def _ws_authorized_dep(websocket: WebSocket, dep_id: int):
         if (not user or user.disabled or websocket.session.get("sv", 0) != user.session_epoch
                 or not dep or (dep.owner_id != user.id and user.role != "admin")):
             await websocket.close(code=4403)
-            return None, None
+            return None
         c = s.get(Connection, dep.connection_id)
         conn = Connection(**c.model_dump()) if c else None
         dep = Deployment(**dep.model_dump())
+        grant = _ConsoleGrant(
+            conn=conn, deployment=dep, user_id=user.id,
+            session_epoch=user.session_epoch,
+        ) if conn else None
     if not conn:
         await websocket.close(code=4404)
-        return None, None
-    return conn, dep
+        return None
+    return grant
 
 
 async def _accept_binary(websocket: WebSocket) -> None:
@@ -1242,33 +1941,69 @@ def _pve_ws_kwargs(px: Proxmox, conn: Connection) -> dict:
             "ssl": ctx, "subprotocols": ["binary"], "max_size": None, "open_timeout": 15}
 
 
+@dataclass(frozen=True)
+class _SerialConsolePreparation:
+    """Detached inputs needed after guarded serial configuration is complete."""
+
+    ws_url: str
+    ws_kwargs: dict
+    ticket: object
+    proxy_user: object
+
+
+def _prepare_serial_console(dep_id: int, grant: _ConsoleGrant) -> _SerialConsolePreparation:
+    """Guard persistent serial setup without holding the lock for the live proxy."""
+    with _deployment_operation_lock(dep_id):
+        with Session(engine) as session:
+            user = session.get(User, grant.user_id)
+            dep = session.get(Deployment, dep_id)
+            if (not user or user.disabled or user.session_epoch != grant.session_epoch
+                    or not dep or (dep.owner_id != user.id and user.role != "admin")):
+                raise HTTPException(403, "console authorization expired")
+            _reject_cleanup_pending(dep)
+            active = _active_lifecycle_job(session, dep.id)
+            if active:
+                raise HTTPException(409, f"{active.type} job already active for this deployment")
+            conn = session.get(Connection, dep.connection_id)
+            if not conn or not dep.vmid:
+                raise HTTPException(400, "VM not provisioned")
+            _reject_disabled_connection(conn)
+            px = Proxmox(conn)
+            node = dep.node or conn.node or px.pick_node()
+            px.ensure_serial(dep.vmid, node)
+            proxy = px.termproxy(dep.vmid, node)
+            ticket = proxy.get("ticket")
+            port = proxy.get("port")
+            return _SerialConsolePreparation(
+                ws_url=px.console_ws_url(dep.vmid, node, port, ticket),
+                ws_kwargs=_pve_ws_kwargs(px, conn),
+                ticket=ticket,
+                proxy_user=proxy.get("user"),
+            )
+
+
 @router.websocket("/vms/{dep_id}/console")
 async def vm_console(websocket: WebSocket, dep_id: int):
     """Bridge the browser's xterm to the VM's serial console. We open a Proxmox
     termproxy (authenticated with our API token, kept server-side) and pipe bytes;
     the browser only ever talks to GoblinDock."""
-    conn, dep = await _ws_authorized_dep(websocket, dep_id)
-    if not conn:
+    grant = await _ws_authorized_dep(websocket, dep_id)
+    if not grant:
         return
-    if not dep.vmid:
+    if not grant.deployment.vmid:
         await websocket.close(code=4403)
         return
-    vmid, node = dep.vmid, dep.node or conn.node
     await _accept_binary(websocket)
 
     import websockets as _ws
 
     try:
-        px = Proxmox(conn)
-        node = node or px.pick_node()
-        px.ensure_serial(vmid, node)
-        tp = px.termproxy(vmid, node)
-        ticket, port, puser = tp.get("ticket"), tp.get("port"), tp.get("user")
+        prep = await asyncio.to_thread(_prepare_serial_console, dep_id, grant)
         async with _ws.connect(
-            px.console_ws_url(vmid, node, port, ticket), **_pve_ws_kwargs(px, conn),
+            prep.ws_url, **prep.ws_kwargs,
         ) as pve:
-            await pve.send(f"{puser}:{ticket}\n")
-            await _pump_ws(websocket, pve, prefer_bytes=False)
+            await pve.send(f"{prep.proxy_user}:{prep.ticket}\n")
+            await _pump_ws(websocket, pve, prefer_bytes=False, grant=grant)
     except Exception as e:  # noqa: BLE001
         try:
             await websocket.send_text(f"\r\n[goblindock] console unavailable: {e}\r\n")
@@ -1303,6 +2038,7 @@ def vm_vncproxy(dep_id: int, response: Response, user: User = Depends(current_us
     conn = session.get(Connection, dep.connection_id)
     if not conn or not dep.vmid:
         raise HTTPException(400, "VM not provisioned")
+    _reject_disabled_connection(conn)
     px = Proxmox(conn)
     node = dep.node or conn.node or px.pick_node()
     try:
@@ -1346,9 +2082,10 @@ async def vm_vnc(websocket: WebSocket, dep_id: int):
     tok = websocket.query_params.get("t")
     sess = _VNC_SESS.pop(tok, None) if tok else None
     _sweep_vnc_sessions()   # clean any other abandoned tokens on each connect
-    conn, _dep = await _ws_authorized_dep(websocket, dep_id)
-    if not conn:
+    grant = await _ws_authorized_dep(websocket, dep_id)
+    if not grant:
         return
+    conn = grant.conn
     if not sess or sess.get("dep_id") != dep_id or sess.get("exp", 0) < time.time():
         await websocket.close(code=4403)
         return
@@ -1362,7 +2099,7 @@ async def vm_vnc(websocket: WebSocket, dep_id: int):
             px.console_ws_url(sess["vmid"], sess["node"], sess["port"], sess["ticket"]),
             **_pve_ws_kwargs(px, conn),
         ) as pve:
-            await _pump_ws(websocket, pve, prefer_bytes=True)
+            await _pump_ws(websocket, pve, prefer_bytes=True, grant=grant)
     except Exception:  # noqa: BLE001
         pass
     finally:
@@ -1385,9 +2122,10 @@ class BaseImageBody(BaseModel):
 @router.post("/images/base")
 def add_base_image(body: BaseImageBody, user: User = Depends(require_admin),
                    session: Session = Depends(get_session)):
+    checksum = _clean_checksum(body.checksum)
     url = validate_image_url(body.source_url)
     img = Image(kind="base", name=body.name, os_family=body.os_family,
-                source_url=url, checksum=body.checksum,
+                source_url=url, checksum=checksum,
                 build_status="ready", created_by=user.id, size="cloud image")
     session.add(img)
     record_audit(session, user, "image.add_base", "image", "-", body.name)
@@ -1409,6 +2147,8 @@ def cached_images(connectionId: int, user: User = Depends(current_user),
     conn = session.get(Connection, connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
+    if conn.disabled:
+        return {"online": False, "disabled": True, "cached": []}
     now = time.time()
     hit = _CACHED_IMAGES_CACHE.get(connectionId)
     if hit and now - hit[0] < _CACHED_IMAGES_TTL:
@@ -1425,7 +2165,9 @@ def cached_images(connectionId: int, user: User = Depends(current_user),
     for img in bases:
         if not (img.source_url or "").strip():
             continue  # nothing to download — UI shows unknown
-        cached[str(img.id)] = px.iso_volume_path(base_disk_filename(img.source_url)) in vols
+        cached[str(img.id)] = px.iso_volume_path(base_disk_filename(
+            img.source_url, img.checksum or "", _checksum_algo(img.checksum or ""),
+        )) in vols
     result = {"online": True, "cached": cached}
     _CACHED_IMAGES_CACHE[connectionId] = (now, result)
     return result
@@ -1453,11 +2195,12 @@ def sync_image(img_id: int, body: SyncBody, user: User = Depends(require_admin),
     conn = session.get(Connection, body.connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
-    # De-dupe: return any already queued/running sync for this image+connection instead
+    _reject_disabled_connection(conn)
+    # De-dupe: return any already active sync for this image+connection instead
     # of piling identical heavyweight downloads onto the worker.
     existing = session.exec(select(Job).where(
         Job.type == "image_sync", Job.image_id == img.id,
-        Job.connection_id == conn.id, Job.status.in_(("queued", "running")))).first()
+        Job.connection_id == conn.id, Job.status.in_(("queued", "running", "waiting")))).first()
     if existing:
         return {"ok": True, "jobId": existing.id, "deduped": True}
     job = Job(type="image_sync", title=f"Syncing {img.name} → {conn.name}",
@@ -1580,6 +2323,35 @@ def _validate_recipe(session: Session, recipe: list, user: User) -> None:
     _assert_trusted_ansible_blocks(session, recipe, blocks_by_key)
 
 
+def _validate_recipe_sensitive_inputs(session: Session, recipe: list) -> None:
+    """Sensitive (password/secret) template inputs must be ask-on-deploy or a
+    deployer secret reference — for EVERY template, not just public ones: a
+    literal would sit in plaintext in templates.recipe_json (and its backups)."""
+    refs = {
+        placed.get("ref")
+        for section in recipe if isinstance(section, dict)
+        for placed in (section.get("blocks") or [])
+        if isinstance(placed, dict) and isinstance(placed.get("ref"), str)
+    }
+    rows = session.exec(select(Block).where(Block.key.in_(refs))).all() if refs else []
+    schemas_by_ref = {}
+    for block in rows:
+        try:
+            schema = normalize_input_schema(
+                json.loads(block.input_schema_json or "[]"),
+            )
+        except (json.JSONDecodeError, TypeError):
+            continue
+        if not input_schema_problems(schema, require_type=True):
+            schemas_by_ref[block.key] = schema
+    try:
+        validate_public_sensitive_inputs(
+            recipe, schemas_by_ref, reject_unknown=True,
+        )
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
+
 def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optional[int], Optional[int], Optional[int]]:
     """Resolve baseImageId/connectionId/networkId or 400. The network must belong
     to the template's connection — deploys use them together."""
@@ -1593,6 +2365,9 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
         conn = session.get(Connection, body.connectionId)
         if not conn:
             raise HTTPException(400, "connectionId not found")
+        if conn.disabled:
+            raise HTTPException(400, f"Proxmox connection {conn.name!r} is disabled "
+                                     "— it cannot be picked as a template location")
         cid = conn.id
     if body.networkId is not None:
         if cid is None:
@@ -1607,6 +2382,7 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
 @router.post("/templates")
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     _validate_recipe(session, body.recipe, user)
+    _validate_recipe_sensitive_inputs(session, body.recipe)
     bid, cid, nid = _validate_template_refs(session, body)
     # Store the authored sizes verbatim. The per-VM ceiling is enforced at deploy
     # time from the connection (0 = unlimited), so a template default is never
@@ -1646,6 +2422,7 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
     if not _template_owned(rc, user):
         raise HTTPException(403, "not yours")
     _validate_recipe(session, body.recipe, user)
+    _validate_recipe_sensitive_inputs(session, body.recipe)
     rc.name = body.name.strip() or rc.name
     rc.description = body.description
     rc.os_family = body.os_family
@@ -1856,7 +2633,7 @@ def del_variable(var_id: int, user: User = Depends(current_user), session: Sessi
 class ConnBody(BaseModel):
     name: str
     host: str
-    port: int = 8006
+    port: int = Field(default=8006, ge=1, le=65535)
     token_id: str
     token_secret: str
     verify_tls: bool = True   # verify the Proxmox TLS cert by default; opt out for self-signed
@@ -1868,9 +2645,9 @@ class ConnBody(BaseModel):
     ssh_host: str = ""
     ssh_user: str = "root"
     ssh_key_path: str = ""
-    max_cores: int = 0       # per-VM ceilings for this target (0 = inherit global)
-    max_ram_gb: int = 0
-    max_disk_gb: int = 0
+    max_cores: int = Field(default=0, ge=0, le=256)       # 0 = unlimited
+    max_ram_gb: int = Field(default=0, ge=0, le=1024)
+    max_disk_gb: int = Field(default=0, ge=0, le=16384)
 
 
 @router.post("/connections")
@@ -1892,6 +2669,8 @@ def add_connection(body: ConnBody, user: User = Depends(require_admin), session:
     session.refresh(c)
     # give it a default DHCP network now (so GET /state never has to write one)
     default_network_for(session, c, user.id)
+    backfill_starter_template_location(session)
+    session.commit()
     return {"ok": True}
 
 
@@ -2053,6 +2832,7 @@ def connection_capacity(conn_id: int, user: User = Depends(current_user),
     conn = session.get(Connection, conn_id)
     if not conn:
         raise HTTPException(404, "not found")
+    _reject_disabled_connection(conn)
     now = time.monotonic()
     cached = _CAPACITY_CACHE.get(conn_id)
     if cached and now - cached[0] < _CAPACITY_TTL:
@@ -2084,7 +2864,9 @@ class UserBody(BaseModel):
 
 @router.post("/users")
 def add_user(body: UserBody, user: User = Depends(require_admin), session: Session = Depends(get_session)):
-    if session.exec(select(User).where(User.email == body.email.strip().lower())).first():
+    if session.exec(select(User).where(
+        User.email == body.email.strip().lower(), User.deleted_at.is_(None),
+    )).first():
         raise HTTPException(400, "email already exists")
     _check_password(body.password)
     u = User(email=body.email.strip().lower(), name=body.name.strip(),
@@ -2136,7 +2918,7 @@ def cancel_job(job_id: int, user: User = Depends(current_user), session: Session
         raise HTTPException(404, "not found")
     if not _job_owned(job, user):
         raise HTTPException(403, "not your job")
-    if job.status in ("queued", "running"):
+    if job.status in ("queued", "running", "waiting"):
         job.cancel_requested = True
         session.add(job)
         session.commit()
@@ -2182,7 +2964,7 @@ def delete_job(job_id: int, user: User = Depends(current_user), session: Session
         raise HTTPException(404, "not found")
     if not _job_owned(job, user):
         raise HTTPException(403, "not your job")
-    if job.status in ("queued", "running"):
+    if job.status in ("queued", "running", "waiting"):
         raise HTTPException(409, "job is still running — cancel it first")
     job.dismissed = True
     job.dismissed_at = utcnow()
@@ -2219,7 +3001,7 @@ def purge_job_permanently(job_id: int, user: User = Depends(current_user),
         raise HTTPException(404, "not found")
     if not _job_owned(job, user):
         raise HTTPException(403, "not your job")
-    if job.status in ("queued", "running"):
+    if job.status in ("queued", "running", "waiting"):
         raise HTTPException(409, "job is still running — cancel it first")
     _purge_job(session, job)
     session.commit()
@@ -2229,7 +3011,7 @@ def purge_job_permanently(job_id: int, user: User = Depends(current_user),
 @router.post("/jobs/purge-all")
 def purge_all_jobs(user: User = Depends(current_user), session: Session = Depends(get_session)):
     """Hard-delete every FINISHED job the viewer can see (admin = all jobs, else own) plus
-    their steps/logs. Running/queued jobs are left untouched."""
+    their steps/logs. Active jobs are left untouched."""
     q = select(Job).where(Job.status.in_(["succeeded", "failed", "canceled"]))
     if user.role != "admin":
         q = q.where(Job.created_by == user.id)
@@ -2279,13 +3061,17 @@ def set_auto_root_password(body: AutoRootPwBody, user: User = Depends(require_ad
 @router.get("/jobs/{job_id}/stream")
 async def stream_job(job_id: int, request: Request, user: User = Depends(current_user)):
     """SSE: emit a job snapshot whenever steps/logs/progress change."""
-    # Authenticate + authorise up front (the generator below runs unattended).
+    # The dependency authenticates this request and this check rejects an unauthorized
+    # handshake. The generator also repeats both checks against fresh rows before every
+    # read/emission because an SSE connection can otherwise outlive revocation.
     with Session(engine) as s0:
         job0 = s0.get(Job, job_id)
         if not job0:
             raise HTTPException(404, "not found")
         if not _job_owned(job0, user):
             raise HTTPException(403, "not your job")
+    granted_user_id = user.id
+    granted_session_epoch = request.session.get("sv", 0)
 
     async def gen():
         last_event_id = 0
@@ -2296,14 +3082,24 @@ async def stream_job(job_id: int, request: Request, user: User = Depends(current
             if await request.is_disconnected() or time.monotonic() > deadline:
                 break
             with Session(engine) as session:
+                live_user = session.get(User, granted_user_id)
+                if (
+                    not live_user
+                    or live_user.disabled
+                    or live_user.deleted_at is not None
+                    or live_user.session_epoch != granted_session_epoch
+                ):
+                    break
                 job = session.get(Job, job_id)
                 if not job:
                     yield "event: error\ndata: {}\n\n"
                     break
+                if not _job_owned(job, live_user):
+                    break
                 # Only load+send the FULL log on the first frame; afterwards send just
                 # the new lines so each tick is O(new), not O(total) — the client
                 # appends `newLogs` to what it already has (see web/job.js).
-                detail = S.job_detail(session, job, include_log=first, viewer=user)
+                detail = S.job_detail(session, job, include_log=first, viewer=live_user)
                 if first:
                     last_event_id = detail.get("lastEventId", 0)
                     new_logs = []
@@ -2393,7 +3189,9 @@ def update_profile(body: ProfileBody, user: User = Depends(current_user),
         u.name = body.name.strip()
     if body.email is not None and body.email.strip():
         email = body.email.strip().lower()
-        clash = session.exec(select(User).where(User.email == email, User.id != u.id)).first()
+        clash = session.exec(select(User).where(
+            User.email == email, User.id != u.id, User.deleted_at.is_(None),
+        )).first()
         if clash:
             raise HTTPException(400, "email already in use")
         u.email = email
@@ -2460,7 +3258,7 @@ def revoke_widget_key(user: User = Depends(current_user),
 class ConnEditBody(BaseModel):
     name: Optional[str] = None
     host: Optional[str] = None
-    port: Optional[int] = None
+    port: Optional[int] = Field(default=None, ge=1, le=65535)
     token_id: Optional[str] = None
     token_secret: Optional[str] = None
     verify_tls: Optional[bool] = None
@@ -2472,9 +3270,10 @@ class ConnEditBody(BaseModel):
     ssh_host: Optional[str] = None
     ssh_user: Optional[str] = None
     ssh_key_path: Optional[str] = None
-    max_cores: Optional[int] = None
-    max_ram_gb: Optional[int] = None
-    max_disk_gb: Optional[int] = None
+    max_cores: Optional[int] = Field(default=None, ge=0, le=256)
+    max_ram_gb: Optional[int] = Field(default=None, ge=0, le=1024)
+    max_disk_gb: Optional[int] = Field(default=None, ge=0, le=16384)
+    disabled: Optional[bool] = None
 
 
 @router.put("/connections/{conn_id}")
@@ -2495,12 +3294,23 @@ def edit_connection(conn_id: int, body: ConnEditBody, user: User = Depends(requi
     for fld in ("node", "storage", "iso_storage", "snippet_storage"):
         if data.get(fld) is not None:
             data[fld] = _clean_storage_id(data[fld], fld.replace("_", " "))
+    was_disabled = bool(c.disabled)
     for k, v in data.items():
-        if v is not None:                      # 0 is allowed (resets to inherit global)
+        if v is not None:                      # 0 is allowed (unlimited)
             setattr(c, k, v)
     session.add(c)
-    record_audit(session, user, "connection.update", "connection", c.id, c.name)
+    if bool(c.disabled) != was_disabled:
+        # Distinct audit trail for the enable/disable choice, and an immediate
+        # status-cache bust so Settings reflects the new state on the next poll
+        # (re-enable also makes the first /state probe refresh the inventory).
+        _CONN_STATUS_CACHE.pop(c.id, None)
+        record_audit(session, user,
+                     "connection.disable" if c.disabled else "connection.enable",
+                     "connection", c.id, c.name)
+    else:
+        record_audit(session, user, "connection.update", "connection", c.id, c.name)
     session.commit()
+    statebus.bump()
     return {"ok": True}
 
 
@@ -2516,7 +3326,7 @@ def delete_connection(conn_id: int, user: User = Depends(require_admin),
         raise HTTPException(409, "connection is referenced by a template")
     if session.exec(select(Job).where(
             Job.connection_id == conn_id,
-            Job.status.in_(["queued", "running"]),
+            Job.status.in_(["queued", "running", "waiting"]),
     )).first():
         raise HTTPException(409, "connection is referenced by an active job")
     if session.exec(select(Image).where(Image.connection_id == conn_id, Image.kind == "golden")).first():
@@ -2562,17 +3372,19 @@ def _validate_network_body(body: NetworkBody) -> None:
     if body.mode != "static":
         return
     try:
-        net = ipaddress.ip_network(body.subnet_cidr, strict=False)
-    except ValueError:
-        raise HTTPException(400, "a static network needs a valid subnet_cidr (e.g. 10.0.50.0/24)")
-    if body.gateway and _ip("gateway", body.gateway) not in net:
-        raise HTTPException(400, "gateway is outside the subnet")
-    if body.range_start or body.range_end:
-        start, end = _ip("range_start", body.range_start), _ip("range_end", body.range_end)
-        if start > end:
-            raise HTTPException(400, "range_start must be <= range_end")
-        if start not in net or end not in net:
-            raise HTTPException(400, "the IP range is outside the subnet")
+        pool = parse_static_pool(
+            body.subnet_cidr, body.range_start, body.range_end, body.gateway,
+        )
+    except StaticPoolError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+    reserved = {pool.network.network_address}
+    if isinstance(pool.network, ipaddress.IPv4Network):
+        reserved.add(pool.network.broadcast_address)
+    if pool.gateway is not None:
+        reserved.add(pool.gateway)
+    if any(pool.start <= address <= pool.end for address in reserved):
+        raise HTTPException(400, "the static IP range contains a reserved address")
 
 
 @router.post("/networks")
@@ -2604,6 +3416,8 @@ def edit_network(net_id: int, body: NetworkBody, user: User = Depends(require_ad
             raise HTTPException(400, "unknown connection")
         if session.exec(select(Deployment).where(Deployment.network_id == net_id)).first():
             raise HTTPException(409, "network is in use by a deployment — can't move it to another connection")
+        if session.exec(select(Template).where(Template.network_id == net_id)).first():
+            raise HTTPException(409, "network is referenced by a template — update the template first")
         n.connection_id = body.connectionId
     n.name = body.name.strip()
     n.mode = "static" if body.mode == "static" else "dhcp"
@@ -2649,7 +3463,9 @@ class UserEditBody(BaseModel):
 
 def _last_admin_guard(session: Session, target: User):
     if target.role == "admin":
-        admins = session.exec(select(User).where(User.role == "admin", User.disabled == False)).all()  # noqa: E712
+        admins = session.exec(select(User).where(
+            User.role == "admin", User.disabled == False, User.deleted_at.is_(None),  # noqa: E712
+        )).all()
         if len(admins) <= 1:
             raise HTTPException(409, "cannot remove the last active admin")
 
@@ -2658,7 +3474,7 @@ def _last_admin_guard(session: Session, target: User):
 def edit_user(uid: int, body: UserEditBody, user: User = Depends(require_admin),
               session: Session = Depends(get_session)):
     u = session.get(User, uid)
-    if not u:
+    if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")
     if body.name is not None and body.name.strip():
         u.name = body.name.strip()
@@ -2687,7 +3503,7 @@ def reset_user_password(uid: int, body: PasswordResetBody, request: Request,
                         user: User = Depends(require_admin),
                         session: Session = Depends(get_session)):
     u = session.get(User, uid)
-    if not u:
+    if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")
     _check_password(body.value)
     u.password_hash = hash_password(body.value)
@@ -2707,15 +3523,37 @@ def reset_user_password(uid: int, body: PasswordResetBody, request: Request,
 def delete_user(uid: int, user: User = Depends(require_admin),
                 session: Session = Depends(get_session)):
     u = session.get(User, uid)
-    if not u:
+    if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")
     if u.id == user.id:
         raise HTTPException(409, "you cannot delete yourself")
     _last_admin_guard(session, u)
     if session.exec(select(Deployment).where(Deployment.owner_id == uid)).first():
         raise HTTPException(409, "user still owns VMs — reassign or destroy them first")
-    session.delete(u)
-    record_audit(session, user, "user.delete", "user", uid, u.email)
+    original_email = u.email
+    # Private user values should not survive account deletion. Historical ownership on
+    # templates, blocks, jobs and audit records deliberately remains attached to this
+    # tombstone, preventing both broken history and ownership transfer through ID reuse.
+    for secret in session.exec(select(Secret).where(Secret.owner_id == uid)).all():
+        session.delete(secret)
+    for variable in session.exec(select(Variable).where(Variable.owner_id == uid)).all():
+        session.delete(variable)
+    u.disabled = True
+    u.deleted_at = utcnow()
+    u.session_epoch = (u.session_epoch or 0) + 1
+    u.email = f"deleted-{u.id}-{new_csrf_token()}@goblindock.invalid"
+    u.name = f"Deleted user #{u.id}"
+    u.password_hash = ""
+    u.role = "user"
+    u.failed_logins = 0
+    u.locked_until = None
+    u.last_login = None
+    u.widget_key_hash = None
+    u.widget_key_prefix = ""
+    u.widget_key_created_at = None
+    u.widget_key_last_used = None
+    session.add(u)
+    record_audit(session, user, "user.delete", "user", uid, original_email)
     session.commit()
     return {"ok": True}
 
@@ -2804,7 +3642,7 @@ def create_block(body: BlockBody, user: User = Depends(current_user),
               name=body.name.strip() or "Custom block", category=body.category, icon=body.icon,
               section=body.section, phase="cloudinit" if body.phase == "cloudinit" else "ansible",
               description=body.description,
-              input_schema_json=json.dumps(body.input_schema or []),
+              input_schema_json=json.dumps(normalize_input_schema(body.input_schema or [])),
               ansible_template=body.ansible_template, cloudinit_template=body.cloudinit_template,
               owner_id=user.id)
     session.add(b)
@@ -2860,7 +3698,7 @@ def edit_block(key: str, body: BlockBody, user: User = Depends(current_user),
     b.section = body.section
     b.phase = "cloudinit" if body.phase == "cloudinit" else "ansible"
     b.description = body.description
-    b.input_schema_json = json.dumps(body.input_schema or [])
+    b.input_schema_json = json.dumps(normalize_input_schema(body.input_schema or []))
     b.ansible_template = body.ansible_template
     b.cloudinit_template = body.cloudinit_template
     session.add(b)
@@ -2908,6 +3746,7 @@ def edit_image(img_id: int, body: BaseImageEditBody, user: User = Depends(curren
         raise HTTPException(403, "admin only")
     if img.kind == "golden" and img.created_by != user.id and user.role != "admin":
         raise HTTPException(403, "not yours")
+    checksum = _clean_checksum(body.checksum) if body.checksum is not None else None
     if body.name is not None and body.name.strip():
         img.name = _clean_name(body.name, "image name")
     if body.os_family:
@@ -2917,8 +3756,8 @@ def edit_image(img_id: int, body: BaseImageEditBody, user: User = Depends(curren
         if user.role != "admin":
             raise HTTPException(403, "custom image URLs are admin-only")
         img.source_url = validate_image_url(body.source_url)
-    if body.checksum is not None:
-        img.checksum = body.checksum
+    if checksum is not None:
+        img.checksum = checksum
     session.add(img)
     record_audit(session, user, "image.update", "image", img.id, img.name)
     session.commit()
@@ -3026,3 +3865,80 @@ def run_db_backup(user: User = Depends(require_admin), session: Session = Depend
     record_audit(session, user, "db.backup", "system", dest.name, "manual backup")
     session.commit()
     return {"ok": True, "name": dest.name, "bytes": dest.stat().st_size}
+
+
+# =========================================================================== #
+# admin: system health                                                        #
+# =========================================================================== #
+_PROCESS_STARTED = utcnow()
+
+
+@router.get("/system/health")
+def system_health(user: User = Depends(require_admin), session: Session = Depends(get_session)):
+    """Version + component status + inventory stats for the Settings Health tab.
+
+    Read-only and deliberately contact-free: it never probes Proxmox (per-
+    connection liveness already lives on the Proxmox tab, and a disabled source
+    must not be touched). No filesystem paths are exposed — sizes only."""
+    db_stats = {"ok": True, "journalMode": "", "sizeBytes": 0, "walBytes": 0}
+    try:
+        with engine.begin() as conn:
+            db_stats["journalMode"] = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+        db_stats["sizeBytes"] = os.path.getsize(settings.db_path)
+        wal = settings.db_path + "-wal"
+        db_stats["walBytes"] = os.path.getsize(wal) if os.path.exists(wal) else 0
+    except Exception:  # noqa: BLE001
+        db_stats["ok"] = False
+
+    backups = {"enabled": settings.backup_enabled, "count": 0, "newest": None}
+    try:
+        rows = backup.list_backups()
+        backups["count"] = len(rows)
+        if rows:
+            backups["newest"] = rows[0]     # {name, bytes, modified} — no paths
+    except Exception:  # noqa: BLE001
+        pass
+
+    vm_statuses: dict[str, int] = {}
+    for status in session.exec(select(Deployment.status)).all():
+        key = status or "unknown"
+        vm_statuses[key] = vm_statuses.get(key, 0) + 1
+    job_counts = {"queued": 0, "running": 0, "waiting": 0}
+    for status in session.exec(select(Job.status).where(
+            Job.status.in_(tuple(job_counts)))).all():
+        job_counts[status] += 1
+    conns_all = session.exec(select(Connection)).all()
+
+    try:
+        usage = shutil.disk_usage(settings.data_dir)
+        disk = {"totalBytes": usage.total, "freeBytes": usage.free}
+    except OSError:
+        disk = {"totalBytes": 0, "freeBytes": 0}
+
+    workers = worker_health()
+    sched = scheduler_health()
+    return {
+        "version": __version__,
+        "build": settings.build_info,
+        "python": platform.python_version(),
+        "startedAt": _PROCESS_STARTED.isoformat(),
+        "uptimeSeconds": int((utcnow() - _PROCESS_STARTED).total_seconds()),
+        "components": {
+            "api": {"ok": True},
+            "worker": {"ok": workers["jobWorkerAlive"] and workers["waitingWorkerAlive"],
+                       **workers},
+            "scheduler": {"ok": sched["running"], **sched},
+            "database": db_stats,
+            "backups": backups,
+        },
+        "inventory": {
+            "vms": {"total": sum(vm_statuses.values()), "byStatus": vm_statuses},
+            "connections": {"total": len(conns_all),
+                            "disabled": sum(1 for c in conns_all if c.disabled)},
+            "jobs": job_counts,
+            "users": len(session.exec(select(User.id).where(User.deleted_at.is_(None))).all()),
+            "templates": len(session.exec(select(Template.id)).all()),
+            "baseImages": len(session.exec(select(Image.id).where(Image.kind == "base")).all()),
+        },
+        "disk": disk,
+    }

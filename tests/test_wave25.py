@@ -124,6 +124,54 @@ def test_failure_with_cancel_in_message_is_failed_not_canceled():
     print("test_failure_with_cancel_in_message_is_failed_not_canceled OK")
 
 
+def test_failed_deploy_with_present_vm_retains_allocation():
+    """A failed deploy may own a live VM, so presence must retain its reserved IP."""
+    cid = _mk_conn(); nid = _mk_net(cid)
+    did = _mk_dep_with_alloc(cid, nid, vmid=9502, status="working")
+    with session_scope() as s:
+        job = Job(type="deploy", status="failed", error="configure failed",
+                  deployment_id=did, connection_id=cid)
+        s.add(job); s.flush(); jid = job.id
+    saved = worker.Proxmox
+    worker.Proxmox = _stub_px(present=(9502,))
+    try:
+        worker._reconcile_failed_job(jid)
+    finally:
+        worker.Proxmox = saved
+    with session_scope() as s:
+        dep = s.get(Deployment, did)
+        assert dep.status == "error"
+        assert dep.vmid == 9502
+    assert len(_allocs(did)) == 1
+
+
+def test_failed_deploy_with_unknown_vm_retains_allocation():
+    """An inventory failure must never release an address that an unobserved VM may own."""
+    cid = _mk_conn(); nid = _mk_net(cid)
+    did = _mk_dep_with_alloc(cid, nid, vmid=9503, status="working")
+    with session_scope() as s:
+        job = Job(type="deploy", status="failed", error="configure failed",
+                  deployment_id=did, connection_id=cid)
+        s.add(job); s.flush(); jid = job.id
+
+    class _UnknownPx:
+        node = "pve"
+        def __init__(self, conn): pass
+        def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
+
+    saved = worker.Proxmox
+    worker.Proxmox = _UnknownPx
+    try:
+        worker._reconcile_failed_job(jid)
+    finally:
+        worker.Proxmox = saved
+    with session_scope() as s:
+        dep = s.get(Deployment, did)
+        assert dep.status == "error"
+        assert dep.vmid == 9503
+    assert len(_allocs(did)) == 1
+
+
 def test_jobcancelled_marks_canceled_and_tears_down_deploy():
     """An explicit JobCancelled from the job impl IS a user cancel: the half-built VM
     is destroyed, the IP freed and the deployment dropped."""
@@ -157,13 +205,12 @@ def _ansible_phase_with_status(status, rc):
         j = Job(type="deploy", status="running"); s.add(j); s.flush(); jid = j.id
     ctx = worker.JobCtx(jid)
     saved = {k: getattr(worker, k) for k in
-             ("run_playbook", "has_ansible_blocks", "compile_ansible", "_blocks_by_key")}
+             ("run_playbook", "has_ansible_blocks", "compile_ansible")}
     worker.run_playbook = lambda *a, **k: (status, rc)
     worker.has_ansible_blocks = lambda *a, **k: True
     worker.compile_ansible = lambda *a, **k: "- hosts: all\n  tasks: []"
-    worker._blocks_by_key = lambda: {}
     try:
-        worker._run_ansible_phase(ctx, [{"ref": "x"}], None, "10.0.60.5", "KEY", "cfg")
+        worker._run_ansible_phase(ctx, [{"ref": "x"}], {}, None, "10.0.60.5", "KEY", "cfg")
         return None
     except BaseException as e:  # noqa: BLE001
         return e
@@ -296,6 +343,8 @@ def test_effective_disk_records_actual_on_resize_failure():
 
 if __name__ == "__main__":
     test_failure_with_cancel_in_message_is_failed_not_canceled()
+    test_failed_deploy_with_present_vm_retains_allocation()
+    test_failed_deploy_with_unknown_vm_retains_allocation()
     test_jobcancelled_marks_canceled_and_tears_down_deploy()
     test_ansible_phase_canceled_status_raises_jobcancelled()
     test_ansible_phase_failed_status_raises_runtimeerror_not_cancel()

@@ -1,6 +1,7 @@
 /* GoblinDock — lucide-style line icons. Stroke 2, 24x24, round caps. */
 (function () {
   const P = {
+    menu: '<path d="M4 6h16M4 12h16M4 18h16"/>',
     dashboard: '<rect x="3" y="3" width="7" height="9" rx="1"/><rect x="14" y="3" width="7" height="5" rx="1"/><rect x="14" y="12" width="7" height="9" rx="1"/><rect x="3" y="16" width="7" height="5" rx="1"/>',
     server: '<rect x="2" y="4" width="20" height="7" rx="2"/><rect x="2" y="13" width="20" height="7" rx="2"/><path d="M6 7.5h.01M6 16.5h.01"/>',
     plus: '<path d="M12 5v14M5 12h14"/>',

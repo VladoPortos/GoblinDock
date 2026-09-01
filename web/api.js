@@ -90,6 +90,11 @@ window.API = (function () {
     vmAction: (id, action) => req('POST', `/api/deployments/${id}/action`, { action }),
     vmRebuild: (id) => req('POST', `/api/deployments/${id}/rebuild`),
     vmDestroy: (id) => req('DELETE', `/api/deployments/${id}`),
+    // removes only GoblinDock's record — never sends a delete to Proxmox
+    vmCleanupLocal: (id) => req('POST', `/api/deployments/${id}/cleanup_local`),
+    // day-2 resize: direct Proxmox config writes, no job (CPU/RAM need a stopped VM)
+    vmResize: (id, p) => req('POST', `/api/deployments/${id}/resize`, p),
+    vmDiskResize: (id, disk, p) => req('POST', `/api/deployments/${id}/disks/${disk}/resize`, p),
     patchVm: (id, p) => req('PATCH', `/api/deployments/${id}`, p),
     vmDetail: (id) => req('GET', `/api/vms/${id}/detail`),
     vncProxy: (id) => req('POST', `/api/vms/${id}/vncproxy`),
@@ -135,6 +140,7 @@ window.API = (function () {
     addConnection: (p) => req('POST', '/api/connections', p),
     editConnection: (id, p) => req('PUT', `/api/connections/${id}`, p),
     deleteConnection: (id) => req('DELETE', `/api/connections/${id}`),
+    systemHealth: () => req('GET', '/api/system/health'),
     testConnection: (id) => req('POST', `/api/connections/${id}/test`),
     probeConnection: (p) => req('POST', '/api/connections/probe', p),
     connectionCapacity: (id) => req('GET', `/api/connections/${id}/capacity`),

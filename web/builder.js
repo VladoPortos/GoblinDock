@@ -38,18 +38,35 @@
     return sc.some((f) => (f.type === 'text' || f.type === 'secret' || f.type === 'password') && !f.optional && !(b.inputs || {})[f.name] && !((b.ask || []).includes(f.name)));
   }
 
+  function activatePlacedBlock(event, select) {
+    if (event.target !== event.currentTarget && event.target && event.target.closest) {
+      const nested = event.target.closest('button, a, input, select, textarea');
+      if (nested && (!event.currentTarget.contains || event.currentTarget.contains(nested))) return;
+    }
+    const click = event.type === 'click';
+    const key = event.type === 'keydown' ? event.key : '';
+    if (!click && key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return;
+    if ((key === ' ' || key === 'Spacebar') && event.preventDefault) event.preventDefault();
+    select();
+  }
+
   // ---------- Palette ----------
-  function Palette({ onAdd, dragRef, onNewBlock }) {
+  function Palette({ onAdd, dragRef, onNewBlock, mobileActive }) {
     const [tab, setTab] = useState('builtin');
     const [q, setQ] = useState('');
     let blocks = (GD.PALETTE || []).filter((b) => (tab === 'builtin' ? b.builtin : !b.builtin));
     if (q) blocks = blocks.filter((b) => (b.name + b.cat + b.desc).toLowerCase().includes(q.toLowerCase()));
     const cats = {};
     blocks.forEach((b) => { (cats[b.cat] = cats[b.cat] || []).push(b); });
-    return h('div', { className: 'bpane', style: { width: 256, borderRight: '1px solid var(--border-soft)' } },
+    return h('div', {
+      id: 'builder-palette-panel', role: 'tabpanel', 'aria-labelledby': 'builder-palette-tab',
+      className: 'bpane builder-palette' + (mobileActive ? ' mobile-active' : ''),
+      style: { width: 256, borderRight: '1px solid var(--border-soft)' },
+    },
       h('div', { className: 'bpane-head' },
         h('span', { className: 'panel-title' }, 'Block Palette'),
-        h('button', { className: 'btn ghost sm', title: 'New custom block', style: { marginLeft: 'auto' }, onClick: onNewBlock }, h(Icon, { name: 'plus', size: 14 }))),
+        h('button', { type: 'button', className: 'btn ghost sm', title: 'New custom block',
+          'aria-label': 'New custom block', style: { marginLeft: 'auto' }, onClick: onNewBlock }, h(Icon, { name: 'plus', size: 14 }))),
       h('div', { style: { padding: '10px 12px', display: 'flex', flexDirection: 'column', gap: 9 } },
         h('div', { className: 'seg', style: { width: '100%' } },
           h('button', { className: tab === 'builtin' ? 'active' : '', style: { flex: 1, justifyContent: 'center' }, onClick: () => setTab('builtin') }, 'Built-in'),
@@ -61,21 +78,25 @@
         Object.keys(cats).map((cat) => h('div', { key: cat, style: { marginBottom: 14 } },
           h('div', { className: 'nav-label', style: { padding: '6px 2px 8px' } }, cat),
           h('div', { style: { display: 'flex', flexDirection: 'column', gap: 7 } },
-            cats[cat].map((b) => h('div', {
-              key: b.id, className: 'palette-block', draggable: true,
+            cats[cat].map((b) => h('button', {
+              key: b.id, type: 'button', className: 'palette-block', draggable: true,
               onDragStart: () => { dragRef.current = b; }, onClick: () => onAdd(b), title: 'Click or drag to add',
             },
               h('span', { className: 'pb-ico' }, h(Icon, { name: b.icon, size: 15 })),
               h('div', { style: { minWidth: 0 } },
                 h('div', { className: 'mono', style: { fontSize: 12, fontWeight: 600 } }, b.name),
                 h('div', { className: 'hint', style: { fontSize: 10.5 } }, b.desc)),
-              h('span', { className: 'pb-grip' }, h(Icon, { name: 'grip', size: 14 }))))))),
+              h('span', { className: 'pb-grip', 'aria-hidden': true }, h(Icon, { name: 'grip', size: 14 }))))))),
         tab === 'mine' && Object.keys(cats).length === 0 && h('div', { className: 'hint', style: { padding: 12, textAlign: 'center' } }, 'No custom blocks yet. Click ＋ to create one.')));
   }
 
   // ---------- Canvas ----------
-  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }) {
-    return h('div', { className: 'bpane', style: { flex: 1, background: 'var(--bg)' } },
+  function Canvas({ sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mobileActive }) {
+    return h('div', {
+      id: 'builder-canvas-panel', role: 'tabpanel', 'aria-labelledby': 'builder-canvas-tab',
+      className: 'bpane builder-canvas' + (mobileActive ? ' mobile-active' : ''),
+      style: { flex: 1, background: 'var(--bg)' },
+    },
       h('div', { style: { overflowY: 'auto', flex: 1, padding: '20px 24px 60px' } },
         h('div', { style: { maxWidth: 620, margin: '0 auto', display: 'flex', flexDirection: 'column' } },
           sections.map((sec, si) => h('div', { key: sec.id, className: 'canvas-section' },
@@ -96,10 +117,15 @@
                 ? h('div', { className: 'dz-hint mono' }, h(Icon, { name: 'plus', size: 15 }), 'drop blocks here')
                 : sec.blocks.map((b, bi) => h('div', {
                     key: b.uid, className: 'placed-block' + (sel === b.uid ? ' sel' : '') + (warnOf(b) ? ' warn' : ''),
-                    onClick: () => setSel(b.uid),
+                    role: 'button', tabIndex: 0, 'aria-pressed': sel === b.uid,
+                    'aria-label': 'Select ' + b.name,
+                    onClick: (event) => activatePlacedBlock(event, () => setSel(b.uid)),
+                    onKeyDown: (event) => activatePlacedBlock(event, () => setSel(b.uid)),
                   },
-                    h('span', { className: 'pb-grip', style: { cursor: 'grab' }, title: 'Reorder',
-                      onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, 1); } }, h(Icon, { name: 'grip', size: 15 })),
+                    h('button', { type: 'button', className: 'pb-grip', title: 'Move down',
+                      'aria-label': 'Move ' + b.name + ' down',
+                      onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, 1); } },
+                    h(Icon, { name: 'grip', size: 15 })),
                     h('span', { className: 'placed-ico' }, h(Icon, { name: refIcon(b.ref), size: 15 })),
                     h('div', { style: { minWidth: 0, flex: 1 } },
                       h('div', { className: 'row', style: { gap: 7 } },
@@ -114,9 +140,9 @@
                           h(Icon, { name: 'info', size: 11 }), 'asks at deploy')),
                       h('div', { className: 'hint mono', style: { fontSize: 11, marginTop: 2 } }, summaryOf(b))),
                     h('div', { className: 'pb-actions' },
-                      h('button', { className: 'icon-btn', title: 'Move up', onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, -1); } }, h(Icon, { name: 'chevronR', size: 14, style: { transform: 'rotate(-90deg)' } })),
-                      h('button', { className: 'icon-btn', title: 'Duplicate', onClick: (e) => { e.stopPropagation(); onDup(sec.id, b); } }, h(Icon, { name: 'duplicate', size: 14 })),
-                      h('button', { className: 'icon-btn danger', title: 'Remove', onClick: (e) => { e.stopPropagation(); onRemove(sec.id, b.uid); } }, h(Icon, { name: 'trash', size: 14 })))))))))));
+                      h('button', { type: 'button', className: 'icon-btn', title: 'Move up', 'aria-label': 'Move ' + b.name + ' up', onClick: (e) => { e.stopPropagation(); onMove(sec.id, b.uid, -1); } }, h(Icon, { name: 'chevronR', size: 14, style: { transform: 'rotate(-90deg)' } })),
+                      h('button', { type: 'button', className: 'icon-btn', title: 'Duplicate', 'aria-label': 'Duplicate ' + b.name, onClick: (e) => { e.stopPropagation(); onDup(sec.id, b); } }, h(Icon, { name: 'duplicate', size: 14 })),
+                      h('button', { type: 'button', className: 'icon-btn danger', title: 'Remove', 'aria-label': 'Remove ' + b.name, onClick: (e) => { e.stopPropagation(); onRemove(sec.id, b.uid); } }, h(Icon, { name: 'trash', size: 14 })))))))))));
   }
 
   // ---------- schema-driven field ----------
@@ -133,6 +159,7 @@
           autoComplete: 'new-password',
           onChange: (e) => { const v = e.target.value; setPw(v); commit(v, confirm); } }),
         h('button', { type: 'button', className: 'icon-btn', title: show ? 'Hide' : 'Show',
+          'aria-label': (show ? 'Hide' : 'Show') + ' password',
           onClick: () => setShow(!show) }, h(Icon, { name: show ? 'eyeOff' : 'eye', size: 14 }))),
       h('input', { className: 'input mono', type: show ? 'text' : 'password', value: confirm, placeholder: 'confirm password',
         autoComplete: 'new-password', style: { marginTop: 6 },
@@ -146,7 +173,8 @@
       h('div', { style: { flex: 1 } }, h(Field, { value, onChange, mono: true })),
       secrets.length > 0 && h('select', {
         className: 'select', style: { width: 38, padding: 0, textAlign: 'center' }, value: '',
-        title: 'Insert a secret', onChange: (e) => { if (e.target.value) onChange('{{ secrets.' + e.target.value + ' }}'); },
+        title: 'Insert a secret', 'aria-label': 'Insert a secret',
+        onChange: (e) => { if (e.target.value) onChange('{{ secrets.' + e.target.value + ' }}'); },
       }, [h('option', { key: '', value: '' }, '🔒'), ...secrets.map((s) => h('option', { key: s.id, value: s.name }, s.name))]));
   }
 
@@ -187,9 +215,9 @@
       h('div', { onClick: () => setOpen(true), title: 'Open editor',
         style: { cursor: 'pointer', border: '1px solid var(--border)', borderRadius: 9, background: 'var(--inset)', padding: '9px 11px', overflow: 'hidden' } },
         h('pre', { className: 'mono', style: { margin: 0, fontSize: 11.5, color: value ? 'var(--text-dim)' : 'var(--text-faint)', whiteSpace: 'pre', overflow: 'hidden', maxHeight: 78 } },
-          (lines.slice(0, 4).join('\n')) || '# empty — click to edit'),
+          (lines.slice(0, 4).join('\n')) || '# empty — click or use Open editor'),
         h('div', { className: 'row', style: { marginTop: 8, gap: 8 } },
-          h('button', { className: 'btn sm', onClick: (e) => { e.stopPropagation(); setOpen(true); } }, h(Icon, { name: 'code', size: 13 }), 'Open editor'),
+          h('button', { type: 'button', className: 'btn sm', onClick: (e) => { e.stopPropagation(); setOpen(true); } }, h(Icon, { name: 'code', size: 13 }), 'Open editor'),
           h('span', { className: 'hint mono', style: { fontSize: 10.5, marginLeft: 'auto' } }, lines.length, lines.length === 1 ? ' line' : ' lines'))),
       open && h(Modal, { onClose: () => setOpen(false), width: 'min(940px, 96vw)' },
         h('div', { className: 'modal-head' },
@@ -223,11 +251,15 @@
   }
 
   // ---------- Inspector ----------
-  function Inspector({ sections, sel, meta, setInput, setAsk }) {
+  function Inspector({ sections, sel, meta, setInput, setAsk, mobileActive }) {
+    const paneProps = {
+      id: 'builder-inspector-panel', role: 'tabpanel', 'aria-labelledby': 'builder-inspector-tab',
+      className: 'bpane builder-inspector' + (mobileActive ? ' mobile-active' : ''),
+    };
     let block = null;
     sections.forEach((s) => s.blocks.forEach((b) => { if (b.uid === sel) { block = b; } }));
     if (!block) {
-      return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
+      return h('div', { ...paneProps, style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
         h('div', { className: 'bpane-head' }, h('span', { className: 'panel-title' }, 'Template')),
         h('div', { style: { padding: 16, overflowY: 'auto', display: 'flex', flexDirection: 'column', gap: 14 } },
           h(SpecField, { icon: 'tag', label: 'Template name' },
@@ -251,7 +283,7 @@
             h('p', { className: 'hint', style: { fontSize: 11.5 } }, 'These blocks run on every VM you deploy with this template.'))));
     }
     const schema = paletteByKey(block.ref).schema || [];
-    return h('div', { className: 'bpane', style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
+    return h('div', { ...paneProps, style: { width: 308, borderLeft: '1px solid var(--border-soft)', background: 'var(--surface-2)', borderTop: '2px solid var(--accent)' } },
       h('div', { className: 'bpane-head' },
         h('span', { className: 'placed-ico', style: { width: 22, height: 22 } }, h(Icon, { name: refIcon(block.ref), size: 14 })),
         h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 12.5 } }, block.name)),
@@ -266,6 +298,10 @@
   }
 
   // ---------- Custom block editor ----------
+  const selectOptionsText = (field) => Array.isArray(field.options) ? field.options.join(', ') : '';
+  const parseSelectOptions = (value) => String(value || '').split(',')
+    .map((option) => option.trim()).filter(Boolean);
+
   function BlockEditorModal({ initial, onClose, onSaved }) {
     const editing = initial && !initial.builtin && initial.key;
     // Ansible-phase blocks run on the shared control node, so authoring them is admin-only
@@ -277,16 +313,37 @@
       section: (initial && initial.section) || 'Scripts', phase: (initial && initial.phase) || (isAdmin ? 'ansible' : 'cloudinit'),
       description: (initial && initial.desc) || '',
       cloudinit: (initial && initial.cloudinit) || 'echo hello', ansible: (initial && initial.ansible) || '- name: my task\n  ansible.builtin.debug: { msg: hi }',
-      schema: (initial && initial.schema) ? JSON.parse(JSON.stringify(initial.schema)) : [],
+      schema: (initial && initial.schema)
+        ? JSON.parse(JSON.stringify(initial.schema)).map((field) => ({
+            ...field,
+            ...(field.type === 'select' ? { _optionsText: selectOptionsText(field) } : {}),
+          }))
+        : [],
     }));
     const [busy, setBusy] = useState(false);
     const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
-    const setField = (i, k, v) => setF((p) => ({ ...p, schema: p.schema.map((x, j) => j === i ? { ...x, [k]: v } : x) }));
+    const setField = (i, k, v) => setF((p) => ({
+      ...p,
+      schema: p.schema.map((x, j) => {
+        if (j !== i) return x;
+        const next = { ...x, [k]: v };
+        if (k === 'type' && v === 'select' && next._optionsText == null) {
+          next._optionsText = selectOptionsText(next);
+        }
+        return next;
+      }),
+    }));
     const addField = () => set('schema', [...f.schema, { name: 'var' + (f.schema.length + 1), type: 'text', default: '' }]);
     const submit = async () => {
       setBusy(true);
       try {
-        const payload = { name: f.name, category: f.category, icon: f.icon, section: f.section, phase: f.phase, description: f.description, cloudinit_template: f.cloudinit, ansible_template: f.ansible, input_schema: f.schema };
+        const inputSchema = f.schema.map((field) => {
+          const { _optionsText, ...clean } = field;
+          if (clean.type === 'select') clean.options = parseSelectOptions(_optionsText);
+          else delete clean.options;
+          return clean;
+        });
+        const payload = { name: f.name, category: f.category, icon: f.icon, section: f.section, phase: f.phase, description: f.description, cloudinit_template: f.cloudinit, ansible_template: f.ansible, input_schema: inputSchema };
         if (editing) await window.API.editBlock(initial.key, payload);
         else await window.API.createBlock(payload);
         onSaved();
@@ -308,13 +365,23 @@
       h('div', null,
         h('div', { className: 'row', style: { marginBottom: 6 } },
           h('label', { className: 'field-label', style: { margin: 0 } }, 'Inputs'),
-          h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: addField }, h(Icon, { name: 'plus', size: 13 }), 'Add input')),
-        f.schema.map((fld, i) => h('div', { key: i, className: 'row', style: { gap: 6, marginBottom: 6 } },
-          h('input', { className: 'input mono', style: { flex: 1 }, value: fld.name, placeholder: 'name', onChange: (e) => setField(i, 'name', e.target.value) }),
-          h('select', { className: 'select', style: { width: 100 }, value: fld.type, onChange: (e) => setField(i, 'type', e.target.value) },
-            ['text', 'tags', 'bool', 'select', 'code', 'secret', 'password'].map((t) => h('option', { key: t, value: t }, t))),
-          h('input', { className: 'input mono', style: { flex: 1 }, value: fld.default == null ? '' : fld.default, placeholder: 'default', onChange: (e) => setField(i, 'default', e.target.value) }),
-          h('button', { className: 'icon-btn danger', onClick: () => set('schema', f.schema.filter((_, j) => j !== i)) }, h(Icon, { name: 'trash', size: 14 })))),
+          h('button', { type: 'button', className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: addField }, h(Icon, { name: 'plus', size: 13 }), 'Add input')),
+        f.schema.map((fld, i) => h('div', { key: i, style: { marginBottom: 8 } },
+          h('div', { className: 'row', style: { gap: 6 } },
+            h('input', { className: 'input mono', style: { flex: 1 }, value: fld.name, placeholder: 'name', 'aria-label': 'Input name', onChange: (e) => setField(i, 'name', e.target.value) }),
+            h('select', { className: 'select', style: { width: 100 }, value: fld.type, 'aria-label': 'Type for ' + (fld.name || 'input'), onChange: (e) => setField(i, 'type', e.target.value) },
+              ['text', 'tags', 'bool', 'select', 'code', 'secret', 'password'].map((t) => h('option', { key: t, value: t }, t))),
+            h('input', { className: 'input mono', style: { flex: 1 }, value: fld.default == null ? '' : fld.default, placeholder: 'default', 'aria-label': 'Default for ' + (fld.name || 'input'), onChange: (e) => setField(i, 'default', e.target.value) }),
+            h('button', { type: 'button', className: 'icon-btn danger',
+              'aria-label': 'Remove ' + (fld.name || 'input') + ' input',
+              onClick: () => set('schema', f.schema.filter((_, j) => j !== i)) }, h(Icon, { name: 'trash', size: 14 }))),
+          fld.type === 'select' && h('input', {
+            className: 'input mono', style: { marginTop: 6 },
+            value: fld._optionsText == null ? selectOptionsText(fld) : fld._optionsText,
+            placeholder: 'safe, fast, debug',
+            'aria-label': 'Options for ' + (fld.name || 'input'),
+            onChange: (e) => setField(i, '_optionsText', e.target.value),
+          }))),
         f.schema.length === 0 && h('div', { className: 'hint', style: { fontSize: 11.5 } }, 'No inputs — the block runs as-is.')));
   }
 
@@ -353,6 +420,7 @@
     const [selNetId, setSelNetId] = useState(loadedTpl ? loadedTpl.networkId : null);
     const [desc, setDesc] = useState(loadedTpl ? (loadedTpl.desc || '') : '');
     const [isPublic, setIsPublic] = useState(loadedTpl ? !!loadedTpl.public : false);
+    const [mobilePanel, setMobilePanel] = useState('canvas');
 
     const bases = GD.BASE_IMAGES || [];
     const conns = GD.CONNECTIONS || [];
@@ -441,7 +509,7 @@
     const warnCount = sections.reduce((a, s) => a + s.blocks.filter(warnOf).length, 0);
 
     return h('div', { style: { display: 'flex', flexDirection: 'column', height: '100%' } },
-      h('div', { className: 'builder-bar' },
+      h('div', { className: 'builder-bar builder-header' },
         h('div', { className: 'row', style: { gap: 10, minWidth: 0 } },
           h('button', { className: 'btn ghost sm', title: 'Back', onClick: () => go('templates') },
             h(Icon, { name: 'chevronL', size: 16 }), 'Templates'),
@@ -450,7 +518,7 @@
           h('span', { className: 'chip', style: { gap: 6 } }, h(OSGlyph, { os: meta.os, size: 14 }), meta.base),
           h('span', { className: 'hint mono', style: { fontSize: 11 } }, blockCount, ' blocks'),
           warnCount > 0 && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, h(Icon, { name: 'warn', size: 12 }), warnCount, ' need input')),
-        h('div', { className: 'row', style: { marginLeft: 'auto', gap: 8 } },
+        h('div', { className: 'row builder-actions', style: { marginLeft: 'auto', gap: 8 } },
           h('button', { className: 'btn sm' + (isPublic ? ' primary' : ''),
             title: isPublic ? 'Public — every user can see and deploy this template'
                             : 'Private — only you can see this template',
@@ -458,22 +526,30 @@
             h(Icon, { name: isPublic ? 'globe' : 'lock', size: 15 }), isPublic ? 'Public' : 'Private'),
           h('button', { className: 'btn sm', onClick: openYaml }, h(Icon, { name: 'code', size: 15 }), 'View YAML'),
           h('button', { className: 'btn primary sm', onClick: doSave, disabled: busy }, h(Icon, { name: 'check', size: 15 }), busy ? 'Working…' : (loadedTpl ? 'Save changes' : 'Save template')))),
-      h('div', { style: { display: 'flex', flex: 1, minHeight: 0 } },
-        h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({}) }),
-        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove }),
-        h(Inspector, { sections, sel, meta, setInput, setAsk })),
+      h('div', { className: 'builder-mobile-switcher', role: 'tablist', 'aria-label': 'Builder panels' },
+        ['palette', 'canvas', 'inspector'].map((panel) => h('button', {
+          key: panel, id: 'builder-' + panel + '-tab', type: 'button', role: 'tab',
+          'aria-selected': mobilePanel === panel, 'aria-controls': 'builder-' + panel + '-panel',
+          className: mobilePanel === panel ? 'active' : '', onClick: () => setMobilePanel(panel),
+        }, panel[0].toUpperCase() + panel.slice(1)))),
+      h('div', { className: 'builder-workspace' },
+        h(Palette, { onAdd: (b) => addBlock(b), dragRef, onNewBlock: () => setBlockModal({}), mobileActive: mobilePanel === 'palette' }),
+        h(Canvas, { sections, sel, setSel, accepts, onDrop, onRemove, onDup, onMove, mobileActive: mobilePanel === 'canvas' }),
+        h(Inspector, { sections, sel, meta, setInput, setAsk, mobileActive: mobilePanel === 'inspector' })),
       yaml && h(Modal, { onClose: () => setYaml(false), width: 'min(680px, 94vw)' },
         h('div', { className: 'modal-head' },
           h(Icon, { name: 'code', size: 17, style: { color: 'var(--accent)' } }),
           h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, 'Generated Ansible playbook'),
           h('span', { className: 'badge', style: { marginLeft: 6 } }, 'read-only'),
-          h('button', { className: 'icon-btn', style: { marginLeft: 'auto' }, onClick: () => setYaml(false) }, h(Icon, { name: 'x', size: 16 }))),
+          h('button', { type: 'button', className: 'icon-btn', style: { marginLeft: 'auto' },
+            'aria-label': 'Close generated playbook', onClick: () => setYaml(false) }, h(Icon, { name: 'x', size: 16 }))),
         h('div', { style: { padding: 0 } },
           h('pre', { className: 'logpane', style: { margin: 0, borderRadius: 0, border: 'none', maxHeight: '60vh', fontSize: 12 } }, yamlText))),
       blockModal && h(BlockEditorModal, { initial: blockModal.initial, onClose: () => setBlockModal(null), onSaved: () => { setBlockModal(null); window.GDStore.toast('Block saved', 'ok'); window.GDStore.refresh().catch(() => {}); } }));
   }
 
   window.Builder = Builder;
+  window.BuilderUI = { activatePlacedBlock, parseSelectOptions };
   window.BlockEditorModal = BlockEditorModal;
   window.SchemaField = SchemaField;
 })();

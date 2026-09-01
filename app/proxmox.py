@@ -13,8 +13,11 @@ import ipaddress
 import logging
 import os
 import re
+import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from proxmoxer import ProxmoxAPI
 from proxmoxer.core import ResourceException
@@ -32,6 +35,16 @@ _warned_insecure_tls: set = set()
 # Docker's default bridge subnet — a guest running containers can report docker0's
 # 172.17.x gateway, which must never be mistaken for the VM's real management IP.
 _DOCKER_BRIDGE_NET = ipaddress.ip_network("172.17.0.0/16")
+_ssh_tofu_lock = threading.Lock()
+
+
+def _proxmox_port(value) -> int:
+    """Normalize legacy database values before constructing network endpoints."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 8006
+    return port if 1 <= port <= 65535 else 8006
 
 
 class ProxmoxError(RuntimeError):
@@ -48,14 +61,25 @@ class JobCancelled(Exception):
     pass
 
 
-def base_disk_filename(src_url: str) -> str:
-    """Cached per-URL qcow2 name on node storage. 'import' content needs a
-    recognised extension (cloud .img files are qcow2), and the name flows into
-    the comma-delimited import-from config — strict allowlist, URL-hash namespaced."""
-    raw_name = (src_url.rsplit("/", 1)[-1] if src_url else "image") or "image"
+def base_disk_filename(
+    src_url: str, checksum: str = "", checksum_algorithm: str = "",
+) -> str:
+    """Safe cache identity for one source and, when declared, one digest.
+
+    Checksum-less images retain the historical URL-only identity.  A declared
+    checksum becomes part of the identity so adding or changing verification can
+    never reuse bytes cached under a different integrity contract.  Only the URL
+    path contributes human-readable text; credentials and query tokens never do.
+    """
+    raw_name = ((urlsplit(src_url or "").path.rsplit("/", 1)[-1]) or "image")
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).lstrip(".-") or "image"
     stem = safe.rsplit(".", 1)[0] or "image"
-    url_tag = hashlib.sha256((src_url or "").encode()).hexdigest()[:8]
+    digest = (checksum or "").strip().lower()
+    algorithm = (checksum_algorithm or "").strip().lower()
+    identity = src_url or ""
+    if digest:
+        identity = f"{identity}\0{algorithm}\0{digest}"
+    url_tag = hashlib.sha256(identity.encode()).hexdigest()[:8]
     filename = f"{stem}-{url_tag}.qcow2"
     if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
         raise RuntimeError(f"unsafe image filename derived from URL: {raw_name!r}")
@@ -119,7 +143,7 @@ class Proxmox:
             token_value=decrypt(conn.token_secret_enc),
             verify_ssl=conn.verify_tls,
             service="PVE",
-            port=conn.port or 8006,
+            port=_proxmox_port(conn.port),
             timeout=30,
         )
 
@@ -318,6 +342,40 @@ class Proxmox:
         except Exception:  # noqa: BLE001
             return False
 
+    def delete_storage_volume(self, filename: str, node: Optional[str] = None):
+        """Delete one safe import-cache volume, returning a task id when PVE does."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", filename or ""):
+            raise ProxmoxError(f"invalid storage filename: {filename!r}")
+        node = node or self.pick_node()
+        volid = self.iso_volume_path(filename)
+        return self.api.nodes(node).storage(self.iso_storage).content(volid).delete()
+
+    def validate_snippet_volume(self, volid: str, node: Optional[str] = None) -> None:
+        """Require a normalized, configured, and API-visible cloud-init snippet.
+
+        SSH/SFTP success alone does not prove that Proxmox can attach the volume.
+        Check the active snippet storage advertises ``snippets`` and that its content
+        API lists this exact volume before accepting a VM-create request.
+        """
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+):snippets/([A-Za-z0-9_.-]+)", volid or "")
+        if not match:
+            raise ProxmoxError(f"invalid snippet volume id: {volid!r}")
+        storage = match.group(1)
+        if storage != self.snippet_storage:
+            raise ProxmoxError(
+                f"snippet volume storage {storage!r} does not match configured storage "
+                f"{self.snippet_storage!r}"
+            )
+        node = node or self.pick_node()
+        stores = self.api.nodes(node).storage.get() or []
+        active = next((item for item in stores if (item or {}).get("storage") == storage), None)
+        contents = [part.strip() for part in str((active or {}).get("content", "")).split(",")]
+        if not active or not active.get("active") or "snippets" not in contents:
+            raise ProxmoxError(f"storage {storage!r} is not active for snippets on {node}")
+        volumes = self.api.nodes(node).storage(storage).content.get(content="snippets") or []
+        if volid not in {(item or {}).get("volid") for item in volumes}:
+            raise ProxmoxError(f"snippet volume {volid!r} is not visible on {node}")
+
     def create_vm_import(
         self, vmid: int, name: str, import_path: str, cores: int, ram_mb: int,
         node: Optional[str] = None,
@@ -437,7 +495,7 @@ class Proxmox:
 
     def console_ws_url(self, vmid: int, node: str, port, ticket: str) -> str:
         from urllib.parse import quote
-        host, pp = self.conn.host, self.conn.port or 8006
+        host, pp = self.conn.host, _proxmox_port(self.conn.port)
         return (f"wss://{host}:{pp}/api2/json/nodes/{node}/qemu/{vmid}"
                 f"/vncwebsocket?port={port}&vncticket={quote(str(ticket))}")
 
@@ -454,6 +512,41 @@ def _load_ssh_key(path: str):
     return None
 
 
+def _tofu_host_key_policy(paramiko, tofu_path: Path):
+    """Persist the first key for a hostname, then reject every unknown key type.
+
+    Paramiko's AutoAddPolicy works per hostname *and algorithm*, which would accept
+    an ECDSA attacker key after an RSA key was pinned.  TOFU is hostname-wide here:
+    once any algorithm is known, only an exact previously pinned key is acceptable.
+    """
+    class _HostnameTofuPolicy(paramiko.MissingHostKeyPolicy):
+        def missing_host_key(self, client, hostname, key):
+            with _ssh_tofu_lock:
+                persisted = paramiko.HostKeys()
+                persisted.load(str(tofu_path))
+                pinned = []
+                for host_keys in (
+                    getattr(client, "_system_host_keys", None),
+                    getattr(client, "_host_keys", None),
+                    persisted,
+                ):
+                    known = host_keys.lookup(hostname) if host_keys is not None else None
+                    if known:
+                        pinned.extend(known.values())
+                if any(existing == key for existing in pinned):
+                    # A concurrent first connection may have persisted this exact key
+                    # after this client loaded its snapshot but before its handshake.
+                    client._host_keys.add(hostname, key.get_name(), key)
+                    return
+                if pinned:
+                    raise paramiko.BadHostKeyException(hostname, key, pinned[0])
+                client._host_keys.add(hostname, key.get_name(), key)
+                client.save_host_keys(str(tofu_path))
+                os.chmod(tofu_path, 0o600)
+
+    return _HostnameTofuPolicy()
+
+
 def _ssh_client(conn: Connection, key, timeout: int):
     """Connected paramiko SSHClient for the node — shared by snippet write/delete.
     Honours any known_hosts we have so a pinned node can't be MITM'd. Strict
@@ -467,11 +560,27 @@ def _ssh_client(conn: Connection, key, timeout: int):
         pass
     if settings.ssh_known_hosts and os.path.exists(settings.ssh_known_hosts):
         try:
-            client.load_host_keys(settings.ssh_known_hosts)
+            # Explicit pins are read-only and checked before the writable TOFU set.
+            client.load_system_host_keys(settings.ssh_known_hosts)
         except Exception:  # noqa: BLE001
             pass
+    if not settings.ssh_strict:
+        tofu_path = Path(settings.data_dir) / "ssh_known_hosts"
+        tofu_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(tofu_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
+        # Existing installations may have created the file under a permissive umask.
+        # Tighten it before loading; AutoAddPolicy preserves the mode when truncating.
+        os.chmod(tofu_path, 0o600)
+        client.load_host_keys(str(tofu_path))
     client.set_missing_host_key_policy(
-        paramiko.RejectPolicy() if settings.ssh_strict else paramiko.AutoAddPolicy()
+        paramiko.RejectPolicy()
+        if settings.ssh_strict
+        else _tofu_host_key_policy(paramiko, tofu_path)
     )
     client.connect(conn.ssh_host or conn.host, username=conn.ssh_user or "root", pkey=key, timeout=timeout)
     return client
@@ -514,18 +623,30 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
         # Pure SFTP — no shell exec, so nothing user-influenced reaches a shell.
         sftp = client.open_sftp()
         try:
-            sftp.stat(base)
-        except IOError:
             try:
-                sftp.mkdir(base)
+                sftp.stat(base)
             except IOError:
-                pass  # parent may be missing; putfo below will surface a clear error
-        sftp.putfo(io.BytesIO(content.encode("utf-8")), remote)
-        sftp.close()
+                try:
+                    sftp.mkdir(base)
+                except IOError:
+                    pass  # parent may be missing; putfo below will surface a clear error
+            sftp.putfo(io.BytesIO(content.encode("utf-8")), remote)
+            # The cloud-config may contain resolved password/secret inputs.  Fail
+            # closed unless the node-side copy is readable only by its SSH owner.
+            try:
+                sftp.chmod(remote, 0o600)
+            except Exception:
+                try:
+                    sftp.remove(remote)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+        finally:
+            sftp.close()
     finally:
         client.close()
 
-    return f"{conn.snippet_storage}:snippets/{filename}"
+    return f"{store}:snippets/{filename}"
 
 
 def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:
@@ -554,3 +675,28 @@ def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:
         pass
     finally:
         client.close()
+
+
+# --------------------------------------------------------------------------- #
+# read-only inventory truth                                                    #
+# --------------------------------------------------------------------------- #
+VM_PRESENT = "present"
+VM_ABSENT = "absent"
+VM_UNKNOWN = "unknown"
+
+
+def probe_vm_presence(
+    px: Optional["Proxmox"], vmid: Optional[int], node: Optional[str]
+) -> tuple[str, str]:
+    """Return tri-state Proxmox inventory truth without collapsing errors to absence."""
+    if vmid is None:
+        return VM_ABSENT, "VM ID was never assigned"
+    if px is None:
+        return VM_UNKNOWN, "Proxmox client unavailable"
+    try:
+        present = vmid in {int(v["vmid"]) for v in px.list_qemu(node)}
+    except Exception as exc:  # noqa: BLE001
+        return VM_UNKNOWN, f"Proxmox inventory probe failed: {exc}"
+    if present:
+        return VM_PRESENT, f"VM {vmid} is present in Proxmox inventory"
+    return VM_ABSENT, f"VM {vmid} is absent from Proxmox inventory"

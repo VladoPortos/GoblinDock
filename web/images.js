@@ -8,6 +8,27 @@
   const refresh = () => window.GDStore.refresh().catch(() => {});
   const toast = (m, t) => window.GDStore.toast(m, t);
 
+  const CHECKSUM_ALGORITHMS = {
+    32: 'MD5', 40: 'SHA-1', 64: 'SHA-256', 96: 'SHA-384', 128: 'SHA-512',
+  };
+
+  function checksumMeta(value) {
+    const normalized = String(value || '').trim().toLowerCase();
+    if (!normalized) {
+      return { normalized: '', valid: true, algorithm: 'Optional', message: 'Optional' };
+    }
+    const algorithm = CHECKSUM_ALGORITHMS[normalized.length];
+    if (algorithm && /^[0-9a-f]+$/.test(normalized)) {
+      return { normalized, valid: true, algorithm, message: algorithm + ' checksum' };
+    }
+    return {
+      normalized,
+      valid: false,
+      algorithm: '',
+      message: 'Enter a bare hexadecimal checksum with 32, 40, 64, 96, or 128 characters.',
+    };
+  }
+
   /* ============ ISOs / BASE IMAGES (Manage) ============ */
   function IsoCard({ img, go, onEdit, onDelete, isAdmin, cacheState, syncing, canSync, onSync }) {
     return h('div', { className: 'card', style: { overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
@@ -25,7 +46,7 @@
                 : '— cache unknown'))),
         h('div', null,
           h('div', { className: 'panel-title', style: { marginBottom: 6 } }, 'Cloud image URL'),
-          h('div', { className: 'copy mono', style: { fontSize: 10.5, wordBreak: 'break-all' } }, img.source_url || img.checksum))),
+          h('div', { className: 'copy mono', style: { fontSize: 10.5, wordBreak: 'break-all' } }, img.source_url || img.checksum || 'Not provided'))),
       h('div', { style: { display: 'flex', borderTop: '1px solid var(--border-soft)' } },
         h('button', { className: 'card-act', onClick: () => go('newtemplate', { baseImageId: img.imgId }) }, h(Icon, { name: 'template', size: 14 }), 'New template'),
         isAdmin && h('button', { className: 'card-act', disabled: !canSync,
@@ -38,28 +59,60 @@
         isAdmin && h(Menu, { align: 'right', items: [
           { label: 'Edit', icon: 'edit', onClick: () => onEdit(img) },
           { sep: true },
-          { label: 'Delete', icon: 'trash', danger: true, onClick: () => onDelete(img) },
+          { label: 'Delete', icon: 'trash', danger: true,
+            disabled: img.canDelete !== true,
+            title: img.canDelete === true ? 'Delete base image' : 'This image is referenced by a template or deployed VM',
+            onClick: () => onDelete(img) },
         ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' } }, h(Icon, { name: 'more', size: 16 })))));
   }
 
   function IsoModal({ img, onClose, onDone }) {
     const editing = !!img;
-    const [f, setF] = useState({ name: img ? img.name : '', os_family: img ? img.os : 'ubuntu', source_url: img ? (img.source_url || '') : '' });
+    const [f, setF] = useState({
+      name: img ? img.name : '',
+      os_family: img ? img.os : 'ubuntu',
+      source_url: img ? (img.source_url || '') : '',
+      checksum: img ? (img.checksum || '') : '',
+    });
     const [busy, setBusy] = useState(false);
+    const checksumId = React.useId();
+    const checksumFeedbackId = checksumId + '-feedback';
+    const checksum = checksumMeta(f.checksum);
     const set = (k, v) => setF((p) => ({ ...p, [k]: v }));
     const submit = async () => {
       if (!f.name.trim() || !f.source_url.trim()) { toast('Name and URL required', 'err'); return; }
+      if (!checksum.valid) { toast(checksum.message, 'err'); return; }
       setBusy(true);
       try {
-        if (editing) await window.API.editImage(img.imgId, f);
-        else await window.API.addBaseImage(f);
+        const payload = { ...f, checksum: checksum.normalized };
+        if (editing) await window.API.editImage(img.imgId, payload);
+        else await window.API.addBaseImage(payload);
         onDone();
       } catch (e) { toast(e.message, 'err'); setBusy(false); }
     };
     return h(FormModal, { title: editing ? 'Edit base image' : 'Add base image (ISO)', icon: 'disk', onClose, onSubmit: submit, busy },
       h(Field, { label: 'Name', value: f.name, onChange: (v) => set('name', v), placeholder: 'Ubuntu 24.04 LTS' }),
       h(SelectField, { label: 'OS family', value: f.os_family, onChange: (v) => set('os_family', v), options: ['ubuntu', 'debian', 'alpine', 'rocky', 'generic'] }),
-      h(Field, { label: 'Cloud image URL (.img/.qcow2)', value: f.source_url, onChange: (v) => set('source_url', v), mono: true, placeholder: 'https://…/noble-server-cloudimg-amd64.img' }));
+      h(Field, { label: 'Cloud image URL (.img/.qcow2)', value: f.source_url, onChange: (v) => set('source_url', v), mono: true, placeholder: 'https://…/noble-server-cloudimg-amd64.img' }),
+      h('div', null,
+        h('label', { className: 'field-label', htmlFor: checksumId }, 'Checksum (optional)'),
+        h('input', {
+          id: checksumId,
+          className: 'input mono',
+          value: f.checksum,
+          placeholder: '64-character SHA-256 digest',
+          spellCheck: false,
+          autoCapitalize: 'none',
+          'aria-invalid': !checksum.valid,
+          'aria-describedby': checksumFeedbackId,
+          onChange: (e) => set('checksum', e.target.value),
+        }),
+        h('div', {
+          id: checksumFeedbackId,
+          className: 'hint',
+          'aria-live': 'polite',
+          style: { fontSize: 11, marginTop: 4, color: checksum.valid ? null : 'var(--err)' },
+        }, checksum.message)));
   }
 
   function Isos({ go }) {
@@ -130,15 +183,10 @@
       modal === 'add' && h(IsoModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Base image added', 'ok'); refresh(); } }),
       modal && modal.img && h(IsoModal, { img: modal.img, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Base image updated', 'ok'); refresh(); } }),
       confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Remove ' + confirm.name + '?',
-        body: 'Removes the base image entry. Downloaded files on the node are not deleted.'
-          + (function () {
-            const refs = ((window.GD.TEMPLATES) || []).filter((t) => t.baseImageId === confirm.imgId).length;
-            return refs ? ' ' + refs + ' template' + (refs === 1 ? ' references' : 's reference') + ' this image — '
-              + (refs === 1 ? 'it keeps' : 'they keep') + ' working but ' + (refs === 1 ? 'loses' : 'lose')
-              + ' deploy until re-pointed.' : '';
-          })(),
+        body: 'Removes the base image entry. No template or deployed VM references it. Downloaded files on the node are not deleted.',
         confirmLabel: 'Remove', onConfirm: () => del(confirm) }));
   }
 
+  window.ImageUI = { checksumMeta, IsoModal };
   window.Isos = Isos;
 })();

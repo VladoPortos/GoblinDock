@@ -118,6 +118,11 @@ class Settings:
         self.backup_dir = Path(
             os.environ.get("GOBLINDOCK_BACKUP_DIR", str(self.data_dir / "backups")))
 
+        # Build identity baked into the image by CI (e.g. "beta-build@<sha>" or
+        # "v2.6.0@<sha>") — shown on the admin Health page next to __version__.
+        # Empty on a from-source run.
+        self.build_info = os.environ.get("GOBLINDOCK_BUILD", "").strip()
+
         # Optional first-run admin bootstrap.
         self.admin_email = os.environ.get("GOBLINDOCK_ADMIN_EMAIL", "")
         self.admin_password = os.environ.get("GOBLINDOCK_ADMIN_PASSWORD", "")

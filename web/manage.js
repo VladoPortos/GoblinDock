@@ -63,9 +63,15 @@
               ? h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => fork(b) }, h(Icon, { name: 'duplicate', size: 14 }), 'Fork')
               : h('div', { className: 'row', style: { marginLeft: 'auto', gap: 4 } },
                   h('button', { className: 'btn ghost sm', onClick: () => setEditor({ initial: b }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
-                  h('button', { className: 'icon-btn danger', onClick: () => setConfirm(b) }, h(Icon, { name: 'trash', size: 15 }))))))),
+                  h('button', {
+                    type: 'button', className: 'icon-btn danger',
+                    disabled: b.canDelete !== true,
+                    title: b.canDelete === true ? 'Delete block' : 'This block is referenced by a template',
+                    'aria-label': 'Delete ' + b.name,
+                    onClick: () => setConfirm(b),
+                  }, h(Icon, { name: 'trash', size: 15 }))))))),
       editor && h(window.BlockEditorModal, { initial: editor.initial, onClose: () => setEditor(null), onSaved: () => { setEditor(null); toast('Block saved', 'ok'); refresh(); } }),
-      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'This removes your custom block. Templates already using it keep their copy of the inputs.', confirmLabel: 'Delete block', onConfirm: () => del(confirm) }));
+      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'This permanently removes your custom block. It is not referenced by any template.', confirmLabel: 'Delete block', onConfirm: () => del(confirm) }));
   }
 
   /* ============ SECRETS ============ */
@@ -142,9 +148,10 @@
             h('h3', null, 'No secrets yet'),
             h('button', { className: 'btn primary', onClick: () => setModal('add') }, h(Icon, { name: 'plus', size: 16 }), 'Add secret')))
         : h('div', { className: 'card', style: { overflow: 'hidden' } },
+            h('div', { className: 'table-scroll' },
             h('table', { className: 'tbl' },
               h('thead', null, h('tr', null, ['Name', 'Scope', 'Value', 'Created by', 'Last used', ''].map((c, i) => h('th', { key: i }, c)))),
-              h('tbody', null, (GD.SECRETS || []).map((s) => h(SecretRow, { key: s.id, s, onDelete: (x) => setConfirm(x), onEdit: (x) => setModal({ secret: x }) }))))),
+              h('tbody', null, (GD.SECRETS || []).map((s) => h(SecretRow, { key: s.id, s, onDelete: (x) => setConfirm(x), onEdit: (x) => setModal({ secret: x }) })))))),
       modal === 'add' && h(SecretModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Secret added', 'ok'); refresh(); } }),
       modal && modal.secret && h(SecretModal, { secret: modal.secret, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Secret updated', 'ok'); refresh(); } }),
       confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'Blocks referencing this secret will fail until you add it again.', confirmLabel: 'Delete', onConfirm: () => del(confirm) }));
@@ -195,6 +202,7 @@
             h('h3', null, 'No variables yet'),
             h('button', { className: 'btn primary', onClick: () => setModal('add') }, h(Icon, { name: 'plus', size: 16 }), 'Add variable')))
         : h('div', { className: 'card', style: { overflow: 'hidden' } },
+            h('div', { className: 'table-scroll' },
             h('table', { className: 'tbl' },
               h('thead', null, h('tr', null, ['Name', 'Scope', 'Value', 'Created by', ''].map((c, i) => h('th', { key: i }, c)))),
               h('tbody', null, (GD.VARIABLES || []).map((v) => h('tr', { key: v.id },
@@ -210,7 +218,7 @@
                   { label: 'Edit', icon: 'edit', onClick: () => setModal({ variable: v }) },
                   { sep: true },
                   { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm(v) },
-                ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 16 }))))))))),
+                ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 16 })))))))))),
       modal === 'add' && h(VarModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Variable added', 'ok'); refresh(); } }),
       modal && modal.variable && h(VarModal, { variable: modal.variable, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Variable updated', 'ok'); refresh(); } }),
       confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'Blocks referencing this variable fall back to an empty value.', confirmLabel: 'Delete', onConfirm: () => del(confirm) }));
@@ -224,36 +232,82 @@
         h('div', null,
           h('h1', { className: 'page-title' }, 'Settings'),
           h('div', { className: 'page-sub' }, 'Admin · infrastructure that everything else builds on.'))),
-      h('div', { className: 'seg', style: { marginBottom: 18 } },
+      h('div', { className: 'seg settings-section-selector', style: { marginBottom: 18 } },
         h('button', { className: tab === 'connections' ? 'active' : '', onClick: () => setTab('connections') }, h(Icon, { name: 'server', size: 14 }), 'Proxmox'),
         h('button', { className: tab === 'networks' ? 'active' : '', onClick: () => setTab('networks') }, h(Icon, { name: 'network', size: 14 }), 'Networks'),
         h('button', { className: tab === 'users' ? 'active' : '', onClick: () => setTab('users') }, h(Icon, { name: 'users', size: 14 }), 'Users'),
         h('button', { className: tab === 'backups' ? 'active' : '', onClick: () => setTab('backups') }, h(Icon, { name: 'download', size: 14 }), 'Backups'),
         h('button', { className: tab === 'audit' ? 'active' : '', onClick: () => setTab('audit') }, h(Icon, { name: 'history', size: 14 }), 'Audit'),
-        h('button', { className: tab === 'prefs' ? 'active' : '', onClick: () => setTab('prefs') }, h(Icon, { name: 'sliders', size: 14 }), 'Preferences')),
+        h('button', { className: tab === 'prefs' ? 'active' : '', onClick: () => setTab('prefs') }, h(Icon, { name: 'sliders', size: 14 }), 'Preferences'),
+        h('button', { className: tab === 'health' ? 'active' : '', onClick: () => setTab('health') }, h(Icon, { name: 'activity', size: 14 }), 'Health')),
       tab === 'connections' ? h(Connections) : tab === 'networks' ? h(Networks)
         : tab === 'users' ? h(Users) : tab === 'backups' ? h(Backups)
-        : tab === 'prefs' ? h(Preferences) : h(AuditLog));
+        : tab === 'prefs' ? h(Preferences) : tab === 'health' ? h(Health) : h(AuditLog));
   }
 
   /* ---- Connections ---- */
+  function connectionDraft(conn) {
+    const c = conn || {};
+    const hostFromUrl = (c.url || '').replace(/^https?:\/\//, '').split(':')[0];
+    return {
+      name: c.name ?? '',
+      host: c.host ?? hostFromUrl,
+      port: c.port ?? 8006,
+      token_id: c.tokenId ?? '',
+      token_secret: '',
+      node: c.node ?? '',
+      storage: c.storage === '—' ? '' : (c.storage ?? (conn ? '' : 'local-zfs')),
+      iso_storage: c.isoStorage ?? 'local',
+      snippet_storage: c.snippetStorage ?? 'local',
+      bridge: c.bridge ?? 'vmbr0',
+      verify_tls: c.verifyTls == null ? true : !!c.verifyTls,
+      ssh_host: c.sshHost ?? '',
+      ssh_user: c.sshUser ?? 'root',
+      ssh_key_path: c.sshKeyPath ?? '',
+      max_cores: c.maxCores ?? 0,
+      max_ram_gb: c.maxRamGb ?? 0,
+      max_disk_gb: c.maxDiskGb ?? 0,
+    };
+  }
+
+  function finiteNumber(value, fallback) {
+    const number = Number(value);
+    return Number.isFinite(number) ? number : fallback;
+  }
+
+  function nonnegativeNumber(value) {
+    return Math.max(0, finiteNumber(value, 0));
+  }
+
+  function connectionPayload(draft, editing) {
+    const portText = String(draft.port == null ? '' : draft.port).trim();
+    const payload = {
+      name: draft.name,
+      host: draft.host,
+      port: portText ? finiteNumber(draft.port, 8006) : 8006,
+      token_id: draft.token_id,
+      verify_tls: draft.verify_tls,
+      node: draft.node,
+      storage: draft.storage,
+      iso_storage: draft.iso_storage,
+      snippet_storage: draft.snippet_storage,
+      bridge: draft.bridge,
+      ssh_host: draft.ssh_host,
+      ssh_user: draft.ssh_user,
+      ssh_key_path: draft.ssh_key_path,
+      max_cores: nonnegativeNumber(draft.max_cores),
+      max_ram_gb: nonnegativeNumber(draft.max_ram_gb),
+      max_disk_gb: nonnegativeNumber(draft.max_disk_gb),
+    };
+    if (!editing || String(draft.token_secret ?? '').trim()) {
+      payload.token_secret = draft.token_secret ?? '';
+    }
+    return payload;
+  }
+
   function ConnModal({ conn, onClose, onDone }) {
     const editing = !!conn;
-    const [f, setF] = useState(() => ({
-      name: conn ? conn.name : '',
-      host: conn ? (conn.host || (conn.url || '').replace(/^https?:\/\//, '').split(':')[0]) : '',
-      port: conn ? (conn.port || 8006) : 8006,
-      token_id: conn ? (conn.tokenId || '') : '', token_secret: '',
-      node: conn ? conn.node : '',
-      storage: conn ? (conn.storage === '—' ? '' : conn.storage) : 'local-zfs',
-      iso_storage: conn ? (conn.isoStorage || 'local') : 'local',
-      snippet_storage: conn ? (conn.snippetStorage || 'local') : 'local',
-      bridge: conn ? conn.bridge : 'vmbr0',
-      verify_tls: conn ? !!conn.verifyTls : true,
-      max_cores: conn ? (conn.maxCores || 0) : 0,
-      max_ram_gb: conn ? (conn.maxRamGb || 0) : 0,
-      max_disk_gb: conn ? (conn.maxDiskGb || 0) : 0,
-    }));
+    const [f, setF] = useState(() => connectionDraft(conn));
     const [busy, setBusy] = useState(false);
     const [probe, setProbe] = useState(null);      // null until a successful "Load from Proxmox"
     const [probing, setProbing] = useState(false);
@@ -291,22 +345,20 @@
       if (!f.name || !f.host || (!editing && (!f.token_id || !f.token_secret))) { toast('Name, host and token are required', 'err'); return; }
       setBusy(true);
       try {
-        const limits = { max_cores: Number(f.max_cores) || 0, max_ram_gb: Number(f.max_ram_gb) || 0, max_disk_gb: Number(f.max_disk_gb) || 0 };
+        const payload = connectionPayload(f, editing);
         if (editing) {
-          const payload = { name: f.name, host: f.host, port: Number(f.port), node: f.node, storage: f.storage, iso_storage: f.iso_storage, snippet_storage: f.snippet_storage, bridge: f.bridge, verify_tls: f.verify_tls, ...limits };
-          if (f.token_id) payload.token_id = f.token_id;
-          if (f.token_secret) payload.token_secret = f.token_secret;
           await window.API.editConnection(conn.connId, payload);
         } else {
-          await window.API.addConnection({ ...f, port: Number(f.port), ...limits });
+          await window.API.addConnection(payload);
         }
         onDone();
       } catch (e) { toast(e.message, 'err'); setBusy(false); }
     };
     return h(FormModal, { title: editing ? 'Edit connection' : 'Add Proxmox connection', icon: 'server', onClose, onSubmit: submit, busy, submitLabel: editing ? 'Save' : 'Add', width: 'min(560px, 94vw)' },
-      h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
+      h('div', { className: 'connection-form-grid', style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 12 } },
         h(Field, { label: 'Name', value: f.name, onChange: (v) => set('name', v) }),
         h(Field, { label: 'Host / IP', value: f.host, onChange: (v) => set('host', v), mono: true }),
+        h(Field, { label: 'API port', value: f.port, onChange: (v) => set('port', v.replace(/[^0-9]/g, '')), mono: true }),
         h(Field, { label: 'Token ID', value: f.token_id, onChange: (v) => set('token_id', v), mono: true, placeholder: 'goblindock@pve!app' }),
         h(Field, { label: 'Token secret' + (editing ? ' (leave blank to keep)' : ''), value: f.token_secret, onChange: (v) => set('token_secret', v), mono: true, type: 'password', placeholder: editing ? '••••••••' : '' }),
         h('div', { style: { gridColumn: '1 / -1', display: 'flex', alignItems: 'center', gap: 10 } },
@@ -328,20 +380,28 @@
         probe
           ? h(SelectField, { label: 'ISO storage', value: f.iso_storage, onChange: (v) => set('iso_storage', v), options: isoStoreOpts })
           : h(Field, { label: 'ISO storage', value: f.iso_storage, onChange: (v) => set('iso_storage', v), mono: true }),
+        h(Field, { label: 'Snippet storage', value: f.snippet_storage, onChange: (v) => set('snippet_storage', v), mono: true }),
         probe
           ? h(SelectField, { label: 'Bridge', value: f.bridge, onChange: (v) => set('bridge', v), options: bridgeOpts })
           : h(Field, { label: 'Bridge', value: f.bridge, onChange: (v) => set('bridge', v), mono: true }),
+        h(Field, { label: 'SSH host', value: f.ssh_host, onChange: (v) => set('ssh_host', v), mono: true }),
+        h(Field, { label: 'SSH user', value: f.ssh_user, onChange: (v) => set('ssh_user', v), mono: true }),
+        h(Field, { label: 'SSH key path', value: f.ssh_key_path, onChange: (v) => set('ssh_key_path', v), mono: true, placeholder: '/run/secrets/pve_key' }),
         h('div', { style: { gridColumn: '1 / -1' } },
           h('label', { className: 'field-label' }, 'Per-VM limits for this target ',
-            h('span', { className: 'hint', style: { fontWeight: 400, fontSize: 11 } }, '· 0 = inherit global')),
-          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
+            h('span', { className: 'hint', style: { fontWeight: 400, fontSize: 11 } }, '· 0 = unlimited')),
+          h('div', { className: 'connection-limit-grid', style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
             h(Field, { label: 'Max vCPU', value: f.max_cores, onChange: (v) => set('max_cores', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' }),
             h(Field, { label: 'Max RAM (GB)', value: f.max_ram_gb, onChange: (v) => set('max_ram_gb', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' }),
             h(Field, { label: 'Max disk (GB)', value: f.max_disk_gb, onChange: (v) => set('max_disk_gb', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' })))));
   }
 
-  function NodeGauge({ connId }) {
-    const cap = useFetched(() => window.API.connectionCapacity(connId), [connId], { online: false });
+  function NodeGauge({ connId, disabled }) {
+    // a disabled source is never probed — don't even ask the capacity endpoint
+    const cap = useFetched(() => disabled
+      ? Promise.resolve({ online: false, disabled: true })
+      : window.API.connectionCapacity(connId), [connId, disabled], { online: false });
+    if (disabled) return h('div', { className: 'hint mono', style: { fontSize: 11, opacity: 0.6 } }, 'source disabled — not polled');
     if (!cap) return h('div', { className: 'hint mono', style: { fontSize: 11 } }, 'checking capacity…');
     if (!cap.online) return h('div', { className: 'hint mono', style: { fontSize: 11, opacity: 0.6 } }, 'node offline');
     const bar = (label, used, total) => h('div', { style: { marginTop: 4 } },
@@ -364,7 +424,25 @@
       catch (e) { toast(e.message, 'err'); }
       setTesting((t) => ({ ...t, [c.connId]: false })); refresh();
     };
-    const del = async (c) => { try { await window.API.deleteConnection(c.connId); toast('Connection removed', 'ok'); refresh(); } catch (e) { toast(e.message, 'err'); } };
+    const del = async (c) => {
+      try {
+        await window.API.deleteConnection(c.connId);
+        // drop the card (and its networks) NOW — the in-flight /state may still be
+        // waiting on this very connection's dead probe and predates the delete
+        window.GDStore.removeConnection(c.connId);
+        toast('Connection removed', 'ok');
+        window.GDStore.refresh({ fresh: true }).catch(() => {});
+      } catch (e) { toast(e.message, 'err'); }
+    };
+    const toggleDisabled = async (c) => {
+      try {
+        await window.API.editConnection(c.connId, { disabled: !c.disabled });
+        toast(c.disabled
+          ? c.name + ' enabled — inventory refreshes on the next poll'
+          : c.name + ' disabled — its VMs are hidden and it will not be polled or targeted', c.disabled ? 'ok' : 'warn');
+        refresh();
+      } catch (e) { toast(e.message, 'err'); }
+    };
     return h('div', null,
       h('div', { className: 'row', style: { marginBottom: 14 } },
         h('span', { className: 'panel-title' }, (GD.CONNECTIONS || []).length, ' connections'),
@@ -377,7 +455,8 @@
               h('div', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, c.name),
               h('div', { className: 'copy mono', style: { fontSize: 11 } }, c.url)),
             h('div', { style: { marginLeft: 'auto' } },
-              c.status === 'online' ? h('span', { className: 'badge running' }, h('span', { className: 'dot running' }), 'v', c.version)
+              c.disabled ? h('span', { className: 'badge', title: 'Disabled by an admin — not polled, VMs hidden, no new operations' }, h('span', { className: 'dot' }), 'Disabled')
+                : c.status === 'online' ? h('span', { className: 'badge running' }, h('span', { className: 'dot running' }), 'v', c.version)
                 : c.status === 'offline' ? h('span', { className: 'badge error' }, h('span', { className: 'dot error' }), 'Offline')
                 : h('span', { className: 'badge' }, 'Unknown'))),
           h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
@@ -391,10 +470,16 @@
               h(Icon, { name: 'sliders', size: 12 }),
               h('span', { className: 'hint mono', style: { fontSize: 11 } }, 'Per-VM max: ' + cpu + ' vCPU · ' + ram + ' GB · ' + disk + ' GB'));
           })(),
-          h(NodeGauge, { connId: c.connId }),
+          h(NodeGauge, { connId: c.connId, disabled: c.disabled }),
           h('div', { className: 'divider' }),
           h('div', { className: 'row', style: { gap: 8 } },
             h('button', { className: 'btn sm', style: { flex: 1 }, onClick: () => test(c), disabled: testing[c.connId] }, h(Icon, { name: 'refresh', size: 14 }), testing[c.connId] ? 'Testing…' : 'Test'),
+            h('button', {
+              className: 'btn sm' + (c.disabled ? ' primary' : ''), style: { flex: 1 },
+              title: c.disabled ? 'Re-enable: VMs reappear and inventory refreshes — nothing was lost'
+                : 'Disable: keep the config and VM records, but stop polling and hide its VMs (for a source that is offline / in maintenance / retired)',
+              onClick: () => toggleDisabled(c),
+            }, h(Icon, { name: c.disabled ? 'play' : 'stop', size: 14 }), c.disabled ? 'Enable' : 'Disable'),
             h('button', { className: 'btn ghost sm icon', onClick: () => setModal({ conn: c }) }, h(Icon, { name: 'edit', size: 15 })),
             h('button', { className: 'icon-btn danger', onClick: () => setConfirm(c) }, h(Icon, { name: 'trash', size: 16 })))))),
       modal === 'add' && h(ConnModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Connection added', 'ok'); refresh(); } }),
@@ -448,28 +533,36 @@
   function Networks() {
     const [modal, setModal] = useState(null);
     const [confirm, setConfirm] = useState(null);
-    const del = async (n) => { try { await window.API.deleteNetwork(n.netId); toast('Network deleted', 'ok'); refresh(); } catch (e) { toast(e.message, 'err'); } };
+    const del = async (n) => {
+      try {
+        await window.API.deleteNetwork(n.netId);
+        window.GDStore.removeNetwork(n.netId);
+        toast('Network deleted', 'ok');
+        window.GDStore.refresh({ fresh: true }).catch(() => {});
+      } catch (e) { toast(e.message, 'err'); }
+    };
     return h('div', null,
       h('div', { className: 'row', style: { marginBottom: 14 } },
         h('span', { className: 'panel-title' }, 'Per-connection networks'),
         h('button', { className: 'btn primary sm', style: { marginLeft: 'auto' }, onClick: () => setModal('add') }, h(Icon, { name: 'plus', size: 15 }), 'Add network')),
       h('div', { className: 'card', style: { overflow: 'hidden' } },
-        h('table', { className: 'tbl' },
-          h('thead', null, h('tr', null, ['Name', 'Connection', 'Mode', 'Bridge', 'Subnet', 'IP allocation', ''].map((c, i) => h('th', { key: i }, c)))),
-          h('tbody', null, (GD.NETWORKS || []).map((n) => h('tr', { key: n.id },
-            h('td', null, h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 13 } }, n.name)),
-            h('td', null, h('span', { className: 'chip' }, n.conn)),
-            h('td', null, n.mode === 'DHCP' ? h('span', { className: 'badge info' }, 'DHCP') : h('span', { className: 'badge accent' }, 'Static')),
-            h('td', { className: 'mono', style: { fontSize: 12 } }, n.bridge, n.vlan !== '—' ? (' · vlan ' + n.vlan) : ''),
-            h('td', { className: 'mono', style: { fontSize: 12 } }, n.subnet),
-            h('td', { style: { width: 150 } }, h('div', { className: 'row', style: { gap: 8 } },
-              h('div', { style: { width: 64 } }, h('div', { className: 'meter' }, h('i', { style: { width: (n.used / Math.max(1, n.total) * 100) + '%' } }))),
-              h('span', { className: 'mono hint', style: { fontSize: 11 } }, n.used, ' / ', n.total))),
-            h('td', null, h(Menu, { items: [
-              { label: 'Edit', icon: 'edit', onClick: () => setModal({ net: n }) },
-              { sep: true },
-              { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm(n) },
-            ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 16 }))))))))),
+        h('div', { className: 'table-scroll' },
+          h('table', { className: 'tbl' },
+            h('thead', null, h('tr', null, ['Name', 'Connection', 'Mode', 'Bridge', 'Subnet', 'IP allocation', ''].map((c, i) => h('th', { key: i }, c)))),
+            h('tbody', null, (GD.NETWORKS || []).map((n) => h('tr', { key: n.id },
+              h('td', null, h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 13 } }, n.name)),
+              h('td', null, h('span', { className: 'chip' }, n.conn)),
+              h('td', null, n.mode === 'DHCP' ? h('span', { className: 'badge info' }, 'DHCP') : h('span', { className: 'badge accent' }, 'Static')),
+              h('td', { className: 'mono', style: { fontSize: 12 } }, n.bridge, n.vlan !== '—' ? (' · vlan ' + n.vlan) : ''),
+              h('td', { className: 'mono', style: { fontSize: 12 } }, n.subnet),
+              h('td', { style: { width: 150 } }, h('div', { className: 'row', style: { gap: 8 } },
+                h('div', { style: { width: 64 } }, h('div', { className: 'meter' }, h('i', { style: { width: (n.used / Math.max(1, n.total) * 100) + '%' } }))),
+                h('span', { className: 'mono hint', style: { fontSize: 11 } }, n.used, ' / ', n.total))),
+              h('td', null, h(Menu, { items: [
+                { label: 'Edit', icon: 'edit', onClick: () => setModal({ net: n }) },
+                { sep: true },
+                { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm(n) },
+              ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 16 })))))))))),
       modal === 'add' && h(NetworkModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Network added', 'ok'); refresh(); } }),
       modal && modal.net && h(NetworkModal, { net: modal.net, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Network updated', 'ok'); refresh(); } }),
       confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Delete ' + confirm.name + '?', body: 'Only allowed if no VM uses it.', confirmLabel: 'Delete', onConfirm: () => del(confirm) }));
@@ -523,22 +616,23 @@
         h('span', { className: 'panel-title' }, (GD.USERS || []).length, ' users'),
         h('button', { className: 'btn primary sm', style: { marginLeft: 'auto' }, onClick: () => setModal('add') }, h(Icon, { name: 'plus', size: 15 }), 'Add user')),
       h('div', { className: 'card', style: { overflow: 'hidden' } },
-        h('table', { className: 'tbl' },
-          h('thead', null, h('tr', null, ['User', 'Email', 'Role', 'Last login', 'VMs', ''].map((c, i) => h('th', { key: i }, c)))),
-          h('tbody', null, (GD.USERS || []).map((u) => h('tr', { key: u.id, style: u.disabled ? { opacity: 0.5 } : null },
-            h('td', null, h('div', { className: 'row', style: { gap: 9 } },
-              h('span', { className: 'avatar', style: { width: 28, height: 28, cursor: 'default' } }, u.name.split(' ').map((x) => x[0]).join('').slice(0, 2)),
-              h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 13 } }, u.name, u.disabled ? ' (disabled)' : ''))),
-            h('td', { className: 'mono', style: { fontSize: 12, color: 'var(--text-dim)' } }, u.email),
-            h('td', null, u.role === 'Admin' ? h('span', { className: 'badge accent' }, h(Icon, { name: 'shield', size: 12 }), 'Admin') : h('span', { className: 'badge' }, 'User')),
-            h('td', { className: 'mono hint', style: { fontSize: 12 } }, u.last),
-            h('td', { className: 'mono', style: { fontSize: 13 } }, u.vms),
-            h('td', null, h(Menu, { items: [
-              { label: 'Edit', icon: 'edit', onClick: () => setModal({ user: u }) },
-              { label: 'Reset password', icon: 'key', onClick: () => setModal({ reset: u }) },
-              { sep: true },
-              { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm(u) },
-            ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 16 }))))))))),
+        h('div', { className: 'table-scroll' },
+          h('table', { className: 'tbl' },
+            h('thead', null, h('tr', null, ['User', 'Email', 'Role', 'Last login', 'VMs', ''].map((c, i) => h('th', { key: i }, c)))),
+            h('tbody', null, (GD.USERS || []).map((u) => h('tr', { key: u.id, style: u.disabled ? { opacity: 0.5 } : null },
+              h('td', null, h('div', { className: 'row', style: { gap: 9 } },
+                h('span', { className: 'avatar', style: { width: 28, height: 28, cursor: 'default' } }, u.name.split(' ').map((x) => x[0]).join('').slice(0, 2)),
+                h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 13 } }, u.name, u.disabled ? ' (disabled)' : ''))),
+              h('td', { className: 'mono', style: { fontSize: 12, color: 'var(--text-dim)' } }, u.email),
+              h('td', null, u.role === 'Admin' ? h('span', { className: 'badge accent' }, h(Icon, { name: 'shield', size: 12 }), 'Admin') : h('span', { className: 'badge' }, 'User')),
+              h('td', { className: 'mono hint', style: { fontSize: 12 } }, u.last),
+              h('td', { className: 'mono', style: { fontSize: 13 } }, u.vms),
+              h('td', null, h(Menu, { items: [
+                { label: 'Edit', icon: 'edit', onClick: () => setModal({ user: u }) },
+                { label: 'Reset password', icon: 'key', onClick: () => setModal({ reset: u }) },
+                { sep: true },
+                { label: 'Delete', icon: 'trash', danger: true, onClick: () => setConfirm(u) },
+              ] }, h('button', { className: 'icon-btn' }, h(Icon, { name: 'more', size: 16 })))))))))),
       modal === 'add' && h(UserModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('User added', 'ok'); refresh(); } }),
       modal && modal.user && h(UserModal, { user: modal.user, onClose: () => setModal(null), onDone: () => { setModal(null); toast('User updated', 'ok'); refresh(); } }),
       modal && modal.reset && h(ResetPwModal, { user: modal.reset, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Password reset', 'ok'); } }),
@@ -575,6 +669,7 @@
       data === null
         ? h('div', { className: 'card', style: { padding: 30, textAlign: 'center', color: 'var(--text-faint)' } }, 'Loading…')
         : h('div', { className: 'card', style: { overflow: 'hidden' } },
+            h('div', { className: 'table-scroll' },
             h('table', { className: 'tbl' },
               h('thead', null, h('tr', null, ['When', 'User', 'Action', 'Target', 'IP', 'Detail'].map((c, i) => h('th', { key: i }, c)))),
               h('tbody', null, rows.length === 0
@@ -586,7 +681,7 @@
                     h('td', { className: 'mono hint', style: { fontSize: 11.5 } }, a.target),
                     h('td', { className: 'mono hint', style: { fontSize: 11.5 } }, a.ip || '—'),
                     h('td', { className: 'hint', style: { fontSize: 12 } }, a.detail))))),
-            ),
+            )),
       pages > 1 && h('div', { className: 'row', style: { marginTop: 12, justifyContent: 'center', gap: 12 } },
         h('button', { className: 'btn sm', disabled: offset <= 0, onClick: () => setOffset(Math.max(0, offset - LIMIT)) }, h(Icon, { name: 'chevronL', size: 14 }), 'Prev'),
         h('span', { className: 'hint mono', style: { fontSize: 12 } }, 'Page ', page, ' / ', pages),
@@ -620,6 +715,7 @@
             h('button', { className: 'btn primary', onClick: backupNow, disabled: busy },
               h(Icon, { name: 'download', size: 15 }), busy ? 'Backing up…' : 'Back up now')))),
       h('div', { className: 'card', style: { overflow: 'hidden' } },
+        h('div', { className: 'table-scroll' },
         h('table', { className: 'tbl' },
           h('thead', null, h('tr', null, ['Backup file', 'Size', 'Created'].map((c, i) => h('th', { key: i }, c)))),
           h('tbody', null, list.length === 0
@@ -627,7 +723,120 @@
             : list.map((b) => h('tr', { key: b.name },
                 h('td', { className: 'mono', style: { fontSize: 12 } }, b.name),
                 h('td', { className: 'mono hint', style: { fontSize: 12 } }, fmtBytes(b.bytes)),
-                h('td', { className: 'hint', style: { fontSize: 12 } }, fmtTs(b.modified))))))));
+                h('td', { className: 'hint', style: { fontSize: 12 } }, fmtTs(b.modified)))))))));
+  }
+
+  /* ---- Health ---- */
+  function fmtUptime(sec) {
+    if (sec == null) return '—';
+    const d = Math.floor(sec / 86400), hrs = Math.floor((sec % 86400) / 3600), min = Math.floor((sec % 3600) / 60);
+    if (d) return d + 'd ' + hrs + 'h';
+    if (hrs) return hrs + 'h ' + min + 'm';
+    return Math.max(1, min) + 'm';
+  }
+
+  function HealthRow({ ok, label, detail }) {
+    // details may be long (build ids, backup names) — wrap, never truncate
+    return h('div', { className: 'row', style: { gap: 9, padding: '6px 0', alignItems: 'baseline' } },
+      h('span', { className: 'dot ' + (ok ? 'running' : 'error'), style: { flexShrink: 0 } }),
+      h('span', { className: 'mono', style: { fontSize: 12.5, fontWeight: 600, minWidth: 110, flexShrink: 0 } }, label),
+      h('span', { className: 'hint mono', style: { fontSize: 11.5, flex: 1, minWidth: 0, overflowWrap: 'anywhere' } },
+        detail || (ok ? 'ok' : 'not running')));
+  }
+
+  function Health() {
+    const [tick, setTick] = useState(0);
+    const hlt = useFetched(() => window.API.systemHealth(), [tick], { error: true });
+    if (!hlt) return h('div', { className: 'card card-pad hint' }, 'Checking system health…');
+    if (hlt.error) return h('div', { className: 'card card-pad' },
+      h('div', { className: 'row', style: { gap: 9 } }, h('span', { className: 'dot error' }),
+        h('span', { className: 'hint' }, 'Could not read system health')),
+      h('button', { className: 'btn sm', style: { marginTop: 10 }, onClick: () => setTick((t) => t + 1) },
+        h(Icon, { name: 'refresh', size: 14 }), 'Retry'));
+    const c = hlt.components || {};
+    const worker = c.worker || {}, sched = c.scheduler || {}, db = c.database || {}, bk = c.backups || {};
+    const inv = hlt.inventory || {};
+    const vms = inv.vms || {}, conns = inv.connections || {}, jobs = inv.jobs || {};
+    const disk = hlt.disk || {};
+    const usedBytes = (disk.totalBytes || 0) - (disk.freeBytes || 0);
+    const usedPct = disk.totalBytes ? Math.round(usedBytes / disk.totalBytes * 100) : 0;
+    const statusOrder = ['running', 'stopped', 'working', 'error', 'cleanup_pending'];
+    const byStatus = vms.byStatus || {};
+    return h('div', null,
+      h('div', { className: 'row', style: { marginBottom: 14 } },
+        h('span', { className: 'panel-title' }, 'System health'),
+        h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTick((t) => t + 1) },
+          h(Icon, { name: 'refresh', size: 14 }), 'Refresh')),
+      // two wide cards per row (one on narrow screens) — the details are long
+      // mono strings (build ids, backup names) and must never truncate
+      h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(min(480px, 100%), 1fr))', gap: 14 } },
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Version'),
+          h('div', { className: 'mono', style: { fontSize: 24, fontWeight: 700 } }, 'v', hlt.version),
+          h('div', { className: 'copy mono', style: { fontSize: 11.5, marginTop: 3, overflowWrap: 'anywhere' } },
+            hlt.build || 'local build (no CI build id)'),
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10, marginTop: 14 } },
+            h(Stat, { k: 'Python', v: hlt.python || '—' }),
+            h(Stat, { k: 'Uptime', v: fmtUptime(hlt.uptimeSeconds) }),
+            h(Stat, { k: 'Started', v: hlt.startedAt ? new Date(hlt.startedAt).toLocaleString() : '—' }))),
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 6 } }, 'Components'),
+          h(HealthRow, { ok: true, label: 'API', detail: 'serving requests' }),
+          h(HealthRow, {
+            ok: !!worker.ok, label: 'Job worker',
+            detail: worker.jobWorkerAlive
+              ? ('running' + (worker.waitingWorkerAlive ? ' · waiting-poller running' : ' · waiting-poller DOWN'))
+              : 'not running',
+          }),
+          h(HealthRow, {
+            ok: !!sched.ok, label: 'Scheduler',
+            detail: sched.running
+              ? ((sched.jobs || []).map((j) => j.id
+                  + (j.nextRun ? ' (next ' + new Date(j.nextRun).toLocaleString() + ')' : ''))
+                  .join(' · ') || 'running — no tasks registered')
+              : 'not running',
+          }),
+          h(HealthRow, {
+            ok: !!db.ok, label: 'Database',
+            detail: db.ok
+              ? (String(db.journalMode || '').toUpperCase() + ' mode · db ' + fmtBytes(db.sizeBytes || 0)
+                 + (db.walBytes ? ' · wal ' + fmtBytes(db.walBytes) : ''))
+              : 'unreadable',
+          }),
+          // enabled-with-none-yet is healthy on a fresh instance (the first
+          // scheduled run may be hours away) — the scheduler row covers firing
+          h(HealthRow, {
+            ok: true, label: 'Backups',
+            detail: bk.enabled
+              ? (bk.count
+                ? (bk.count + ' kept · latest ' + ((bk.newest || {}).name || '—')
+                   + ((bk.newest || {}).modified
+                     ? ' (' + new Date(bk.newest.modified).toLocaleString() + ')' : ''))
+                : 'enabled — first run pending')
+              : 'disabled',
+          })),
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Inventory'),
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
+            h(Stat, { k: 'VMs', v: vms.total || 0 }),
+            h(Stat, { k: 'Connections', v: (conns.total || 0) + (conns.disabled ? ' (' + conns.disabled + ' off)' : '') }),
+            h(Stat, { k: 'Users', v: inv.users || 0 }),
+            h(Stat, { k: 'Templates', v: inv.templates || 0 }),
+            h(Stat, { k: 'Base images', v: inv.baseImages || 0 }),
+            h(Stat, { k: 'Jobs in queue', v: (jobs.queued || 0) + (jobs.running || 0) + (jobs.waiting || 0) })),
+          h('div', { className: 'row', style: { gap: 6, marginTop: 12, flexWrap: 'wrap' } },
+            statusOrder.filter((s) => byStatus[s]).map((s) => h('span', {
+              key: s, className: 'badge ' + (s === 'running' ? 'running' : (s === 'error' || s === 'cleanup_pending') ? 'error' : s === 'working' ? 'working' : ''),
+            }, byStatus[s], ' ', s.replace('_', ' '))))),
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Storage'),
+          h('div', { className: 'hint mono', style: { fontSize: 10.5, display: 'flex', justifyContent: 'space-between' } },
+            h('span', null, 'Data volume'), h('span', null, fmtBytes(usedBytes) + ' / ' + fmtBytes(disk.totalBytes || 0))),
+          h('div', { style: { height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden', marginTop: 3 } },
+            h('div', { style: { height: '100%', width: usedPct + '%', background: usedPct > 90 ? 'var(--err)' : 'var(--accent)' } })),
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 14 } },
+            h(Stat, { k: 'Free', v: fmtBytes(disk.freeBytes || 0) }),
+            h(Stat, { k: 'Database', v: fmtBytes((db.sizeBytes || 0) + (db.walBytes || 0)) })))));
   }
 
   function Preferences() {
@@ -652,4 +861,5 @@
   window.Secrets = Secrets;
   window.Variables = Variables;
   window.Settings = Settings;
+  window.ConnectionUI = { connectionDraft, connectionPayload };
 })();

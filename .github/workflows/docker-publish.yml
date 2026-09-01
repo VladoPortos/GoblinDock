@@ -2,7 +2,7 @@ name: Publish image
 
 on:
   push:
-    branches: [main]
+    branches: [main, beta-build]
     tags: ["v*"]
 
 permissions:
@@ -54,6 +54,8 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            GOBLINDOCK_BUILD=${{ github.ref_name }}@${{ github.sha }}
           provenance: true
           sbom: true
           cache-from: type=gha
