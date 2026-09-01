@@ -137,6 +137,7 @@ window.API = (function () {
     addConnection: (p) => req('POST', '/api/connections', p),
     editConnection: (id, p) => req('PUT', `/api/connections/${id}`, p),
     deleteConnection: (id) => req('DELETE', `/api/connections/${id}`),
+    systemHealth: () => req('GET', '/api/system/health'),
     testConnection: (id) => req('POST', `/api/connections/${id}/test`),
     probeConnection: (p) => req('POST', '/api/connections/probe', p),
     connectionCapacity: (id) => req('GET', `/api/connections/${id}/capacity`),

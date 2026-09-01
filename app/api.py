@@ -8,8 +8,11 @@ import hmac
 import ipaddress
 import json
 import logging
+import os
+import platform
 import re
 import secrets as _secrets
+import shutil
 import socket
 import threading
 import time
@@ -74,6 +77,9 @@ from .recipes import (
     validate_public_sensitive_inputs,
 )
 from .seed import backfill_starter_template_location
+from .scheduler import scheduler_health
+from .worker import worker_health
+from . import __version__
 from . import backup
 from . import statebus
 from .security import (
@@ -3711,3 +3717,80 @@ def run_db_backup(user: User = Depends(require_admin), session: Session = Depend
     record_audit(session, user, "db.backup", "system", dest.name, "manual backup")
     session.commit()
     return {"ok": True, "name": dest.name, "bytes": dest.stat().st_size}
+
+
+# =========================================================================== #
+# admin: system health                                                        #
+# =========================================================================== #
+_PROCESS_STARTED = utcnow()
+
+
+@router.get("/system/health")
+def system_health(user: User = Depends(require_admin), session: Session = Depends(get_session)):
+    """Version + component status + inventory stats for the Settings Health tab.
+
+    Read-only and deliberately contact-free: it never probes Proxmox (per-
+    connection liveness already lives on the Proxmox tab, and a disabled source
+    must not be touched). No filesystem paths are exposed — sizes only."""
+    db_stats = {"ok": True, "journalMode": "", "sizeBytes": 0, "walBytes": 0}
+    try:
+        with engine.begin() as conn:
+            db_stats["journalMode"] = conn.exec_driver_sql("PRAGMA journal_mode").scalar()
+        db_stats["sizeBytes"] = os.path.getsize(settings.db_path)
+        wal = settings.db_path + "-wal"
+        db_stats["walBytes"] = os.path.getsize(wal) if os.path.exists(wal) else 0
+    except Exception:  # noqa: BLE001
+        db_stats["ok"] = False
+
+    backups = {"enabled": settings.backup_enabled, "count": 0, "newest": None}
+    try:
+        rows = backup.list_backups()
+        backups["count"] = len(rows)
+        if rows:
+            backups["newest"] = rows[0]     # {name, bytes, modified} — no paths
+    except Exception:  # noqa: BLE001
+        pass
+
+    vm_statuses: dict[str, int] = {}
+    for status in session.exec(select(Deployment.status)).all():
+        key = status or "unknown"
+        vm_statuses[key] = vm_statuses.get(key, 0) + 1
+    job_counts = {"queued": 0, "running": 0, "waiting": 0}
+    for status in session.exec(select(Job.status).where(
+            Job.status.in_(tuple(job_counts)))).all():
+        job_counts[status] += 1
+    conns_all = session.exec(select(Connection)).all()
+
+    try:
+        usage = shutil.disk_usage(settings.data_dir)
+        disk = {"totalBytes": usage.total, "freeBytes": usage.free}
+    except OSError:
+        disk = {"totalBytes": 0, "freeBytes": 0}
+
+    workers = worker_health()
+    sched = scheduler_health()
+    return {
+        "version": __version__,
+        "build": settings.build_info,
+        "python": platform.python_version(),
+        "startedAt": _PROCESS_STARTED.isoformat(),
+        "uptimeSeconds": int((utcnow() - _PROCESS_STARTED).total_seconds()),
+        "components": {
+            "api": {"ok": True},
+            "worker": {"ok": workers["jobWorkerAlive"] and workers["waitingWorkerAlive"],
+                       **workers},
+            "scheduler": {"ok": sched["running"], **sched},
+            "database": db_stats,
+            "backups": backups,
+        },
+        "inventory": {
+            "vms": {"total": sum(vm_statuses.values()), "byStatus": vm_statuses},
+            "connections": {"total": len(conns_all),
+                            "disabled": sum(1 for c in conns_all if c.disabled)},
+            "jobs": job_counts,
+            "users": len(session.exec(select(User.id).where(User.deleted_at.is_(None))).all()),
+            "templates": len(session.exec(select(Template.id)).all()),
+            "baseImages": len(session.exec(select(Image.id).where(Image.kind == "base")).all()),
+        },
+        "disk": disk,
+    }

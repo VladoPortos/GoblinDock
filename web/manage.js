@@ -238,10 +238,11 @@
         h('button', { className: tab === 'users' ? 'active' : '', onClick: () => setTab('users') }, h(Icon, { name: 'users', size: 14 }), 'Users'),
         h('button', { className: tab === 'backups' ? 'active' : '', onClick: () => setTab('backups') }, h(Icon, { name: 'download', size: 14 }), 'Backups'),
         h('button', { className: tab === 'audit' ? 'active' : '', onClick: () => setTab('audit') }, h(Icon, { name: 'history', size: 14 }), 'Audit'),
-        h('button', { className: tab === 'prefs' ? 'active' : '', onClick: () => setTab('prefs') }, h(Icon, { name: 'sliders', size: 14 }), 'Preferences')),
+        h('button', { className: tab === 'prefs' ? 'active' : '', onClick: () => setTab('prefs') }, h(Icon, { name: 'sliders', size: 14 }), 'Preferences'),
+        h('button', { className: tab === 'health' ? 'active' : '', onClick: () => setTab('health') }, h(Icon, { name: 'activity', size: 14 }), 'Health')),
       tab === 'connections' ? h(Connections) : tab === 'networks' ? h(Networks)
         : tab === 'users' ? h(Users) : tab === 'backups' ? h(Backups)
-        : tab === 'prefs' ? h(Preferences) : h(AuditLog));
+        : tab === 'prefs' ? h(Preferences) : tab === 'health' ? h(Health) : h(AuditLog));
   }
 
   /* ---- Connections ---- */
@@ -707,6 +708,107 @@
                 h('td', { className: 'mono', style: { fontSize: 12 } }, b.name),
                 h('td', { className: 'mono hint', style: { fontSize: 12 } }, fmtBytes(b.bytes)),
                 h('td', { className: 'hint', style: { fontSize: 12 } }, fmtTs(b.modified)))))))));
+  }
+
+  /* ---- Health ---- */
+  function fmtUptime(sec) {
+    if (sec == null) return '—';
+    const d = Math.floor(sec / 86400), hrs = Math.floor((sec % 86400) / 3600), min = Math.floor((sec % 3600) / 60);
+    if (d) return d + 'd ' + hrs + 'h';
+    if (hrs) return hrs + 'h ' + min + 'm';
+    return Math.max(1, min) + 'm';
+  }
+
+  function HealthRow({ ok, label, detail }) {
+    return h('div', { className: 'row', style: { gap: 9, padding: '6px 0' } },
+      h('span', { className: 'dot ' + (ok ? 'running' : 'error') }),
+      h('span', { className: 'mono', style: { fontSize: 12.5, fontWeight: 600, minWidth: 110 } }, label),
+      h('span', { className: 'hint mono', style: { fontSize: 11.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } },
+        detail || (ok ? 'ok' : 'not running')));
+  }
+
+  function Health() {
+    const [tick, setTick] = useState(0);
+    const hlt = useFetched(() => window.API.systemHealth(), [tick], { error: true });
+    if (!hlt) return h('div', { className: 'card card-pad hint' }, 'Checking system health…');
+    if (hlt.error) return h('div', { className: 'card card-pad' },
+      h('div', { className: 'row', style: { gap: 9 } }, h('span', { className: 'dot error' }),
+        h('span', { className: 'hint' }, 'Could not read system health')),
+      h('button', { className: 'btn sm', style: { marginTop: 10 }, onClick: () => setTick((t) => t + 1) },
+        h(Icon, { name: 'refresh', size: 14 }), 'Retry'));
+    const c = hlt.components || {};
+    const worker = c.worker || {}, sched = c.scheduler || {}, db = c.database || {}, bk = c.backups || {};
+    const inv = hlt.inventory || {};
+    const vms = inv.vms || {}, conns = inv.connections || {}, jobs = inv.jobs || {};
+    const disk = hlt.disk || {};
+    const usedBytes = (disk.totalBytes || 0) - (disk.freeBytes || 0);
+    const usedPct = disk.totalBytes ? Math.round(usedBytes / disk.totalBytes * 100) : 0;
+    const statusOrder = ['running', 'stopped', 'working', 'error', 'cleanup_pending'];
+    const byStatus = vms.byStatus || {};
+    return h('div', null,
+      h('div', { className: 'row', style: { marginBottom: 14 } },
+        h('span', { className: 'panel-title' }, 'System health'),
+        h('button', { className: 'btn ghost sm', style: { marginLeft: 'auto' }, onClick: () => setTick((t) => t + 1) },
+          h(Icon, { name: 'refresh', size: 14 }), 'Refresh')),
+      h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(300px, 1fr))', gap: 14 } },
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Version'),
+          h('div', { className: 'mono', style: { fontSize: 24, fontWeight: 700 } }, 'v', hlt.version),
+          h('div', { className: 'copy mono', style: { fontSize: 11.5, marginTop: 3 } },
+            hlt.build || 'local build (no CI build id)'),
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 14 } },
+            h(Stat, { k: 'Python', v: hlt.python || '—' }),
+            h(Stat, { k: 'Uptime', v: fmtUptime(hlt.uptimeSeconds) }))),
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 6 } }, 'Components'),
+          h(HealthRow, { ok: true, label: 'API', detail: 'serving requests' }),
+          h(HealthRow, {
+            ok: !!worker.ok, label: 'Job worker',
+            detail: worker.jobWorkerAlive
+              ? ('running' + (worker.waitingWorkerAlive ? ' · waiting-poller running' : ' · waiting-poller DOWN'))
+              : 'not running',
+          }),
+          h(HealthRow, {
+            ok: !!sched.ok, label: 'Scheduler',
+            detail: sched.running ? ((sched.jobs || []).length + ' scheduled task' + ((sched.jobs || []).length === 1 ? '' : 's')) : 'not running',
+          }),
+          h(HealthRow, {
+            ok: !!db.ok, label: 'Database',
+            detail: db.ok
+              ? (String(db.journalMode || '').toUpperCase() + ' · ' + fmtBytes(db.sizeBytes || 0)
+                 + (db.walBytes ? ' + ' + fmtBytes(db.walBytes) + ' WAL' : ''))
+              : 'unreadable',
+          }),
+          // enabled-with-none-yet is healthy on a fresh instance (the first
+          // scheduled run may be hours away) — the scheduler row covers firing
+          h(HealthRow, {
+            ok: true, label: 'Backups',
+            detail: bk.enabled
+              ? (bk.count ? (bk.count + ' kept · latest ' + ((bk.newest || {}).name || '—')) : 'enabled — first run pending')
+              : 'disabled',
+          })),
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Inventory'),
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
+            h(Stat, { k: 'VMs', v: vms.total || 0 }),
+            h(Stat, { k: 'Connections', v: (conns.total || 0) + (conns.disabled ? ' (' + conns.disabled + ' off)' : '') }),
+            h(Stat, { k: 'Users', v: inv.users || 0 }),
+            h(Stat, { k: 'Templates', v: inv.templates || 0 }),
+            h(Stat, { k: 'Base images', v: inv.baseImages || 0 }),
+            h(Stat, { k: 'Jobs in queue', v: (jobs.queued || 0) + (jobs.running || 0) + (jobs.waiting || 0) })),
+          h('div', { className: 'row', style: { gap: 6, marginTop: 12, flexWrap: 'wrap' } },
+            statusOrder.filter((s) => byStatus[s]).map((s) => h('span', {
+              key: s, className: 'badge ' + (s === 'running' ? 'running' : (s === 'error' || s === 'cleanup_pending') ? 'error' : s === 'working' ? 'working' : ''),
+            }, byStatus[s], ' ', s.replace('_', ' '))))),
+        h('div', { className: 'card card-pad' },
+          h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Storage'),
+          h('div', { className: 'hint mono', style: { fontSize: 10.5, display: 'flex', justifyContent: 'space-between' } },
+            h('span', null, 'Data volume'), h('span', null, fmtBytes(usedBytes) + ' / ' + fmtBytes(disk.totalBytes || 0))),
+          h('div', { style: { height: 5, background: 'var(--border)', borderRadius: 3, overflow: 'hidden', marginTop: 3 } },
+            h('div', { style: { height: '100%', width: usedPct + '%', background: usedPct > 90 ? 'var(--err)' : 'var(--accent)' } })),
+          h('div', { style: { display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 10, marginTop: 14 } },
+            h(Stat, { k: 'Free', v: fmtBytes(disk.freeBytes || 0) }),
+            h(Stat, { k: 'Database', v: fmtBytes((db.sizeBytes || 0) + (db.walBytes || 0)) })))));
   }
 
   function Preferences() {

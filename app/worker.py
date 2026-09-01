@@ -1618,6 +1618,14 @@ def start_worker() -> None:
         _waiting_thread.start()
 
 
+def worker_health() -> dict:
+    """Liveness of the two background threads, for the admin Health page."""
+    return {
+        "jobWorkerAlive": bool(_worker_thread and _worker_thread.is_alive()),
+        "waitingWorkerAlive": bool(_waiting_thread and _waiting_thread.is_alive()),
+    }
+
+
 def stop_worker(join_timeout: float = 30) -> None:
     _stop.set()
     if _worker_thread and _worker_thread.is_alive():
