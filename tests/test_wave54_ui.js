@@ -70,6 +70,29 @@ async function testFreshRefreshSurvivesAFailingStaleFetch() {
   assert.deepEqual(windowObj.GD.VMS.map((v) => v.depId), [7]);
 }
 
+async function testRemoveConnectionCascadesNetworksAndDefeatsStaleResponses() {
+  const { windowObj, calls, store } = makeStore();
+  windowObj.GD.CONNECTIONS = [{ connId: 1, name: 'pve-a' }, { connId: 2, name: 'pve-b' }];
+  windowObj.GD.NETWORKS = [
+    { netId: 10, connId: 1, name: 'lan-a' },
+    { netId: 11, connId: 2, name: 'lan-b' },
+  ];
+  const stale = store.refresh();                 // started before the delete
+  store.removeConnection(1);
+  assert.deepEqual(windowObj.GD.CONNECTIONS.map((c) => c.connId), [2],
+    'the deleted connection must vanish immediately');
+  assert.deepEqual(windowObj.GD.NETWORKS.map((n) => n.netId), [11],
+    'its networks are cascaded server-side and must vanish with it');
+  calls[0].resolve({
+    CONNECTIONS: [{ connId: 1, name: 'pve-a' }, { connId: 2, name: 'pve-b' }],
+    NETWORKS: [{ netId: 10, connId: 1 }, { netId: 11, connId: 2 }],
+  });
+  await stale;
+  assert.deepEqual(windowObj.GD.CONNECTIONS.map((c) => c.connId), [2],
+    'a stale response must not resurrect the deleted connection');
+  assert.deepEqual(windowObj.GD.NETWORKS.map((n) => n.netId), [11]);
+}
+
 async function testPlainRefreshStillCollapsesIntoTheInflightFetch() {
   const { windowObj, calls, store } = makeStore();
   const first = store.refresh();
@@ -85,6 +108,7 @@ async function testPlainRefreshStillCollapsesIntoTheInflightFetch() {
   await testRemoveVmDropsTheRowImmediately();
   await testStaleInflightResponseCannotResurrectARemovedVm();
   await testFreshRefreshSurvivesAFailingStaleFetch();
+  await testRemoveConnectionCascadesNetworksAndDefeatsStaleResponses();
   await testPlainRefreshStillCollapsesIntoTheInflightFetch();
   console.log('\nALL WAVE 54 UI TESTS PASSED');
 })().catch((e) => { console.error(e); process.exit(1); });

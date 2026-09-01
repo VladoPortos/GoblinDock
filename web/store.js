@@ -3,12 +3,21 @@ window.GDStore = (function () {
   let onChange = null;
   let inflight = null;
 
-  // Client-side tombstones for VMs removed by an immediate action (local-only
-  // cleanup): a /state response that was already in flight when the row was
-  // deleted predates the deletion and would resurrect it — filter such ghosts
-  // for a short window. (SQLite may reuse a freed id, so the window stays small.)
+  // Client-side tombstones for rows removed by an immediate action (local-only
+  // VM cleanup, connection/network delete): a /state response that was already
+  // in flight when the row was deleted predates the deletion and would
+  // resurrect it — filter such ghosts for a short window. (SQLite may reuse a
+  // freed id, so the window stays small.)
   const TOMBSTONE_MS = 10000;
-  const removedVms = new Map();   // depId -> Date.now() at removal
+  const ROW_ID = { VMS: 'depId', CONNECTIONS: 'connId', NETWORKS: 'netId' };
+  const removedRows = new Map();   // `${listKey}:${id}` -> Date.now() at removal
+
+  function _removeRow(listKey, id) {
+    removedRows.set(listKey + ':' + id, Date.now());
+    const rows = window.GD[listKey] || [];
+    const idx = rows.findIndex((row) => row[ROW_ID[listKey]] === id);
+    if (idx >= 0) rows.splice(idx, 1);
+  }
 
   // Per-VM CPU/RAM ring buffer fed by every state refresh — powers the dashboard
   // sparklines. Client-side and best-effort by design: it shows the trend since
@@ -47,11 +56,14 @@ window.GDStore = (function () {
         const s = await window.API.state();
         // mutate GD in place (preserve captured references in component IIFEs)
         Object.keys(s).forEach((k) => { window.GD[k] = s[k]; });
-        if (removedVms.size) {
+        if (removedRows.size) {
           const now = Date.now();
-          removedVms.forEach((ts, id) => { if (now - ts > TOMBSTONE_MS) removedVms.delete(id); });
-          if (removedVms.size) {
-            window.GD.VMS = (window.GD.VMS || []).filter((v) => !removedVms.has(v.depId));
+          removedRows.forEach((ts, key) => { if (now - ts > TOMBSTONE_MS) removedRows.delete(key); });
+          if (removedRows.size) {
+            Object.keys(ROW_ID).forEach((listKey) => {
+              window.GD[listKey] = (window.GD[listKey] || []).filter(
+                (row) => !removedRows.has(listKey + ':' + row[ROW_ID[listKey]]));
+            });
           }
         }
         recordHistory();
@@ -69,10 +81,20 @@ window.GDStore = (function () {
   // probes) next /state fetch. The tombstone stops an in-flight stale response
   // from resurrecting it; refresh({fresh: true}) reconciles with the server.
   function removeVm(depId) {
-    removedVms.set(depId, Date.now());
-    const vms = window.GD.VMS || [];
-    const idx = vms.findIndex((v) => v.depId === depId);
-    if (idx >= 0) vms.splice(idx, 1);
+    _removeRow('VMS', depId);
+    if (onChange) onChange();
+  }
+
+  // Deleting a connection cascades to its networks server-side — mirror that.
+  function removeConnection(connId) {
+    _removeRow('CONNECTIONS', connId);
+    (window.GD.NETWORKS || []).filter((n) => n.connId === connId)
+      .forEach((n) => _removeRow('NETWORKS', n.netId));
+    if (onChange) onChange();
+  }
+
+  function removeNetwork(netId) {
+    _removeRow('NETWORKS', netId);
     if (onChange) onChange();
   }
 
@@ -114,6 +136,8 @@ window.GDStore = (function () {
   return {
     refresh,
     removeVm,
+    removeConnection,
+    removeNetwork,
     setOnChange: (fn) => { onChange = fn; },
     toast,
     vmAction,

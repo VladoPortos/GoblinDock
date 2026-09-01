@@ -424,7 +424,16 @@
       catch (e) { toast(e.message, 'err'); }
       setTesting((t) => ({ ...t, [c.connId]: false })); refresh();
     };
-    const del = async (c) => { try { await window.API.deleteConnection(c.connId); toast('Connection removed', 'ok'); refresh(); } catch (e) { toast(e.message, 'err'); } };
+    const del = async (c) => {
+      try {
+        await window.API.deleteConnection(c.connId);
+        // drop the card (and its networks) NOW — the in-flight /state may still be
+        // waiting on this very connection's dead probe and predates the delete
+        window.GDStore.removeConnection(c.connId);
+        toast('Connection removed', 'ok');
+        window.GDStore.refresh({ fresh: true }).catch(() => {});
+      } catch (e) { toast(e.message, 'err'); }
+    };
     const toggleDisabled = async (c) => {
       try {
         await window.API.editConnection(c.connId, { disabled: !c.disabled });
@@ -524,7 +533,14 @@
   function Networks() {
     const [modal, setModal] = useState(null);
     const [confirm, setConfirm] = useState(null);
-    const del = async (n) => { try { await window.API.deleteNetwork(n.netId); toast('Network deleted', 'ok'); refresh(); } catch (e) { toast(e.message, 'err'); } };
+    const del = async (n) => {
+      try {
+        await window.API.deleteNetwork(n.netId);
+        window.GDStore.removeNetwork(n.netId);
+        toast('Network deleted', 'ok');
+        window.GDStore.refresh({ fresh: true }).catch(() => {});
+      } catch (e) { toast(e.message, 'err'); }
+    };
     return h('div', null,
       h('div', { className: 'row', style: { marginBottom: 14 } },
         h('span', { className: 'panel-title' }, 'Per-connection networks'),
