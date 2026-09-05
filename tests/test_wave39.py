@@ -132,6 +132,11 @@ def test_ci_runs_ui_behavior_suites_and_fail_closed_syntax_checks_all_20_scripts
     }
     missing = [name for name, source in required_contracts.items() if source not in workflow]
     assert not missing, f"CI workflow is missing: {', '.join(missing)}"
+    ci = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+    assert 'name: compile · unit tests · JS syntax' in ci
+    assert 'name: docker build (verify Dockerfile)' in ci
+    assert 'needs: validate' in ci and 'if: always()' in ci
+    assert 'run: test "$VALIDATION_RESULT" = success' in ci
 
 
 def test_beta_build_branch_publishes_without_changing_release_tag_rules():

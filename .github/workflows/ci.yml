@@ -14,11 +14,23 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  test:
+  validate:
     uses: ./.github/workflows/validate.yml
 
+  test:
+    # Preserve the branch-protection context while sharing validation with publishing.
+    name: compile · unit tests · JS syntax
+    needs: validate
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require complete validation
+        env:
+          VALIDATION_RESULT: ${{ needs.validate.result }}
+        run: test "$VALIDATION_RESULT" = success
+
   docker:
-    name: Build test image
+    name: docker build (verify Dockerfile)
     needs: test
     runs-on: ubuntu-latest
     steps:
