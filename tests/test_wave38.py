@@ -534,7 +534,9 @@ def _assert_public_legacy_implicit_text_schema(schema, label):
             Template.owner_id == fixture["author"],
         )).one()
         assert template.public is True
-        assert json.loads(template.recipe_json) == create_recipe
+        stored_recipe = json.loads(template.recipe_json)
+        assert stored_recipe[0]["blocks"][0].pop("placementId").startswith("p-")
+        assert stored_recipe == create_recipe
         stored_block = s.exec(select(Block).where(
             Block.key == fixture["block"],
         )).one()
@@ -546,7 +548,9 @@ def _assert_public_legacy_implicit_text_schema(schema, label):
             template.id, edit_body,
             user=s.get(User, fixture["author"]), session=s,
         )["ok"]
-        assert json.loads(s.get(Template, template.id).recipe_json) == edit_recipe
+        stored_recipe = json.loads(s.get(Template, template.id).recipe_json)
+        assert stored_recipe[0]["blocks"][0].pop("placementId").startswith("p-")
+        assert stored_recipe == edit_recipe
         stored_block = s.exec(select(Block).where(
             Block.key == fixture["block"],
         )).one()
@@ -561,7 +565,9 @@ def _assert_public_legacy_implicit_text_schema(schema, label):
         plan = execution_plan.open_execution_plan(
             s.get(Job, result["jobId"]).execution_plan_enc,
         )
-        assert plan["recipe"] == edit_recipe
+        accepted_recipe = plan["recipe"]
+        assert accepted_recipe[0]["blocks"][0].pop("placementId").startswith("p-")
+        assert accepted_recipe == edit_recipe
         assert json.loads(plan["blocks"][fixture["block"]]["input_schema_json"]) == [
             {"name": "message", "default": "legacy", "type": "text"},
         ]

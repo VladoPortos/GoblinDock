@@ -74,11 +74,18 @@ def _stub_px(record=None, present=()):
     class _Px:
         node = "pve"
         def __init__(self, conn): pass
+        def find_vm_node(self, vmid, node=None): return "pve"
+        def vm_current(self, vmid, node=None): return {"status": "stopped"}
         def destroy(self, vmid, node=None):
             if record is not None:
                 record.append(vmid)
             return "UPID:destroy"
         def wait_task(self, upid, node=None, cancelled=None, timeout=0): pass
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None):
             return [{"vmid": v} for v in present]
     return _Px
@@ -157,6 +164,11 @@ def test_failed_deploy_with_unknown_vm_retains_allocation():
     class _UnknownPx:
         node = "pve"
         def __init__(self, conn): pass
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
 
     saved = worker.Proxmox

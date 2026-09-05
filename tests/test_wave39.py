@@ -116,24 +116,27 @@ async def _asgi_request(method, path, *, json_body=None, cookie=""):
 
 
 def test_ci_runs_ui_behavior_suites_and_fail_closed_syntax_checks_all_20_scripts():
-    """CI must execute both UI suites and reject any drift from the 18+2 JS set."""
+    """Both PR builds and publishing must validate every discovered UI suite."""
     workflow = (
-        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "ci.yml"
+        Path(__file__).resolve().parents[1] / ".github" / "workflows" / "validate.yml"
     ).read_text(encoding="utf-8")
 
     required_contracts = {
-        "the complete 18 web + 2 UI-test syntax-check list": (
-            "js_files=(web/*.js tests/test_wave37_ui.js tests/test_wave39_ui.js)"
+        "all discovered web and UI test scripts": (
+            "js_files=(web/*.js tests/test_wave*_ui.js)"
         ),
-        "the fail-closed 20-file guard": 'if [ "${#js_files[@]}" -ne 20 ]; then',
         "the syntax-check loop": (
             'for f in "${js_files[@]}"; do node --check "$f"; done'
         ),
-        "the Wave 37 UI behavior suite": "node tests/test_wave37_ui.js",
-        "the Wave 39 UI behavior suite": "node tests/test_wave39_ui.js",
+        "every UI behavior suite": 'for t in tests/test_wave*_ui.js; do node "$t"; done',
     }
     missing = [name for name, source in required_contracts.items() if source not in workflow]
     assert not missing, f"CI workflow is missing: {', '.join(missing)}"
+    ci = (Path(__file__).resolve().parents[1] / '.github/workflows/ci.yml').read_text(encoding='utf-8')
+    assert 'name: compile · unit tests · JS syntax' in ci
+    assert 'name: docker build (verify Dockerfile)' in ci
+    assert 'needs: validate' in ci and 'if: always()' in ci
+    assert 'run: test "$VALIDATION_RESULT" = success' in ci
 
 
 def test_beta_build_branch_publishes_without_changing_release_tag_rules():
@@ -816,6 +819,7 @@ def test_authenticated_non_admin_state_endpoint_redacts_operations_and_sensitive
         "maxCores": 8,
         "maxRamGb": 16,
         "maxDiskGb": 200,
+        "inventory": {"updatedAt": None, "completedAt": None, "stale": True, "error": None},
     }
     forbidden_connection_keys = {
         "url", "host", "port", "tokenId", "token_id", "tokenSecret",

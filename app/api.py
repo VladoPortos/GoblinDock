@@ -356,6 +356,7 @@ def _build_job_ctx(session: Session, base: Image, cpu: int, ram: int, disk: int,
     sizing, and network (no network => plain DHCP)."""
     ctx = {"src_url": base.source_url, "checksum": base.checksum or "",
            "checksum_algorithm": _checksum_algo(base.checksum or ""),
+           "base_image_id": base.id,
            "cpu": cpu, "ram": ram, "disk": disk}
     ctx.update(_network_ctx(session, net, dep_id) if net else {"network_mode": "dhcp"})
     return json.dumps(ctx)
@@ -373,15 +374,8 @@ def _maps(session: Session):
 
 
 def _px_cache(conns: dict) -> dict:
-    cache = {}
-    for cid, c in conns.items():
-        if c.disabled:
-            continue  # an admin-disabled source is never probed or targeted
-        try:
-            cache[cid] = Proxmox(c)
-        except Exception:  # noqa: BLE001
-            pass
-    return cache
+    from .inventory import snapshot_proxy
+    return {cid: snapshot_proxy(c) for cid, c in conns.items() if not c.disabled}
 
 
 def _reject_disabled_connection(conn: Optional[Connection], *, detail: str = "") -> None:
@@ -394,25 +388,9 @@ def _reject_disabled_connection(conn: Optional[Connection], *, detail: str = "")
         )
 
 
-# Short-TTL cache for the per-connection /version probe on /state. SSE-driven refetches
-# fire several times/sec during a job; without this each one hits Proxmox once per
-# connection. The TTL collapses that burst into ~one probe per connection per window.
-_CONN_STATUS_CACHE: dict[int, tuple[float, dict]] = {}
-_CONN_STATUS_TTL = 5.0
-
-
 def _conn_status(px, conn_id: int) -> dict:
-    now = time.time()
-    cached = _CONN_STATUS_CACHE.get(conn_id)
-    if cached and now - cached[0] < _CONN_STATUS_TTL:
-        return cached[1]
-    try:
-        v = px.version()
-        st = {"status": "online", "version": v.get("version", "—")}
-    except Exception:  # noqa: BLE001
-        st = {"status": "offline"}
-    _CONN_STATUS_CACHE[conn_id] = (now, st)
-    return st
+    from .inventory import get_snapshot
+    return get_snapshot(conn_id)
 
 
 def _job_owned(job: Job, user: User) -> bool:
@@ -718,24 +696,11 @@ def state(request: Request, user: User = Depends(current_user), session: Session
                               Job.status.in_(["queued", "running", "waiting"])).order_by(Job.id.desc())
         ).all():
             active_by_dep.setdefault(j.deployment_id, j)
-    # Prime live VM status once per connection/node. An unavailable Proxmox target now
-    # costs one bounded connection probe, not one full timeout for every VM in /state.
+    # Remote inventory runs in the background, including on a cold cache. Requests
+    # never trigger network work and keep their own coherent snapshot adapter.
     conn_statuses: dict[int, dict] = {}
-    status_groups: dict[tuple[int, str], list[int]] = {}
-    for dep in deps:
-        if dep.vmid and dep.status not in ("working", "error", "cleanup_pending"):
-            conn = conns.get(dep.connection_id)
-            if conn:
-                status_groups.setdefault(
-                    (conn.id, dep.node or conn.node), [],
-                ).append(dep.vmid)
-    for (conn_id, node), vmids in status_groups.items():
-        px = px_cache.get(conn_id)
-        status = _conn_status(px, conn_id) if px else {"status": "unknown"}
-        conn_statuses[conn_id] = status
-        S.prime_live_statuses(
-            px, conn_id, node, vmids, online=status.get("status") == "online",
-        )
+    for conn_id, px in px_cache.items():
+        conn_statuses[conn_id] = getattr(px, "snapshot", None) or _conn_status(px, conn_id)
 
     vms = [S.vm_dict(session, d, user, px_cache, users, conns, active_by_dep) for d in deps]
 
@@ -906,6 +871,11 @@ def _validate_deploy_inputs(session: Session, tpl: Template, supplied: dict) -> 
     text/secret inputs MUST end up non-empty (answer or stored value).
     Returns canonical JSON to persist on the deployment."""
     recipe = load_recipe(tpl.recipe_json)
+    from .recipes import positional_deploy_inputs
+    try:
+        supplied = positional_deploy_inputs(recipe, supplied or {})
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     allowed = ask_map(recipe)
     supplied = supplied or {}
     for addr in supplied:
@@ -1060,7 +1030,7 @@ def _auto_name(session: Session, base: str = "gd") -> str:
 
 _lifecycle_admission_lock = threading.Lock()
 _ACTIVE_LIFECYCLE_STATUSES = ("queued", "running", "waiting")
-_LIFECYCLE_TYPES = ("deploy", "rebuild", "destroy")
+_LIFECYCLE_TYPES = ("deploy", "rebuild", "destroy", "configure")
 
 
 @dataclass
@@ -1109,6 +1079,8 @@ def _active_lifecycle_job(session: Session, deployment_id: int) -> Optional[Job]
 
 
 def _reject_cleanup_pending(dep: Deployment) -> None:
+    if dep.identity_state == "submitting":
+        raise HTTPException(409, "Remote operation is unconfirmed — inspect its task and confirm VM ownership in Recovery before changing it")
     if dep.status == "cleanup_pending":
         raise HTTPException(409, "VM cleanup is pending — wait for reconciliation to finish")
 
@@ -1184,6 +1156,9 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
               connection_id=conn.id, created_by=user.id, status="queued",
               context_json=_build_job_ctx(session, base, cpu, ram, disk, net, dep.id),
               execution_plan_enc=execution_plan_enc)
+    dep.original_execution_plan_enc = execution_plan_enc
+    dep.original_context_enc = encrypt(job.context_json)
+    session.add(dep)
     session.add(job)
     record_audit(session, user, "deploy", "deployment", dep.id, name)
     session.commit()
@@ -1241,8 +1216,12 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
         return {"ok": True}
 
 
+from .template_ops import RebuildBody
+
+
 @router.post("/deployments/{dep_id}/rebuild")
-def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session)):
+def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session = Depends(get_session),
+               body: Optional[RebuildBody] = None):
     _owned_deployment(session, dep_id, user)
     session.rollback()
     # Rebuild may need to recreate a missing legacy/static allocation. Keep its flush
@@ -1251,10 +1230,10 @@ def vm_rebuild(dep_id: int, user: User = Depends(current_user), session: Session
     # admission lock and stall lifecycle admission for a different VM.
     with _deployment_operation_lock(dep_id):
         with _lifecycle_admission_lock:
-            return _vm_rebuild_transaction(dep_id, user, session)
+            return _vm_rebuild_transaction(dep_id, user, session, body)
 
 
-def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
+def _vm_rebuild_transaction(dep_id: int, user: User, session: Session, body: Optional[RebuildBody] = None):
     dep = _owned_deployment(session, dep_id, user)
     _reject_cleanup_pending(dep)
     # One in-flight lifecycle job per VM — stops a user flooding the single serial
@@ -1264,20 +1243,10 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
         raise HTTPException(409, f"{active.type} job already active for this deployment")
     _reject_disabled_connection(session.get(Connection, dep.connection_id)
                                 if dep.connection_id else None)
-    if not dep.template_id:
-        raise HTTPException(400, "legacy VM — it predates templates; redeploy it from a template")
-    tpl = session.get(Template, dep.template_id)
-    base = session.get(Image, tpl.base_image_id) if tpl and tpl.base_image_id else None
-    if not base or base.kind != "base":
-        raise HTTPException(400, "template has no base image — edit it first")
-    _assert_trusted_ansible_blocks(session, load_recipe(tpl.recipe_json))
-    try:
-        deploy_inputs_json = open_deploy_inputs(dep.deploy_inputs_enc)
-    except ValueError:
-        raise HTTPException(409, "stored deployment answers cannot be decrypted "
-                                 "— secret key mismatch or corrupt row")
-    execution_plan_enc = _build_admitted_execution_plan(
-        session, tpl, dep.owner_id, deploy_inputs_json,
+    from .template_ops import prepare_rebuild
+    body = body or RebuildBody()
+    execution_plan_enc, context_json, deploy_inputs_json = prepare_rebuild(
+        session, dep, user, body.mode, body.deployInputs,
     )
     dep.status = "working"
     dep.cleanup_origin = None
@@ -1287,10 +1256,9 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session):
     # The existing IpAllocation row is reused by allocate_ip() inside _network_ctx —
     # it looks up the deployment_id and returns the same IP, so no new address is
     # allocated and the VM keeps its reserved static IP after the rebuild.
-    net = session.get(Network, dep.network_id) if dep.network_id else None
     job = Job(type="rebuild", title=f"Rebuilding {dep.name}", deployment_id=dep.id,
               connection_id=dep.connection_id, created_by=user.id, status="queued",
-              context_json=_build_job_ctx(session, base, dep.cpu, dep.ram, dep.disk, net, dep.id),
+              context_json=context_json,
               execution_plan_enc=execution_plan_enc)
     session.add(job)
     record_audit(session, user, "vm.rebuild", "deployment", dep.id, dep.name)
@@ -2133,48 +2101,41 @@ def add_base_image(body: BaseImageBody, user: User = Depends(require_admin),
     return {"ok": True}
 
 
-_CACHED_IMAGES_CACHE: dict[int, tuple[float, dict]] = {}
-_CACHED_IMAGES_TTL = 10.0  # seconds — bounds Proxmox listing amplification under polling
-
-
 @router.get("/images/cached")
 def cached_images(connectionId: int, user: User = Depends(current_user),
                   session: Session = Depends(get_session)):
-    """Which base images are already downloaded on the connection's image storage.
-    Result is cached per connection for a few seconds so repeated polling doesn't do
-    one Proxmox listing per call; an unreachable node returns online=False with HTTP
-    200 (the ISOs page renders 'target offline', never an error toast)."""
+    """Read the background storage inventory and durable download identities."""
+    from .inventory import get_snapshot, freshness
+    from .image_cache import active_filename, cache_metadata
     conn = session.get(Connection, connectionId)
     if not conn:
         raise HTTPException(404, "connection not found")
     if conn.disabled:
-        return {"online": False, "disabled": True, "cached": []}
-    now = time.time()
-    hit = _CACHED_IMAGES_CACHE.get(connectionId)
-    if hit and now - hit[0] < _CACHED_IMAGES_TTL:
-        return hit[1]
+        return {"online": False, "disabled": True, "cached": {}, "metadata": {},
+                "inventory": {"stale": True, "error": "Connection disabled"}}
+    snapshot = get_snapshot(connectionId)
     bases = session.exec(select(Image).where(Image.kind == "base")).all()
-    px = Proxmox(conn)
-    try:
-        vols = px.storage_volumes(node=conn.node or None)
-    except Exception:  # noqa: BLE001 — unreachable node is an expected state
-        result = {"online": False, "cached": {}}
-        _CACHED_IMAGES_CACHE[connectionId] = (now, result)
-        return result
+    vols = snapshot.get("volumes")
     cached = {}
+    metadata = {}
     for img in bases:
         if not (img.source_url or "").strip():
             continue  # nothing to download — UI shows unknown
-        cached[str(img.id)] = px.iso_volume_path(base_disk_filename(
-            img.source_url, img.checksum or "", _checksum_algo(img.checksum or ""),
-        )) in vols
-    result = {"online": True, "cached": cached}
-    _CACHED_IMAGES_CACHE[connectionId] = (now, result)
-    return result
+        args = (conn, snapshot.get("imageNode") or conn.node, img.source_url, img.checksum or "", _checksum_algo(img.checksum or ""))
+        filename = active_filename(*args)
+        if vols is not None:
+            cached[str(img.id)] = f"{conn.iso_storage or 'local'}:import/{filename}" in vols
+        metadata[str(img.id)] = cache_metadata(*args)
+    info = freshness(snapshot)
+    if snapshot.get("volumeError"):
+        info.update(stale=True, error=snapshot["volumeError"])
+    return {"online": snapshot["status"] == "online" and vols is not None,
+            "cached": cached, "metadata": metadata, "inventory": info}
 
 
 class SyncBody(BaseModel):
     connectionId: int
+    force_refresh: bool = False
 
 
 @router.post("/images/{img_id}/sync")
@@ -2202,12 +2163,15 @@ def sync_image(img_id: int, body: SyncBody, user: User = Depends(require_admin),
         Job.type == "image_sync", Job.image_id == img.id,
         Job.connection_id == conn.id, Job.status.in_(("queued", "running", "waiting")))).first()
     if existing:
+        if body.force_refresh and not json.loads(existing.context_json or "{}").get("force_refresh"):
+            raise HTTPException(409, "A regular sync is already active; refresh after it finishes")
         return {"ok": True, "jobId": existing.id, "deduped": True}
     job = Job(type="image_sync", title=f"Syncing {img.name} → {conn.name}",
               image_id=img.id, connection_id=conn.id, created_by=user.id, status="queued",
               context_json=json.dumps({"src_url": img.source_url,
                                        "checksum": img.checksum or "",
-                                       "checksum_algorithm": _checksum_algo(img.checksum or "")}))
+                                       "checksum_algorithm": _checksum_algo(img.checksum or ""),
+                                       "force_refresh": body.force_refresh}))
     session.add(job)
     record_audit(session, user, "image.sync", "image", img.id, img.name)
     session.commit()
@@ -2383,6 +2347,11 @@ def _validate_template_refs(session: Session, body: TemplateBody) -> tuple[Optio
 def save_template(body: TemplateBody, user: User = Depends(current_user), session: Session = Depends(get_session)):
     _validate_recipe(session, body.recipe, user)
     _validate_recipe_sensitive_inputs(session, body.recipe)
+    from .recipes import ensure_placement_ids
+    try:
+        body.recipe = ensure_placement_ids(body.recipe)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     bid, cid, nid = _validate_template_refs(session, body)
     # Store the authored sizes verbatim. The per-VM ceiling is enforced at deploy
     # time from the connection (0 = unlimited), so a template default is never
@@ -2423,6 +2392,11 @@ def edit_template_ep(rid: int, body: TemplateBody, user: User = Depends(current_
         raise HTTPException(403, "not yours")
     _validate_recipe(session, body.recipe, user)
     _validate_recipe_sensitive_inputs(session, body.recipe)
+    from .recipes import ensure_placement_ids
+    try:
+        body.recipe = ensure_placement_ids(body.recipe)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     rc.name = body.name.strip() or rc.name
     rc.description = body.description
     rc.os_family = body.os_family
@@ -3300,16 +3274,15 @@ def edit_connection(conn_id: int, body: ConnEditBody, user: User = Depends(requi
             setattr(c, k, v)
     session.add(c)
     if bool(c.disabled) != was_disabled:
-        # Distinct audit trail for the enable/disable choice, and an immediate
-        # status-cache bust so Settings reflects the new state on the next poll
-        # (re-enable also makes the first /state probe refresh the inventory).
-        _CONN_STATUS_CACHE.pop(c.id, None)
+        # Keep enable/disable distinct in the audit trail.
         record_audit(session, user,
                      "connection.disable" if c.disabled else "connection.enable",
                      "connection", c.id, c.name)
     else:
         record_audit(session, user, "connection.update", "connection", c.id, c.name)
     session.commit()
+    from .inventory import invalidate
+    invalidate(c.id)
     statebus.bump()
     return {"ok": True}
 
@@ -3733,6 +3706,8 @@ class BaseImageEditBody(BaseModel):
     os_family: Optional[str] = None
     source_url: Optional[str] = None
     checksum: Optional[str] = None
+    pin: bool = False
+    immutable: bool = False
 
 
 @router.put("/images/{img_id}")
@@ -3747,6 +3722,15 @@ def edit_image(img_id: int, body: BaseImageEditBody, user: User = Depends(curren
     if img.kind == "golden" and img.created_by != user.id and user.role != "admin":
         raise HTTPException(403, "not yours")
     checksum = _clean_checksum(body.checksum) if body.checksum is not None else None
+    if body.pin:
+        if user.role != "admin" or img.kind != "base":
+            raise HTTPException(403, "Only admins can pin base images")
+        from .image_cache import validate_pin
+        try:
+            validate_pin(body.source_url or img.source_url,
+                         checksum if checksum is not None else img.checksum, body.immutable)
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
     if body.name is not None and body.name.strip():
         img.name = _clean_name(body.name, "image name")
     if body.os_family:
@@ -3760,6 +3744,14 @@ def edit_image(img_id: int, body: BaseImageEditBody, user: User = Depends(curren
         img.checksum = checksum
     session.add(img)
     record_audit(session, user, "image.update", "image", img.id, img.name)
+    if body.pin:
+        from .image_cache import pin_identity
+        from .models import Setting
+        # Pin identity and image edits commit together.
+        key = f"image_pin:{img.id}"
+        row = session.get(Setting, key) or Setting(key=key, value="")
+        row.value = pin_identity(img.source_url, img.checksum)
+        session.add(row)
     session.commit()
     return {"ok": True}
 

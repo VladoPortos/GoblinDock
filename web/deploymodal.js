@@ -23,6 +23,7 @@
     const [mem, setMem] = useState(tpl ? tpl.mem : 2);
     const [disk, setDisk] = useState(tpl ? tpl.disk : 20);
     const [busy, setBusy] = useState(false);
+    const [report, setReport] = useState(null);
     const busyRef = React.useRef(false);
     const capData = window.UI.useFetched(
       () => ((tpl && tpl.connectionId) ? window.API.connectionCapacity(tpl.connectionId) : null),
@@ -60,6 +61,17 @@
     const asks = tpl ? collectAsks(tpl) : [];
     const missing = (name.trim() ? [] : ['VM name']).concat(asksMissing(asks, answers));
 
+    const payload = {templateId: tpl && tpl.templateId, name:name.trim(), deployInputs:answers,
+      cpu:Math.min(cpu,maxCpu),ram:Math.min(mem,maxMem),disk:Math.min(disk,maxDisk),tags:''};
+    React.useEffect(()=>setReport(null),[tplId,name,answers,cpu,mem,disk]);
+    const preflight = async () => {
+      if(busyRef.current || !tpl) return;
+      busyRef.current=true;setBusy(true);
+      try{setReport(await window.API.deployPreflight(payload));}
+      catch(e){window.GDStore.toast(e.message || 'Preflight failed','err');}
+      finally{busyRef.current=false;setBusy(false);}
+    };
+
     const submit = async () => {
       if (busyRef.current || !tpl) return;
       if (missing.length) { window.GDStore.toast('Required: ' + missing.join(', '), 'warn'); return; }
@@ -89,6 +101,8 @@
       asks.length > 0 && h('div', null,
         h('div', { className: 'panel-title', style: { marginBottom: 10 } }, 'Required inputs'),
         h(AskInputs, { asks, answers, setAnswers })),
+      h('button',{type:'button',className:'btn sm',disabled:busy,onClick:preflight},'Check readiness'),
+      h(window.PreflightReport,{report}),
       tpl && h('div', null,
         h('button', { className: 'btn ghost sm', onClick: (e) => { e.preventDefault(); setAdv(!adv); } },
           h(Icon, { name: 'sliders', size: 13 }), adv ? 'Hide resources' : 'Adjust resources (optional)'),

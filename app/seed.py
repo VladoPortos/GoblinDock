@@ -500,20 +500,20 @@ BUILTIN_BLOCKS = [
             "- name: Install Node.js\n"
             "  ansible.builtin.shell: |\n"
             "    if command -v apt-get >/dev/null 2>&1; then\n"
-            "      curl -fsSL https://deb.nodesource.com/setup_{version_q}.x | bash - && apt-get install -y nodejs\n"
+            "      curl -fsSL https://deb.nodesource.com/setup_{version_q}.x | bash -; apt-get install -y nodejs\n"
             "    elif command -v dnf >/dev/null 2>&1; then\n"
-            "      curl -fsSL https://rpm.nodesource.com/setup_{version_q}.x | bash - && dnf install -y nodejs\n"
+            "      curl -fsSL https://rpm.nodesource.com/setup_{version_q}.x | bash -; dnf install -y nodejs\n"
             "    else\n"
-            "      curl -fsSL https://rpm.nodesource.com/setup_{version_q}.x | bash - && yum install -y nodejs\n"
+            "      curl -fsSL https://rpm.nodesource.com/setup_{version_q}.x | bash -; yum install -y nodejs\n"
             "    fi"
         ),
         cloudinit=(
             "if command -v apt-get >/dev/null 2>&1; then\n"
-            "  curl -fsSL https://deb.nodesource.com/setup_{version}.x | bash - && apt-get install -y nodejs\n"
+            "  curl -fsSL https://deb.nodesource.com/setup_{version}.x | bash -; apt-get install -y nodejs\n"
             "elif command -v dnf >/dev/null 2>&1; then\n"
-            "  curl -fsSL https://rpm.nodesource.com/setup_{version}.x | bash - && dnf install -y nodejs\n"
+            "  curl -fsSL https://rpm.nodesource.com/setup_{version}.x | bash -; dnf install -y nodejs\n"
             "else\n"
-            "  curl -fsSL https://rpm.nodesource.com/setup_{version}.x | bash - && yum install -y nodejs\n"
+            "  curl -fsSL https://rpm.nodesource.com/setup_{version}.x | bash -; yum install -y nodejs\n"
             "fi"
         ),
     ),
@@ -532,9 +532,9 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Install Claude Code\n"
             "  ansible.builtin.shell: |\n"
-            "    sudo -u {user_q} -H bash -c 'test -x \"$HOME/.local/bin/claude\" || curl -fsSL https://claude.ai/install.sh | bash'"
+            "    sudo -u {user_q} -H bash -eo pipefail -c 'test -x \"$HOME/.local/bin/claude\" || curl -fsSL https://claude.ai/install.sh | bash'"
         ),
-        cloudinit="sudo -u {user} -H bash -c 'test -x \"$HOME/.local/bin/claude\" || curl -fsSL https://claude.ai/install.sh | bash'",
+        cloudinit="sudo -u {user} -H bash -eo pipefail -c 'test -x \"$HOME/.local/bin/claude\" || curl -fsSL https://claude.ai/install.sh | bash'",
     ),
     dict(
         key="b-codex", name="OpenAI Codex", category="AI Tools", icon="spark",
@@ -549,11 +549,11 @@ BUILTIN_BLOCKS = [
             "  ansible.builtin.shell: |\n"
             "    if ! command -v npm >/dev/null 2>&1; then\n"
             "      if command -v apt-get >/dev/null 2>&1; then\n"
-            "        curl -fsSL https://deb.nodesource.com/setup_{node_version_q}.x | bash - && apt-get install -y nodejs\n"
+            "        curl -fsSL https://deb.nodesource.com/setup_{node_version_q}.x | bash -; apt-get install -y nodejs\n"
             "      elif command -v dnf >/dev/null 2>&1; then\n"
-            "        curl -fsSL https://rpm.nodesource.com/setup_{node_version_q}.x | bash - && dnf install -y nodejs\n"
+            "        curl -fsSL https://rpm.nodesource.com/setup_{node_version_q}.x | bash -; dnf install -y nodejs\n"
             "      else\n"
-            "        curl -fsSL https://rpm.nodesource.com/setup_{node_version_q}.x | bash - && yum install -y nodejs\n"
+            "        curl -fsSL https://rpm.nodesource.com/setup_{node_version_q}.x | bash -; yum install -y nodejs\n"
             "      fi\n"
             "    fi\n"
             "    npm install -g @openai/codex"
@@ -561,11 +561,11 @@ BUILTIN_BLOCKS = [
         cloudinit=(
             "if ! command -v npm >/dev/null 2>&1; then\n"
             "  if command -v apt-get >/dev/null 2>&1; then\n"
-            "    curl -fsSL https://deb.nodesource.com/setup_{node_version}.x | bash - && apt-get install -y nodejs\n"
+            "    curl -fsSL https://deb.nodesource.com/setup_{node_version}.x | bash -; apt-get install -y nodejs\n"
             "  elif command -v dnf >/dev/null 2>&1; then\n"
-            "    curl -fsSL https://rpm.nodesource.com/setup_{node_version}.x | bash - && dnf install -y nodejs\n"
+            "    curl -fsSL https://rpm.nodesource.com/setup_{node_version}.x | bash -; dnf install -y nodejs\n"
             "  else\n"
-            "    curl -fsSL https://rpm.nodesource.com/setup_{node_version}.x | bash - && yum install -y nodejs\n"
+            "    curl -fsSL https://rpm.nodesource.com/setup_{node_version}.x | bash -; yum install -y nodejs\n"
             "  fi\n"
             "fi\n"
             "npm install -g @openai/codex"
@@ -735,7 +735,7 @@ BUILTIN_BLOCKS = [
             "if {password_auth}; then echo 'PasswordAuthentication yes' >> \"$conf\"; else echo 'PasswordAuthentication no' >> \"$conf\"; fi\n"
             "echo Port {port} >> \"$conf\"\n"
             "if [ -n {allow_users} ]; then echo AllowUsers {allow_users} >> \"$conf\"; fi\n"
-            "sshd -t && systemctl restart ssh || systemctl restart sshd"
+            "sshd -t; systemctl restart ssh || systemctl restart sshd"
         ),
     ),
     dict(
@@ -774,7 +774,7 @@ BUILTIN_BLOCKS = [
             "elif command -v dnf >/dev/null 2>&1; then dnf install -y epel-release || true; dnf install -y fail2ban\n"
             "else yum install -y epel-release || true; yum install -y fail2ban; fi\n"
             "printf '[sshd]\\nenabled = true\\nbackend = systemd\\nbantime = %s\\nmaxretry = %s\\n' {bantime} {maxretry} > /etc/fail2ban/jail.d/goblindock.local\n"
-            "systemctl enable --now fail2ban && systemctl restart fail2ban"
+            "systemctl enable --now fail2ban; systemctl restart fail2ban"
         ),
     ),
     dict(
@@ -797,9 +797,9 @@ BUILTIN_BLOCKS = [
             "- name: Install CA into the trust store\n"
             "  ansible.builtin.shell: |\n"
             "    if command -v update-ca-trust >/dev/null 2>&1; then\n"
-            "      install -m 0644 /tmp/gd-{name_q}.crt /etc/pki/ca-trust/source/anchors/{name_q}.crt && update-ca-trust extract\n"
+            "      install -m 0644 /tmp/gd-{name_q}.crt /etc/pki/ca-trust/source/anchors/{name_q}.crt; update-ca-trust extract\n"
             "    else\n"
-            "      install -m 0644 /tmp/gd-{name_q}.crt /usr/local/share/ca-certificates/{name_q}.crt && update-ca-certificates\n"
+            "      install -m 0644 /tmp/gd-{name_q}.crt /usr/local/share/ca-certificates/{name_q}.crt; update-ca-certificates\n"
             "    fi\n"
             "    rm -f /tmp/gd-{name_q}.crt"
         ),
@@ -1134,7 +1134,7 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Install WireGuard\n"
             "  ansible.builtin.shell: |\n"
-            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard; else (dnf install -y wireguard-tools || yum install -y wireguard-tools); fi\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard; else (dnf install -y wireguard-tools || yum install -y wireguard-tools); fi\n"
             "- name: Configure wg0\n"
             "  ansible.builtin.shell: |\n"
             "    umask 077\n"
@@ -1150,7 +1150,7 @@ BUILTIN_BLOCKS = [
             "  when: {private_key_set}"
         ),
         cloudinit=(
-            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard; else (dnf install -y wireguard-tools || yum install -y wireguard-tools); fi\n"
+            "if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq wireguard; else (dnf install -y wireguard-tools || yum install -y wireguard-tools); fi\n"
             "umask 077\n"
             "printf '[Interface]\\nAddress = %s\\nPrivateKey = %s\\n' {address} {private_key} > /etc/wireguard/wg0.conf\n"
             "if [ -n {listen_port} ]; then printf 'ListenPort = %s\\n' {listen_port} >> /etc/wireguard/wg0.conf; fi\n"
@@ -1172,12 +1172,12 @@ BUILTIN_BLOCKS = [
             "- name: Install Caddy\n"
             "  ansible.builtin.shell: |\n"
             "    if command -v apt-get >/dev/null; then\n"
-            "      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg\n"
+            "      apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq debian-keyring debian-archive-keyring apt-transport-https curl gnupg\n"
             "      curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/gpg.key | gpg --batch --yes --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg\n"
             "      curl -1sLf https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt > /etc/apt/sources.list.d/caddy-stable.list\n"
-            "      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy\n"
+            "      apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy\n"
             "    else\n"
-            "      dnf install -y 'dnf-command(copr)' && dnf copr enable -y @caddy/caddy && dnf install -y caddy\n"
+            "      dnf install -y 'dnf-command(copr)'; dnf copr enable -y @caddy/caddy; dnf install -y caddy\n"
             "    fi\n"
             "- name: Configure site\n"
             "  ansible.builtin.shell: |\n"
@@ -1191,9 +1191,9 @@ BUILTIN_BLOCKS = [
             "  when: {domain_set}"
         ),
         cloudinit=(
-            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy || true; fi\n"
+            "if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq caddy || true; fi\n"
             "printf '%s {\\n  reverse_proxy %s\\n}\\n' {domain} {upstream} > /etc/caddy/Caddyfile\n"
-            "systemctl enable --now caddy && systemctl restart caddy"
+            "systemctl enable --now caddy; systemctl restart caddy"
         ),
     ),
     dict(
@@ -1208,7 +1208,7 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Install nginx\n"
             "  ansible.builtin.shell: |\n"
-            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx; else (dnf install -y nginx || yum install -y nginx); fi\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx; else (dnf install -y nginx || yum install -y nginx); fi\n"
             "- name: Configure site\n"
             "  ansible.builtin.shell: |\n"
             "    cf=/etc/nginx/conf.d/goblindock-site.conf\n"
@@ -1226,9 +1226,9 @@ BUILTIN_BLOCKS = [
             "  when: {server_name_set}"
         ),
         cloudinit=(
-            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx; else (dnf install -y nginx || yum install -y nginx); fi\n"
+            "if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nginx; else (dnf install -y nginx || yum install -y nginx); fi\n"
             "printf 'server {\\n  listen 80;\\n  server_name %s;\\n  location / {\\n    proxy_pass http://%s;\\n    proxy_set_header Host $host;\\n  }\\n}\\n' {server_name} {upstream} > /etc/nginx/conf.d/goblindock-site.conf\n"
-            "nginx -t && systemctl enable --now nginx && systemctl reload nginx"
+            "nginx -t; systemctl enable --now nginx; systemctl reload nginx"
         ),
     ),
     dict(
@@ -1264,7 +1264,7 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Install chrony\n"
             "  ansible.builtin.shell: |\n"
-            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else (dnf install -y chrony || yum install -y chrony); fi\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else (dnf install -y chrony || yum install -y chrony); fi\n"
             "- name: Configure NTP sources\n"
             "  ansible.builtin.shell: |\n"
             "    conf=/etc/chrony/chrony.conf; [ -f \"$conf\" ] || conf=/etc/chrony.conf\n"
@@ -1275,7 +1275,7 @@ BUILTIN_BLOCKS = [
             "  when: {ntp_servers_set}"
         ),
         cloudinit=(
-            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else (dnf install -y chrony || yum install -y chrony); fi\n"
+            "if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq chrony; else (dnf install -y chrony || yum install -y chrony); fi\n"
             "conf=/etc/chrony/chrony.conf; [ -f \"$conf\" ] || conf=/etc/chrony.conf\n"
             "for s in {ntp_servers}; do echo \"server $s iburst\" >> \"$conf\"; done\n"
             "systemctl restart chronyd 2>/dev/null || systemctl restart chrony"
@@ -1293,14 +1293,14 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Install Node Exporter\n"
             "  ansible.builtin.shell: |\n"
-            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq prometheus-node-exporter; else (dnf install -y golang-github-prometheus-node_exporter || dnf install -y node_exporter || yum install -y node_exporter); fi\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq prometheus-node-exporter; else (dnf install -y golang-github-prometheus-node_exporter || dnf install -y node_exporter || yum install -y node_exporter); fi\n"
             "    systemctl enable --now prometheus-node-exporter 2>/dev/null || systemctl enable --now node_exporter\n"
             "- name: Restrict scrape access\n"
             "  ansible.builtin.shell: ufw allow from {allow_from_q} to any port 9100 proto tcp\n"
             "  when: {allow_from_set}"
         ),
         cloudinit=(
-            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq prometheus-node-exporter; else (dnf install -y node_exporter || yum install -y node_exporter); fi\n"
+            "if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq prometheus-node-exporter; else (dnf install -y node_exporter || yum install -y node_exporter); fi\n"
             "systemctl enable --now prometheus-node-exporter 2>/dev/null || systemctl enable --now node_exporter"
         ),
     ),
@@ -1345,7 +1345,7 @@ BUILTIN_BLOCKS = [
             "      mkdir -p /etc/apt/keyrings\n"
             "      curl -fsSL https://apt.grafana.com/gpg.key | gpg --batch --yes --dearmor -o /etc/apt/keyrings/grafana.gpg\n"
             "      echo 'deb [signed-by=/etc/apt/keyrings/grafana.gpg] https://apt.grafana.com stable main' > /etc/apt/sources.list.d/grafana.list\n"
-            "      apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq promtail\n"
+            "      apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq promtail\n"
             "    else\n"
             "      printf '[grafana]\\nname=grafana\\nbaseurl=https://rpm.grafana.com\\nrepo_gpgcheck=1\\nenabled=1\\ngpgcheck=1\\ngpgkey=https://rpm.grafana.com/gpg.key\\n' > /etc/yum.repos.d/grafana.repo\n"
             "      dnf install -y promtail || yum install -y promtail\n"
@@ -1422,7 +1422,7 @@ BUILTIN_BLOCKS = [
             "    home=$(getent passwd {user_q} | cut -d: -f6); [ -n \"$home\" ]\n"
             "    ghost={host_q}; [ -n \"$ghost\" ] || ghost={provider_q}\n"
             "    ghost=${ghost#https://}; ghost=${ghost%/}\n"
-            "    command -v git >/dev/null || { if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; else (dnf install -y git || yum install -y git); fi; }\n"
+            "    command -v git >/dev/null || { if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq git; else (dnf install -y git || yum install -y git); fi; }\n"
             "    HOME=\"$home\" git config --global user.name {git_name_q}\n"
             "    HOME=\"$home\" git config --global user.email {git_email_q}\n"
             "    HOME=\"$home\" git config --global credential.helper store\n"
@@ -1454,7 +1454,7 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Install NFS server\n"
             "  ansible.builtin.shell: |\n"
-            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server; else (dnf install -y nfs-utils || yum install -y nfs-utils); fi\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server; else (dnf install -y nfs-utils || yum install -y nfs-utils); fi\n"
             "- name: Export directory\n"
             "  ansible.builtin.shell: |\n"
             "    mkdir -p {path_q}\n"
@@ -1466,7 +1466,7 @@ BUILTIN_BLOCKS = [
             "    exportfs -ra"
         ),
         cloudinit=(
-            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server; else (dnf install -y nfs-utils || yum install -y nfs-utils); fi\n"
+            "if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nfs-kernel-server; else (dnf install -y nfs-utils || yum install -y nfs-utils); fi\n"
             "mkdir -p {path}\n"
             "printf '%s %s(%s)\\n' {path} {clients} {options} >> /etc/exports\n"
             "systemctl enable --now nfs-server 2>/dev/null || systemctl enable --now nfs-kernel-server\n"
@@ -1487,7 +1487,7 @@ BUILTIN_BLOCKS = [
         ansible=(
             "- name: Install Samba\n"
             "  ansible.builtin.shell: |\n"
-            "    if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq samba; else (dnf install -y samba || yum install -y samba); fi\n"
+            "    if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq samba; else (dnf install -y samba || yum install -y samba); fi\n"
             "- name: Configure share\n"
             "  ansible.builtin.shell: |\n"
             "    mkdir -p {path_q}\n"
@@ -1508,7 +1508,7 @@ BUILTIN_BLOCKS = [
             "    systemctl restart smbd 2>/dev/null || systemctl restart smb"
         ),
         cloudinit=(
-            "if command -v apt-get >/dev/null; then apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq samba; else (dnf install -y samba || yum install -y samba); fi\n"
+            "if command -v apt-get >/dev/null; then apt-get update -qq; DEBIAN_FRONTEND=noninteractive apt-get install -y -qq samba; else (dnf install -y samba || yum install -y samba); fi\n"
             "mkdir -p {path}\n"
             "printf '[%s]\\n  path = %s\\n  read only = no\\n  guest ok = no\\n  valid users = %s\\n' {share_name} {path} {smb_user} >> /etc/samba/smb.conf\n"
             "printf '%s\\n%s\\n' {smb_password} {smb_password} | smbpasswd -s -a {smb_user}\n"
@@ -1516,6 +1516,36 @@ BUILTIN_BLOCKS = [
         ),
     ),
 ]
+
+
+def _strict_builtin_shell(template: str) -> str:
+    """Give maintained shell tasks one explicit failure contract.
+
+    Work on the template's task boundaries before placeholder rendering, which
+    can contain arbitrary YAML-sensitive input. Preserve existing task args and
+    explicit optional-command guards. Custom blocks and Run Script are untouched.
+    """
+    tasks = re.split(r"(?m)(?=^- name:)", template)
+    for index, task in enumerate(tasks):
+        match = re.search(r"(?m)^  ansible\.builtin\.shell: (.*)$", task)
+        if not match:
+            continue
+        body = match.group(1)
+        replacement = "  ansible.builtin.shell: |\n    set -eo pipefail"
+        if body != "|":
+            replacement += "\n    " + body
+        task = task[:match.start()] + replacement + task[match.end():]
+        if re.search(r"(?m)^  args:\s*$", task):
+            task = re.sub(r"(?m)^  args:\s*$", "  args:\n    executable: /bin/bash", task)
+        else:
+            task = task.rstrip("\n") + "\n  args:\n    executable: /bin/bash\n"
+        tasks[index] = task
+    return "".join(tasks)
+
+
+for _builtin in BUILTIN_BLOCKS:
+    if _builtin["key"] != "b-script":
+        _builtin["ansible"] = _strict_builtin_shell(_builtin["ansible"])
 
 
 # cloud-init = first-boot blocks (identity, or things that must exist BEFORE the

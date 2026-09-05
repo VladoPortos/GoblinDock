@@ -330,6 +330,47 @@ def _placed_blocks(recipe):
                 yield placed
 
 
+def ensure_placement_ids(recipe: list[dict]) -> list[dict]:
+    """Copy a recipe, retaining stable placement IDs and assigning missing IDs.
+
+    Positional addresses remain accepted by legacy clients for fresh admission.
+    IDs distinguish repeated uses of the same block and survive reorder/edit.
+    """
+    import uuid
+    out = json.loads(json.dumps(recipe))
+    seen = set()
+    for placed in _placed_blocks(out):
+        pid = placed.get("placementId")
+        if pid is None:
+            pid = "p-" + uuid.uuid4().hex
+            placed["placementId"] = pid
+        if not isinstance(pid, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", pid) or pid in seen:
+            raise ValueError("placementId must be a unique identifier")
+        seen.add(pid)
+    return out
+
+
+def positional_deploy_inputs(recipe: list[dict], supplied: dict) -> dict:
+    """Resolve stable IDs to current positions, rejecting ambiguous aliases."""
+    aliases = {}
+    for si, sec in enumerate(recipe):
+        if not isinstance(sec, dict) or not isinstance(sec.get("blocks", []), list):
+            continue
+        for bi, placed in enumerate(sec.get("blocks") or []):
+            if isinstance(placed, dict) and isinstance(placed.get("placementId"), str) and placed["placementId"]:
+                pid = placed["placementId"]
+                if pid in aliases:
+                    raise ValueError("duplicate placementId")
+                aliases[pid] = f"{si}.{bi}"
+    out = {}
+    for addr, answers in supplied.items():
+        resolved = aliases.get(addr, addr)
+        if resolved in out:
+            raise ValueError("duplicate answers for the same placement")
+        out[resolved] = answers
+    return out
+
+
 def ask_map(recipe: list[dict]) -> dict[str, list[str]]:
     """Ask-on-deploy index: ``{"<sectionIdx>.<blockIdx>": [input names]}`` for
     every placed block carrying a non-empty ``ask`` list."""
@@ -357,6 +398,7 @@ def merge_deploy_inputs(recipe: list[dict], overrides: dict) -> list[dict]:
     out = json.loads(json.dumps(recipe))  # deep copy — never hand back the stored object
     if not overrides or not isinstance(overrides, dict):
         return out
+    overrides = positional_deploy_inputs(recipe, overrides)
     allowed = ask_map(recipe)
     for addr, answers in overrides.items():
         names = allowed.get(addr)

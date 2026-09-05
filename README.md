@@ -31,6 +31,8 @@ all from a single container backed by one SQLite file.
 
 ## What it does
 
+See [reliability, recovery, and PR test-image instructions](docs/reliability-release.md) for the new preflight, versioned rebuild, recovery, and image-cache controls.
+
 GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
 
 - **🧱 Templates from blocks** — assemble a base cloud image + a stack of customization
@@ -87,7 +89,7 @@ open http://localhost:8080
 
 > The image is published at **`ghcr.io/vladoportos/goblindock`** — multi-arch
 > (amd64 · arm64). Tags: `latest` (newest release), `main` (rolling, from the default
-> branch), and semver (`2.6.0`, `2.6`). The compose files pull `:latest` by default.
+> branch), and semver (`2.8.0`, `2.8`). The compose files pull `:latest` by default.
 
 The first load shows **"Create the first admin account"**. With the dev override the
 Proxmox connection is auto-seeded from `PROXMOX_*` (`GOBLINDOCK_SEED_PROXMOX=true`); in

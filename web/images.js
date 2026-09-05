@@ -30,7 +30,7 @@
   }
 
   /* ============ ISOs / BASE IMAGES (Manage) ============ */
-  function IsoCard({ img, go, onEdit, onDelete, isAdmin, cacheState, syncing, canSync, onSync }) {
+  function IsoCard({ img, go, onEdit, onDelete, onPin, isAdmin, cacheState, syncing, canSync, onSync, metadata = {} }) {
     return h('div', { className: 'card', style: { overflow: 'hidden', display: 'flex', flexDirection: 'column' } },
       h('div', { className: 'card-pad', style: { display: 'flex', flexDirection: 'column', gap: 12, flex: 1 } },
         h('div', { className: 'row', style: { gap: 10 } },
@@ -39,25 +39,31 @@
             h('div', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, img.name),
             h('div', { className: 'hint mono', style: { fontSize: 11 } }, img.size)),
           h('div', { style: { marginLeft: 'auto', textAlign: 'right' } },
-            h('span', { className: 'badge running' }, h('span', { className: 'dot running' }), 'Ready'),
+            h('span', { className: 'badge running' }, h('span', { className: 'dot running' }), img.pinned ? 'Pinned' : 'Ready'),
             h('div', { className: 'hint mono', style: { fontSize: 10.5, marginTop: 5 } },
               cacheState === 'cached' ? h('span', { style: { color: 'var(--ok)' } }, '✓ cached on node')
                 : cacheState === 'missing' ? '○ not downloaded'
                 : '— cache unknown'))),
         h('div', null,
           h('div', { className: 'panel-title', style: { marginBottom: 6 } }, 'Cloud image URL'),
-          h('div', { className: 'copy mono', style: { fontSize: 10.5, wordBreak: 'break-all' } }, img.source_url || img.checksum || 'Not provided'))),
+          h('div', { className: 'copy mono', style: { fontSize: 10.5, wordBreak: 'break-all' } }, img.source_url || img.checksum || 'Not provided')),
+        h('div', { className: 'hint', style: { fontSize: 11 } },
+          metadata.downloadedAt ? 'Downloaded ' + new Date(metadata.downloadedAt).toLocaleString() : 'Download date unknown',
+          metadata.validatedAt ? ' · Checksum verified ' + new Date(metadata.validatedAt).toLocaleString() : ' · No recorded checksum validation'),
+        metadata.sourceIdentity && h('div', { className: 'hint mono', style: { fontSize: 10 }, title: metadata.sourceIdentity },
+          'Source identity ' + metadata.sourceIdentity.slice(0, 16))),
       h('div', { style: { display: 'flex', borderTop: '1px solid var(--border-soft)' } },
         h('button', { className: 'card-act', onClick: () => go('newtemplate', { baseImageId: img.imgId }) }, h(Icon, { name: 'template', size: 14 }), 'New template'),
         isAdmin && h('button', { className: 'card-act', disabled: !canSync,
           title: syncing ? 'Sync in progress…'
-            : cacheState === 'cached' ? 'Already cached on the target node'
+            : cacheState === 'cached' ? 'Download and validate a new copy; retain the previous cache'
             : !canSync && cacheState !== 'missing' ? 'Cache state unknown (target offline or no URL)'
             : 'Download to the target node now',
           onClick: onSync },
-          h(Icon, { name: 'download', size: 14 }), syncing ? 'Syncing…' : 'Sync'),
+          h(Icon, { name: 'download', size: 14 }), syncing ? 'Syncing…' : cacheState === 'cached' ? 'Refresh cache' : 'Sync'),
         isAdmin && h(Menu, { align: 'right', items: [
           { label: 'Edit', icon: 'edit', onClick: () => onEdit(img) },
+          { label: 'Pin version', icon: 'lock', onClick: () => onPin(img) },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true,
             disabled: img.canDelete !== true,
@@ -66,7 +72,7 @@
         ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' } }, h(Icon, { name: 'more', size: 16 })))));
   }
 
-  function IsoModal({ img, onClose, onDone }) {
+  function IsoModal({ img, pinning = false, onClose, onDone }) {
     const editing = !!img;
     const [f, setF] = useState({
       name: img ? img.name : '',
@@ -75,6 +81,7 @@
       checksum: img ? (img.checksum || '') : '',
     });
     const [busy, setBusy] = useState(false);
+    const [immutable, setImmutable] = useState(false);
     const checksumId = React.useId();
     const checksumFeedbackId = checksumId + '-feedback';
     const checksum = checksumMeta(f.checksum);
@@ -82,20 +89,23 @@
     const submit = async () => {
       if (!f.name.trim() || !f.source_url.trim()) { toast('Name and URL required', 'err'); return; }
       if (!checksum.valid) { toast(checksum.message, 'err'); return; }
+      if (pinning && (!immutable || !checksum.normalized)) {
+        toast('Pinning requires a version-specific URL, checksum, and immutable URL confirmation', 'err'); return;
+      }
       setBusy(true);
       try {
-        const payload = { ...f, checksum: checksum.normalized };
+        const payload = { ...f, checksum: checksum.normalized, ...(pinning ? { pin: true, immutable } : {}) };
         if (editing) await window.API.editImage(img.imgId, payload);
         else await window.API.addBaseImage(payload);
         onDone();
       } catch (e) { toast(e.message, 'err'); setBusy(false); }
     };
-    return h(FormModal, { title: editing ? 'Edit base image' : 'Add base image (ISO)', icon: 'disk', onClose, onSubmit: submit, busy },
+    return h(FormModal, { title: pinning ? 'Pin image version' : editing ? 'Edit base image' : 'Add base image (ISO)', icon: 'disk', onClose, onSubmit: submit, busy },
       h(Field, { label: 'Name', value: f.name, onChange: (v) => set('name', v), placeholder: 'Ubuntu 24.04 LTS' }),
       h(SelectField, { label: 'OS family', value: f.os_family, onChange: (v) => set('os_family', v), options: ['ubuntu', 'debian', 'alpine', 'rocky', 'generic'] }),
       h(Field, { label: 'Cloud image URL (.img/.qcow2)', value: f.source_url, onChange: (v) => set('source_url', v), mono: true, placeholder: 'https://…/noble-server-cloudimg-amd64.img' }),
       h('div', null,
-        h('label', { className: 'field-label', htmlFor: checksumId }, 'Checksum (optional)'),
+        h('label', { className: 'field-label', htmlFor: checksumId }, pinning ? 'Checksum (required)' : 'Checksum (optional)'),
         h('input', {
           id: checksumId,
           className: 'input mono',
@@ -112,7 +122,11 @@
           className: 'hint',
           'aria-live': 'polite',
           style: { fontSize: 11, marginTop: 4, color: checksum.valid ? null : 'var(--err)' },
-        }, checksum.message)));
+        }, checksum.message)),
+      pinning && h('label', { className: 'hint', style: { display: 'flex', gap: 8 } },
+        h('input', { type: 'checkbox', checked: immutable, onChange: e => setImmutable(e.target.checked) }),
+        'This URL identifies one immutable release, not a latest/current alias. Future downloads must match this checksum.'),
+      pinning && h('div', { className: 'hint' }, 'Existing VMs retain their disks. Deploys and refreshes use this pinned source after saving.'));
   }
 
   function Isos({ go }) {
@@ -126,10 +140,17 @@
       catch (e) { toast(e.message || 'delete failed', 'err'); throw e; }
     };
 
-    const conns = GD.CONNECTIONS || [];
+    const conns = (GD.CONNECTIONS || []).filter(c => !c.disabled);
     const [targetId, setTargetId] = useState((conns[0] && conns[0].connId) || null);
     const [bump, setBump] = useState(0);                                // forces a cache refetch
     const syncCountRef = React.useRef(0);
+    React.useEffect(() => {
+      if (!conns.some(c => c.connId === targetId)) setTargetId((conns[0] && conns[0].connId) || null);
+    }, [targetId, conns.map(c => c.connId).join(',')]);
+    React.useEffect(() => {
+      const timer = setInterval(() => setBump(b => b + 1), 6000);
+      return () => clearInterval(timer);
+    }, []);
 
     // online null = unknown/loading
     const cache = window.UI.useFetched(
@@ -143,12 +164,12 @@
       syncCountRef.current = workingSyncs;
     }, [workingSyncs]);
 
-    const doSync = async (img) => {
+    const doSync = async (img, forceRefresh = false) => {
       try {
-        await window.API.syncImage(img.imgId, { connectionId: targetId });
+        await window.API.syncImage(img.imgId, { connectionId: targetId, force_refresh: forceRefresh });
         toast('Sync started — watch the activity bell', 'ok');
         window.GDStore.refresh().catch(() => {});
-      } catch (e) { toast(e.message || 'sync failed', 'err'); }
+      } catch (e) { toast(e.message || 'sync failed', 'err'); if (forceRefresh) throw e; }
     };
 
     return h('div', { className: 'page fadein' },
@@ -162,8 +183,11 @@
           h('select', { className: 'select', style: { width: 'auto', minWidth: 140 }, value: targetId || '',
             onChange: (e) => setTargetId(Number(e.target.value) || null) },
             conns.map((c) => h('option', { key: c.connId, value: c.connId }, c.name))),
-          cache.online === false && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, 'target offline')),
+          cache.online === false && h('span', { className: 'badge', style: { background: 'var(--warn-ghost)', color: 'var(--warn)', border: 'none' } }, cache.inventory && cache.inventory.completedAt ? 'target unavailable' : 'waiting for inventory')),
         isAdmin && h('button', { className: 'btn primary', onClick: () => setModal('add') }, h(Icon, { name: 'download', size: 16 }), 'Add base image')),
+      cache.inventory && h('div', { className: 'hint', role: 'status', style: { marginBottom: 14 } },
+        cache.inventory.error || (cache.inventory.stale ? 'Inventory is stale' : 'Inventory is current'),
+        cache.inventory.updatedAt ? ' · Last successful check ' + new Date(cache.inventory.updatedAt).toLocaleString() : ' · First check pending'),
       bases.length === 0
         ? h('div', { className: 'card' }, h('div', { className: 'empty', style: { padding: '44px 20px' } },
             h('div', { className: 'glyph' }, h(Icon, { name: 'disk', size: 26 })),
@@ -176,17 +200,22 @@
                 ? (cache.cached[String(img.imgId)] ? 'cached' : 'missing') : 'unknown';
               const syncing = (GD.JOBS || []).some((j) => j.imageId === img.imgId && j.status === 'working');
               return h(IsoCard, { key: img.id, img, go, isAdmin, cacheState, syncing,
-                canSync: !!targetId && cacheState === 'missing' && !syncing,
-                onSync: () => doSync(img),
+                metadata: (cache.metadata || {})[String(img.imgId)] || {},
+                canSync: !!targetId && !!img.source_url && !syncing,
+                onSync: () => cacheState === 'cached' ? setConfirm({ refresh: true, img }) : doSync(img),
+                onPin: (x) => setModal({ img: x, pinning: true }),
                 onEdit: (x) => setModal({ img: x }), onDelete: (x) => setConfirm(x) });
             })),
       modal === 'add' && h(IsoModal, { onClose: () => setModal(null), onDone: () => { setModal(null); toast('Base image added', 'ok'); refresh(); } }),
-      modal && modal.img && h(IsoModal, { img: modal.img, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Base image updated', 'ok'); refresh(); } }),
-      confirm && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Remove ' + confirm.name + '?',
+      modal && modal.img && h(IsoModal, { img: modal.img, pinning: !!modal.pinning, onClose: () => setModal(null), onDone: () => { setModal(null); toast('Base image updated', 'ok'); refresh(); } }),
+      confirm && confirm.refresh && h(ConfirmModal, { onClose: () => setConfirm(null), icon: 'download', title: 'Refresh ' + confirm.img.name + '?',
+        body: 'Download a new copy and validate its checksum when configured. The previous cached file remains available and existing VMs keep their disks. Extra storage is required.',
+        confirmLabel: 'Refresh cache', onConfirm: () => doSync(confirm.img, true) }),
+      confirm && !confirm.refresh && h(ConfirmModal, { onClose: () => setConfirm(null), tone: 'danger', icon: 'trash', title: 'Remove ' + confirm.name + '?',
         body: 'Removes the base image entry. No template or deployed VM references it. Downloaded files on the node are not deleted.',
         confirmLabel: 'Remove', onConfirm: () => del(confirm) }));
   }
 
-  window.ImageUI = { checksumMeta, IsoModal };
+  window.ImageUI = { checksumMeta, IsoModal, IsoCard };
   window.Isos = Isos;
 })();
