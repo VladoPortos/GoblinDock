@@ -66,18 +66,19 @@
 
   // Fetch-on-mount hook with cancel-on-unmount: runs `fn` whenever `deps` change,
   // ignores stale results after unmount/re-run, resolves to `errValue` on failure.
-  // Returns null while loading.
-  function useFetched(fn, deps, errValue) {
+  // Returns null while loading. Supplying retainKey keeps data visible during
+  // refreshes of that resource; a different key hides the old data immediately.
+  function useFetched(fn, deps, errValue, retainKey) {
     const [data, setData] = React.useState(null);
     React.useEffect(() => {
       let live = true;
-      setData(null);
+      if (retainKey === undefined) setData(null);
       Promise.resolve().then(fn)
-        .then((d) => { if (live) setData(d); })
-        .catch(() => { if (live) setData(errValue === undefined ? null : errValue); });
+        .then((d) => { if (live) setData({ key: retainKey, value: d }); })
+        .catch(() => { if (live) setData({ key: retainKey, value: errValue === undefined ? null : errValue }); });
       return () => { live = false; };
     }, deps);
-    return data;
+    return data && Object.is(data.key, retainKey) ? data.value : null;
   }
 
   function CopyField({ value, mono = true }) {

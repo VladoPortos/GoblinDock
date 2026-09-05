@@ -152,10 +152,11 @@
       return () => clearInterval(timer);
     }, []);
 
+    // Keep the last inventory visible during polls; changing target clears it.
     // online null = unknown/loading
     const cache = window.UI.useFetched(
       () => (targetId ? window.API.cachedImages(targetId) : { online: null, cached: {} }),
-      [targetId, bump], { online: false, cached: {} }) || { online: null, cached: {} };
+      [targetId, bump], { online: false, cached: {} }, targetId) || { online: null, cached: {} };
 
     // when a running sync job finishes (count drops), the cache may have changed
     const workingSyncs = (GD.JOBS || []).filter((j) => j.imageId != null && j.status === 'working').length;
