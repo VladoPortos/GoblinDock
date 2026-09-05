@@ -88,7 +88,15 @@ window.API = (function () {
     // deployments
     deploy: (p) => req('POST', '/api/deployments', p),
     vmAction: (id, action) => req('POST', `/api/deployments/${id}/action`, { action }),
-    vmRebuild: (id) => req('POST', `/api/deployments/${id}/rebuild`),
+    vmRebuild: (id, p) => req('POST', `/api/deployments/${id}/rebuild`, p || {mode: 'original'}),
+    rebuildPlan: (id) => req('GET', `/api/deployments/${id}/rebuild-plan`),
+    rebuildPreview: (id, p) => req('POST', `/api/deployments/${id}/rebuild-preview`, p),
+    deployPreflight: (p) => req('POST', '/api/preflight/deploy', p),
+    rebuildPreflight: (id, p) => req('POST', `/api/deployments/${id}/preflight`, p),
+    recovery: () => req('GET', '/api/recovery'),
+    reconcileVm: (id, p) => req('POST', `/api/deployments/${id}/reconcile`, p || {}),
+    retryConfiguration: (id) => req('POST', `/api/deployments/${id}/retry-configuration`, {acknowledgeReplay: true}),
+    retryCleanup: (id) => req('POST', `/api/deployments/${id}/retry-cleanup`),
     vmDestroy: (id) => req('DELETE', `/api/deployments/${id}`),
     // removes only GoblinDock's record — never sends a delete to Proxmox
     vmCleanupLocal: (id) => req('POST', `/api/deployments/${id}/cleanup_local`),
@@ -115,6 +123,8 @@ window.API = (function () {
 
     // templates (deployment presets: base image + blocks + defaults)
     saveTemplate: (p) => req('POST', '/api/templates', p),
+    exportTemplate: (id) => req('GET', `/api/templates/${id}/export`),
+    importTemplate: (p) => req('POST', '/api/templates/import', p),
     editTemplate: (id, p) => req('PUT', `/api/templates/${id}`, p),
     deleteTemplate: (id) => req('DELETE', `/api/templates/${id}`),
     compile: (recipe, name) => req('POST', '/api/templates/compile', { recipe, name }),

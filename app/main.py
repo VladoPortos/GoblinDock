@@ -12,6 +12,9 @@ from starlette.middleware.base import BaseHTTPMiddleware
 
 from . import __version__
 from .api import router as api_router
+from .template_ops import router as template_router
+from .operations import router as operations_router
+from .inventory import start_inventory, stop_inventory
 from .config import settings
 from .db import init_db
 from .netutil import client_ip, set_request_ip
@@ -42,15 +45,19 @@ async def lifespan(app: FastAPI):
         announce_setup_token(_s)
     start_worker()
     start_scheduler()
+    start_inventory()
     log.info("GoblinDock ready · web=%s · vmid=%s-%s · max %sc/%sMB · dev=%s",
              settings.web_dir, settings.vmid_min, settings.vmid_max,
              settings.max_cores, settings.max_ram_mb, settings.dev_mode)
     yield
     stop_scheduler()
+    stop_inventory()
     stop_worker(join_timeout=30)
 
 
 app = FastAPI(title="GoblinDock", version=__version__, lifespan=lifespan)
+app.include_router(template_router)
+app.include_router(operations_router)
 
 
 async def csrf_and_security_headers(request: Request, call_next):

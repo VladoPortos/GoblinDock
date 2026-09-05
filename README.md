@@ -31,6 +31,8 @@ all from a single container backed by one SQLite file.
 
 ## What it does
 
+See [reliability, recovery, and PR test-image instructions](docs/reliability-release.md) for the new preflight, versioned rebuild, recovery, and image-cache controls.
+
 GoblinDock turns *"spin up a fully-configured VM"* into a few clear buttons:
 
 - **🧱 Templates from blocks** — assemble a base cloud image + a stack of customization

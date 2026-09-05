@@ -8,6 +8,7 @@
   const NAV = [
     { group: 'Operate', items: [
       { id: 'dashboard', label: 'Dashboard', icon: 'server' },
+      { id: 'recovery', label: 'Recovery', icon: 'warn' },
     ]},
     { group: 'Build', items: [
       { id: 'templates', label: 'Templates',   icon: 'template' },
@@ -114,7 +115,8 @@
     });
   }
 
-  const TITLES = {
+    const TITLES = {
+      recovery: ['Operate', 'Recovery'],
     dashboard: ['Operate', 'Virtual Machines'], vmdetail: ['Operate', 'Virtual Machine'],
     job: ['Operate', 'Job Progress'],
     templates: ['Build', 'Templates'],

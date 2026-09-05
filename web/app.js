@@ -104,6 +104,7 @@
 
     const SCREENS = {
       dashboard: () => h(window.Dashboard, { go }),
+      recovery: () => h(window.Recovery, { go }),
       vmdetail: () => h(window.VmDetail, { go }),
       job: () => h(window.JobProgress, { go }),
       newtemplate: () => h(window.Builder, { go }),

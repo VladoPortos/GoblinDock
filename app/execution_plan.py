@@ -17,6 +17,8 @@ from .recipes import (
     load_recipe,
     merge_deploy_inputs,
     normalize_input_schema,
+    ensure_placement_ids,
+    positional_deploy_inputs,
 )
 from .security import decrypt, encrypt
 
@@ -69,7 +71,7 @@ def _recipe_block_refs(recipe: list) -> set[str]:
 def _validate_plan(plan: object) -> dict:
     if not isinstance(plan, dict) or set(plan) not in (_LEGACY_PLAN_FIELDS, _PLAN_FIELDS):
         _invalid()
-    if plan["version"] != 1 or isinstance(plan["version"], bool):
+    if plan["version"] not in (1, 2) or isinstance(plan["version"], bool):
         _invalid()
     if not _is_owner_id(plan["owner_id"]):
         _invalid()
@@ -85,6 +87,10 @@ def _validate_plan(plan: object) -> dict:
     if not isinstance(recipe, list) or not isinstance(blocks, dict) or not isinstance(deploy_inputs, dict):
         _invalid()
     refs = _recipe_block_refs(recipe)
+    if plan["version"] == 2:
+        if any(not placed.get("placementId") for section in recipe for placed in section.get("blocks", [])):
+            _invalid()
+        ensure_placement_ids(recipe)
     if set(blocks) != refs:
         _invalid()
     derived_sensitive: dict[str, list[str]] = {}
@@ -132,6 +138,8 @@ def build_execution_plan(session: Session, template: Template, deployment_owner_
     if not isinstance(deploy_inputs, dict):
         _invalid()
     recipe = load_recipe(template.recipe_json)
+    recipe = ensure_placement_ids(recipe)
+    deploy_inputs = positional_deploy_inputs(recipe, deploy_inputs)
     recipe = merge_deploy_inputs(recipe, deploy_inputs)
     refs = _recipe_block_refs(recipe)
     rows = session.exec(select(Block).where(Block.key.in_(refs))).all() if refs else []
@@ -154,7 +162,7 @@ def build_execution_plan(session: Session, template: Template, deployment_owner_
             and field.get("type") in ("password", "secret")
         })
     return _validate_plan({
-        "version": 1,
+        "version": 2,
         "owner_id": deployment_owner_id,
         "template_owner_id": template.owner_id,
         "deployment_owner_id": deployment_owner_id,

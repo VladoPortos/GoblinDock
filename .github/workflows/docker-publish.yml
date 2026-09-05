@@ -13,7 +13,11 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  validate:
+    uses: ./.github/workflows/validate.yml
+
   build-push:
+    needs: validate
     name: Build & push to GHCR (amd64 · arm64)
     runs-on: ubuntu-latest
     permissions:

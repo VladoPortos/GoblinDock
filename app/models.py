@@ -164,6 +164,7 @@ class Template(SQLModel, table=True):
 
 
 class Deployment(SQLModel, table=True):
+    identity_state: str = ""  # independent of retained job history
     __tablename__ = "deployments"
     id: Optional[int] = Field(default=None, primary_key=True)
     name: str = Field(index=True)
@@ -176,6 +177,10 @@ class Deployment(SQLModel, table=True):
     # credentials, so the JSON is Fernet-encrypted at rest ('' = none); see
     # execution_plan.encrypt_deploy_inputs / open_deploy_inputs.
     deploy_inputs_enc: str = ""
+    # Admission snapshot independent of job retention. Empty means a legacy VM
+    # without a reproducible original plan; never infer it from current templates.
+    original_execution_plan_enc: str = ""
+    original_context_enc: str = ""
     vmid: Optional[int] = None
     node: str = ""
     network_id: Optional[int] = None
@@ -214,6 +219,9 @@ class Job(SQLModel, table=True):
     context_json: str = "{}"
     # Encrypted admission-time recipe, accepted inputs, and block definitions.
     execution_plan_enc: str = ""
+    create_state: str = ""  # submitting preserves identity when the create response is lost
+    remote_task: str = ""
+    remote_node: str = ""
     waiting_since: Optional[datetime] = None
     created_at: datetime = Field(default_factory=utcnow)
     started_at: Optional[datetime] = None

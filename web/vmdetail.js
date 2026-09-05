@@ -350,6 +350,7 @@
     const [conMode, setConMode] = useState('vnc');
     const [tall, setTall] = useState(false);
     const [confirm, setConfirm] = useState(false);
+    const [showRebuild, setShowRebuild] = useState(false);
     const [resize, setResize] = useState(null);   // 'config' | { disk row } | null
     const [busy, setBusy] = useState('');
     const [cred, setCred] = useState(null);
@@ -440,6 +441,8 @@
             ? h('button', { className: 'btn sm', onClick: () => act('stop'), disabled: busy || powerUnavailable }, h(Icon, { name: 'stop', size: 14 }), 'Stop')
             : h('button', { className: 'btn sm', onClick: () => act('start'), disabled: busy || powerUnavailable }, h(Icon, { name: 'play', size: 14 }), 'Start')),
           !locked && h('button', { className: 'btn sm', onClick: () => act('restart'), disabled: busy || !running }, h(Icon, { name: 'restart', size: 14 }), 'Restart'),
+          !locked && h('button', {className:'btn sm',onClick:()=>setShowRebuild(true)}, 'Rebuild'),
+          (d.status==='error' || d.status==='cleanup_pending') && h('button',{className:'btn sm',onClick:()=>go('recovery')},'Recovery'),
           !locked && h('button', { className: 'btn primary sm', onClick: () => setShowConsole((s) => !s), disabled: !d.consoleReady, title: d.consoleReady ? '' : 'Start the VM to use the console' }, h(Icon, { name: 'terminal', size: 14 }), showConsole ? 'Hide console' : 'Console'),
           !locked && h('button', { type: 'button', className: 'btn danger sm', 'aria-label': 'Delete VM',
             onClick: () => setConfirm(true) }, h(Icon, { name: 'trash', size: 14 })),
@@ -458,6 +461,7 @@
         style: { marginBottom: 16, padding: '10px 12px', borderRadius: 9,
           color: 'var(--err)', background: 'var(--err-ghost)', fontSize: 12.5 },
       }, d.err),
+      showRebuild && h(window.RebuildModal,{depId,name:d.name,go,onClose:()=>setShowRebuild(false)}),
 
       d.liveError && h('div', {
         className: 'mono', role: 'status',

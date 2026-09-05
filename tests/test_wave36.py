@@ -561,7 +561,10 @@ def test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_abs
     class _Px:
         node = "pve"
         def __init__(self, conn): pass
-        def list_qemu(self, node=None):
+        def find_vm_node(self, vmid, node=None): return "pve"
+        def vm_current(self, vmid, node=None): return {"status": "stopped"}
+        def destroy(self, vmid, node=None): raise RuntimeError("cleanup unavailable")
+        def list_cluster_guests(self):
             with session_scope() as s:
                 stamped = s.get(Deployment, dep_id).cleanup_last_attempt_at
                 assert stamped is not None, "attempt timestamp must commit before Proxmox work"
@@ -569,6 +572,7 @@ def test_cleanup_retry_is_throttled_and_drops_ownership_only_after_confirmed_abs
             if len(attempts) == 1:
                 raise RuntimeError("inventory unavailable")
             return []
+        def _assert_vmid_free(self, vmid): return None
 
     saved = worker.Proxmox
     worker.Proxmox = _Px
@@ -620,8 +624,11 @@ def test_cleanup_retry_stamps_each_target_immediately_before_external_work():
     class _Px:
         node = "pve"
         def __init__(self, conn): pass
-        def list_qemu(self, node=None):
-            calls.append(node)
+        def find_vm_node(self, vmid, node=None): return "pve"
+        def vm_current(self, vmid, node=None): return {"status": "stopped"}
+        def destroy(self, vmid, node=None): raise RuntimeError("cleanup unavailable")
+        def list_cluster_guests(self):
+            calls.append("pve")
             raise RuntimeError("inventory unavailable")
 
     clock = iter((t0, t0 + timedelta(seconds=61)))
@@ -670,7 +677,8 @@ def test_rebuild_admission_uses_lifecycle_admission_lock():
     def rebuild():
         with Session(engine) as s:
             try:
-                result.append(api.vm_rebuild(dep_id, user=s.get(User, uid), session=s))
+                result.append(api.vm_rebuild(dep_id, user=s.get(User, uid), session=s,
+                                             body=api.RebuildBody(mode="current")))
             except Exception as exc:  # captured for assertion in the parent thread
                 result.append(exc)
 
@@ -720,7 +728,8 @@ def test_rebuild_replaces_invalid_legacy_reservation_in_job_context():
         dep_id, allocation_id = dep.id, allocation.id
 
     with Session(engine) as s:
-        result = api.vm_rebuild(dep_id, user=s.get(User, uid), session=s)
+        result = api.vm_rebuild(dep_id, user=s.get(User, uid), session=s,
+                                body=api.RebuildBody(mode="current"))
 
     with session_scope() as s:
         job = s.get(Job, result["jobId"])
@@ -748,6 +757,14 @@ def _mk_lifecycle_deployment(uid: int, *, status: str = "running") -> int:
         )
         s.add(dep)
         s.flush()
+        # These tests exercise lifecycle locking for an admitted deployment;
+        # legacy-without-plan behavior has separate explicit-current coverage.
+        dep.original_execution_plan_enc = api._build_admitted_execution_plan(s, template, uid, "{}")
+        dep.original_context_enc = encrypt(api._build_job_ctx(
+            s, s.get(Image, template.base_image_id), dep.cpu, dep.ram, dep.disk,
+            s.get(Network, network_id), dep.id,
+        ))
+        s.add(dep)
         return dep.id
 
 
@@ -1025,6 +1042,7 @@ def test_power_wait_does_not_block_other_deployment_lifecycle_admission():
             try:
                 results["lifecycle"] = api.vm_rebuild(
                     other_dep_id, user=s.get(User, uid), session=s,
+                    body=api.RebuildBody(mode="current"),
                 )
             except Exception as exc:
                 results["lifecycle"] = exc
@@ -1350,6 +1368,7 @@ def test_blocked_snapshot_does_not_block_other_deployment_lifecycle_admission():
             try:
                 results["lifecycle"] = api.vm_rebuild(
                     other_dep_id, user=s.get(User, uid), session=s,
+                    body=api.RebuildBody(mode="current"),
                 )
             except Exception as exc:
                 results["lifecycle"] = exc
@@ -1663,6 +1682,7 @@ def test_serial_setup_does_not_block_unrelated_vm_and_reclaims_after_exception()
             try:
                 results["lifecycle"] = api.vm_rebuild(
                     other_dep_id, user=s.get(User, uid), session=s,
+                    body=api.RebuildBody(mode="current"),
                 )
             finally:
                 lifecycle_finished.set()

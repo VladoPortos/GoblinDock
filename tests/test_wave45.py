@@ -76,6 +76,7 @@ def test_legacy_invalid_proxmox_ports_fall_back_for_api_and_console_urls():
                 port=stored_port, token_id="u@p!t",
             )
             px = Proxmox(conn)
+            px.list_cluster_guests = lambda: [{"vmid":8045,"node":"pve","type":"qemu"}]
             assert captured[-1] == expected, (stored_port, captured[-1])
             assert px.console_ws_url(8045, "pve", 5900, "ticket").startswith(
                 f"wss://pve.example.test:{expected}/"
@@ -263,15 +264,16 @@ def test_retry_never_reuses_leftover_from_failed_checksum_download():
     else:
         raise AssertionError("failed checksum download was accepted")
     assert px.present, "fixture must retain the failed target after cleanup fails"
+    failed_filename = px.downloads[0]
 
     filename = worker._ensure_base_disk(_Ctx(), px, "pve", cfg)
-    assert px.downloads == [filename, filename], "retry reused the failed leftover"
-    assert px.deletes >= 2
+    assert px.downloads == [failed_filename, filename] and failed_filename != filename, "retry reused the failed leftover"
+    assert failed_filename in px.present, "replacement must not move a pre-existing volume"
 
     # A subsequent call may reuse only the target whose successful validation was
     # durably recorded by the second attempt.
     assert worker._ensure_base_disk(_Ctx(), px, "pve", cfg) == filename
-    assert px.downloads == [filename, filename]
+    assert px.downloads == [failed_filename, filename]
 
 
 def test_cached_images_uses_the_checksum_specific_volume_identity():
@@ -288,22 +290,16 @@ def test_cached_images_uses_the_checksum_specific_volume_identity():
         user_id, conn_id, image_id = user.id, conn.id, image.id
     expected = base_disk_filename(source, checksum, "sha256")
 
-    class _Px:
-        def __init__(self, _conn): pass
-        def storage_volumes(self, node=None): return {f"local:import/{expected}"}
-        def iso_volume_path(self, filename): return f"local:import/{filename}"
-
-    saved = api.Proxmox
-    api.Proxmox = _Px
-    api._CACHED_IMAGES_CACHE.clear()
+    from app import inventory
+    saved = inventory.get_snapshot
+    inventory.get_snapshot = lambda cid: {"status":"online", "volumes":{f"local:import/{expected}"}, "stale":False}
     try:
         with session_scope() as session:
             result = api.cached_images(
                 conn_id, user=session.get(User, user_id), session=session,
             )
     finally:
-        api.Proxmox = saved
-        api._CACHED_IMAGES_CACHE.clear()
+        inventory.get_snapshot = saved
     assert result["cached"][str(image_id)] is True
 
 
@@ -522,7 +518,7 @@ def test_queued_rebuild_and_destroy_cancellation_restore_live_runtime_state():
     """A spared running VM must be recorded running, never blindly stamped stopped."""
     class _Px:
         def __init__(self, _conn): pass
-        def list_qemu(self, node=None): return [{"vmid": 8046}]
+        def list_cluster_guests(self): return [{"vmid":8046,"node":"pve","type":"qemu"}]
         def vm_current(self, vmid, node=None): return {"status": "running"}
 
     saved = worker.Proxmox
@@ -544,7 +540,7 @@ def test_canceled_lifecycle_with_unknown_runtime_state_fails_safe():
     """Presence without a readable power state must be visible as uncertain, not stopped."""
     class _Px:
         def __init__(self, _conn): pass
-        def list_qemu(self, node=None): return [{"vmid": 8046}]
+        def list_cluster_guests(self): return [{"vmid":8046,"node":"pve","type":"qemu"}]
         def vm_current(self, vmid, node=None): raise RuntimeError("status endpoint unavailable")
 
     dep_id, job_id = _queued_cancel_fixture("destroy")
