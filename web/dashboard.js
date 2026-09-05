@@ -7,6 +7,14 @@
           FormModal, Field, isVmLifecycleLocked } = window.UI;
   const h = React.createElement;
 
+  function InventoryNotice({ connections }) {
+    const stale = (connections || []).filter(c => !c.disabled && c.inventory && c.inventory.stale);
+    if (!stale.length) return null;
+    return h('div', { className: 'hint', role: 'status', style: { marginBottom: 14, color: 'var(--warn)' } },
+      stale.map(c => h('div', { key: c.connId }, c.name, ': ', c.inventory.error || 'Inventory check pending',
+        c.inventory.updatedAt ? ' · Showing last known state from ' + new Date(c.inventory.updatedAt).toLocaleString() : ' · No snapshot yet')));
+  }
+
   // Transitional label for the uptime cell while an optimistic power action is in
   // flight (store sets vm._act + status='working') — gives immediate visual feedback
   // instead of the cell sitting at '—'/'offline' until the real Proxmox status lands.
@@ -359,6 +367,7 @@
           h(Icon, { name: 'plus', size: 16 }), 'Deploy VM')
       ),
 
+      h(InventoryNotice, { connections: GD.CONNECTIONS }),
       h('div', { className: 'row wrap', style: { marginBottom: 16, gap: 10 } },
         h('div', { className: 'seg' },
           h('button', { className: scope === 'mine' ? 'active' : '', onClick: () => setScope('mine') }, 'My VMs'),
@@ -419,7 +428,10 @@
           ? h(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll, hasEligible: eligibleVms.length > 0 })
           : h(CardView, { vms, go, onAct, sel, toggleSel }),
 
-      confirm && h(ConfirmModal, {
+      confirm && confirm.action === 'rebuild' && h(window.RebuildModal, {
+        depId: confirm.vm.depId, name: confirm.vm.name, go, onClose: () => setConfirm(null),
+      }),
+      confirm && confirm.action !== 'rebuild' && h(ConfirmModal, {
         onClose: () => setConfirm(null),
         tone: confirm.action === 'rebuild' ? 'accent' : 'danger',
         icon: confirm.action === 'delete' ? 'trash' : confirm.action === 'cleanupLocal' ? 'warn' : 'rebuild',
@@ -436,10 +448,7 @@
         onConfirm: async () => {
           // toast + rethrow: ConfirmModal stays open for retry when the call fails
           try {
-            if (confirm.action === 'rebuild') {
-              const r = await window.API.vmRebuild(confirm.vm.depId);
-              go('job', { jobId: r.jobId });
-            } else if (confirm.action === 'cleanupLocal') {
+            if (confirm.action === 'cleanupLocal') {
               const r = await window.API.vmCleanupLocal(confirm.vm.depId);
               // drop the row NOW — the next /state fetch can be seconds away when
               // the VM's Proxmox is unreachable, and an in-flight stale response
@@ -475,4 +484,5 @@
   }
 
   window.Dashboard = Dashboard;
+  window.InventoryNotice = InventoryNotice;
 })();

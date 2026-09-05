@@ -7,6 +7,7 @@
   const h = React.createElement;
 
   let UID = 100;
+  const placementId = () => 'p-' + (globalThis.crypto?.randomUUID?.() || (Date.now().toString(36) + '-' + Math.random().toString(36).slice(2))).replace(/-/g, '');
   const SECTION_BY_NAME = { 'OS Setup': 's-os', 'Accounts': 's-acc', 'Install': 's-inst', 'Configure': 's-conf', 'Scripts': 's-scr', 'Cleanup': 's-clean' };
   const blankSections = () => ([
     { id: 's-os', name: 'OS Setup', blocks: [] },
@@ -397,7 +398,7 @@
       const byId = Object.fromEntries(out.map((s) => [s.id, s]));
       src.forEach((sec) => {
         const target = byId[sec.id] || byId[SECTION_BY_NAME[sec.name]] || byId['s-inst'];
-        (sec.blocks || []).forEach((b) => target.blocks.push({ uid: 'u' + (UID++), ref: b.ref, name: b.name || paletteByKey(b.ref).name || b.ref, inputs: b.inputs || {}, ask: Array.isArray(b.ask) ? b.ask.slice() : [] }));
+        (sec.blocks || []).forEach((b) => target.blocks.push({ uid: 'u' + (UID++), placementId: b.placementId || placementId(), ref: b.ref, name: b.name || paletteByKey(b.ref).name || b.ref, inputs: b.inputs || {}, ask: Array.isArray(b.ask) ? b.ask.slice() : [] }));
       });
       return out;
     };
@@ -450,7 +451,7 @@
 
     const recipePayload = () => sections.map((s) => ({
       id: s.id, name: s.name,
-      blocks: s.blocks.map((b) => ({ ref: b.ref, name: b.name, inputs: b.inputs || {},
+      blocks: s.blocks.map((b) => ({ placementId: b.placementId, ref: b.ref, name: b.name, inputs: b.inputs || {},
         ...(b.ask && b.ask.length ? { ask: b.ask } : {}) })),
     }));
     const sectionFor = (block) => SECTION_BY_NAME[block.section] || SECTION_BY_NAME[block.cat] || 's-inst';
@@ -459,7 +460,7 @@
       const uid = 'u' + (UID++);
       const inputs = {};
       (block.schema || []).forEach((f) => { inputs[f.name] = f.default; });
-      setSections((prev) => prev.map((s) => s.id === sid ? { ...s, blocks: [...s.blocks, { uid, ref: block.id, name: block.name, inputs, ask: [] }] } : s));
+      setSections((prev) => prev.map((s) => s.id === sid ? { ...s, blocks: [...s.blocks, { uid, placementId: placementId(), ref: block.id, name: block.name, inputs, ask: [] }] } : s));
       setSel(uid);
     };
     // a block accepts only its own category section (drives the drop lock + cursor)
@@ -469,7 +470,7 @@
       if (b && sectionFor(b) === secId) addBlock(b, secId);
     };
     const onRemove = (secId, uid) => setSections((prev) => prev.map((s) => s.id === secId ? { ...s, blocks: s.blocks.filter((b) => b.uid !== uid) } : s));
-    const onDup = (secId, b) => { const uid = 'u' + (UID++); setSections((prev) => prev.map((s) => s.id === secId ? { ...s, blocks: [...s.blocks, { ...b, uid, inputs: { ...(b.inputs || {}) }, ask: (b.ask || []).slice() }] } : s)); };
+    const onDup = (secId, b) => { const uid = 'u' + (UID++); setSections((prev) => prev.map((s) => s.id === secId ? { ...s, blocks: [...s.blocks, { ...b, uid, placementId: placementId(), inputs: { ...(b.inputs || {}) }, ask: (b.ask || []).slice() }] } : s)); };
     const onMove = (secId, uid, dir) => setSections((prev) => prev.map((s) => {
       if (s.id !== secId) return s;
       const idx = s.blocks.findIndex((b) => b.uid === uid);

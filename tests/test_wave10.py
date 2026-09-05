@@ -180,7 +180,7 @@ def test_legacy_rebuild_guard():
                        vmid=8042, status="running", template_id=None)
         s.add(d); s.flush(); dep_id = d.id
     with session_scope() as s:
-        _expect_http(400, lambda: api.vm_rebuild(dep_id, user=s.get(User, uid), session=s))
+        _expect_http(409, lambda: api.vm_rebuild(dep_id, user=s.get(User, uid), session=s))
     print("test_legacy_rebuild_guard OK")
 
 
@@ -212,15 +212,10 @@ def test_cached_images_endpoint():
     # unknown connection → 404
     with session_scope() as s:
         _expect_http(404, lambda: api.cached_images(999999, user=s.get(User, uid), session=s))
-    # stub Proxmox: exactly base_id's file is present on the node
-    class _StubPx:
-        def __init__(self, conn): pass
-        def storage_volumes(self, node=None, content="import"):
-            return {f"local:import/{base_disk_filename(src)}"}
-        def iso_volume_path(self, filename):
-            return f"local:import/{filename}"
-    orig = api.Proxmox
-    api.Proxmox = _StubPx
+    # The endpoint consumes a background snapshot; no request-side remote calls.
+    from app import inventory
+    orig = inventory.get_snapshot
+    inventory.get_snapshot = lambda cid: {"status": "online", "volumes": {f"local:import/{base_disk_filename(src)}"}}
     try:
         with session_scope() as s:
             out = api.cached_images(conn_id, user=s.get(User, uid), session=s)
@@ -229,22 +224,18 @@ def test_cached_images_endpoint():
         assert str(blank_id) not in out["cached"], "blank source_url must be omitted"
         assert all(isinstance(v, bool) for v in out["cached"].values())
     finally:
-        api.Proxmox = orig
+        inventory.get_snapshot = orig
     # unreachable node → online False, HTTP 200 (no exception)
     # (clear the per-connection cache: the online result above is cached for a few
     # seconds — in production the online→offline transition is far longer than the TTL)
-    api._CACHED_IMAGES_CACHE.clear()
-    class _DownPx:
-        def __init__(self, conn): pass
-        def storage_volumes(self, node=None, content="import"):
-            raise RuntimeError("connection refused")
-    api.Proxmox = _DownPx
+    inventory.get_snapshot = lambda cid: {"status":"offline", "volumes":None, "stale":True, "error":"Inventory unavailable"}
     try:
         with session_scope() as s:
             out = api.cached_images(conn_id, user=s.get(User, uid), session=s)
-        assert out == {"online": False, "cached": {}}
+        assert out["online"] is False and out["cached"] == {}
+        assert out["inventory"]["stale"] is True
     finally:
-        api.Proxmox = orig
+        inventory.get_snapshot = orig
     print("test_cached_images_endpoint OK")
 
 

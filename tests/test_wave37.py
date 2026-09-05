@@ -409,10 +409,17 @@ def test_cleanup_retry_uses_persisted_origin_after_job_retention_prunes_history(
     class _Px:
         node = "pve"
         def __init__(self, conn): pass
+        def find_vm_node(self, vmid, node=None): return "pve"
+        def vm_current(self, vmid, node=None): return {"status": "stopped"}
         def destroy(self, vmid, node=None):
             destroys.append(vmid)
             return "UPID:destroy"
         def wait_task(self, *args, **kwargs): return None
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None): return [{"vmid": 8371}, {"vmid": 8372}]
 
     saved_px = worker.Proxmox
@@ -789,6 +796,7 @@ def test_missing_guest_ip_defers_required_ansible_without_false_success():
         def wait_task(self, *_args, **_kwargs): return None
         def set_config(self, *_args, **_kwargs): return None
         def resize_disk(self, *_args, **_kwargs): return None
+        def wait_guest_ready(self, *_args, **_kwargs): return None
         def start(self, *_args, **_kwargs): return "UPID:start"
         def mac_of(self, *_args, **_kwargs): return "52:54:00:37:00:10"
         def vm_config(self, *_args, **_kwargs): return {"scsi0": "size=20G"}
@@ -1013,6 +1021,11 @@ def test_waiting_poll_isolates_resume_failure_from_later_ready_job():
     class _Px:
         def __init__(self, _conn): self.node = "pve"
         def agent_ipv4(self, vmid, *_args, **_kwargs): return ips[vmid]
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, *_args, **_kwargs): return [{"vmid": vmids[first_id]}]
 
     def _run(_playbook, ip, _user, _key, **_kwargs):
@@ -1195,10 +1208,17 @@ def test_timeout_rechecks_committed_cancellation_before_failing():
 
     class _Px:
         def __init__(self, _conn): self.node = "pve"
+        def find_vm_node(self, vmid, node=None): return "pve"
+        def vm_current(self, vmid, node=None): return {"status": "stopped"}
         def destroy(self, vmid, **_kwargs):
             destroyed.append(vmid)
             return "UPID:destroy"
         def wait_task(self, *_args, **_kwargs): return None
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, _node=None, **_kwargs): return []
 
     original_timeout = worker._timeout_waiting_job
@@ -1233,10 +1253,17 @@ def test_waiting_cancellation_uses_deployment_reconciliation():
 
     class _Px:
         def __init__(self, _conn): self.node = "pve"
+        def find_vm_node(self, vmid, node=None): return "pve"
+        def vm_current(self, vmid, node=None): return {"status": "stopped"}
         def destroy(self, vmid, **_kwargs):
             destroyed.append(vmid)
             return "UPID:destroy"
         def wait_task(self, *_args, **_kwargs): return None
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, _node=None, **_kwargs): return []
 
     with _patched_worker(Proxmox=_Px):
@@ -1522,6 +1549,11 @@ def _run_rebuild_post_destroy_presence_case(inventory_state: str):
         def wait_task(self, *_args, **_kwargs):
             return None
 
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None):
             if inventory_state == "unknown":
                 raise RuntimeError("inventory unavailable after destroy")
@@ -1601,6 +1633,11 @@ def _run_worker_lifecycle_case(job_type: str, vm_status: str, *, stop_error: boo
             calls.append(("wait", upid, node, timeout, callable(cancelled)))
             if stop_error and upid == "UPID:stop":
                 raise ProxmoxError("stop task failed")
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None):
             calls.append(("inventory", node))
             return []
@@ -1616,6 +1653,8 @@ def _run_worker_lifecycle_case(job_type: str, vm_status: str, *, stop_error: boo
     with _patched_worker(
         Proxmox=_Px,
         _run_deploy=lambda *_args, **_kwargs: deploy_calls.append("deploy"),
+        _ensure_base_disk=lambda *_args, **_kwargs: "base.img",
+        _preflight_deploy_cloud_init=lambda *_args, **_kwargs: worker.DeployPreflight({}, '', '', ''),
     ):
         saved_sleep = worker.time.sleep
         worker.time.sleep = forbidden_sleep

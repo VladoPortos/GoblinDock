@@ -60,7 +60,7 @@ def _expect_http(status: int, call) -> HTTPException:
     raise AssertionError(f"expected HTTP {status}")
 
 
-def test_offline_state_uses_one_connection_probe_and_no_per_vm_probes():
+def test_cold_state_uses_no_connection_or_per_vm_probes():
     owner_id = _user("offline@wave47.test")
     conn_id = _connection("offline-wave47")
     with session_scope() as session:
@@ -92,7 +92,6 @@ def test_offline_state_uses_one_connection_probe_and_no_per_vm_probes():
 
     saved_px = api.Proxmox
     api.Proxmox = _OfflinePx
-    api._CONN_STATUS_CACHE.clear()
     S._status_cache.clear()
     try:
         with session_scope() as session:
@@ -103,10 +102,10 @@ def test_offline_state_uses_one_connection_probe_and_no_per_vm_probes():
     owned = [vm for vm in state["VMS"] if vm["name"].startswith("offline-")]
     assert len(owned) == 8
     assert {vm["status"] for vm in owned} == {"unknown"}
-    assert calls == {"version": 1, "inventory": 0, "current": 0}
+    assert calls == {"version": 0, "inventory": 0, "current": 0}
 
 
-def test_online_state_primes_all_vm_statuses_from_one_inventory():
+def test_online_state_reads_all_vm_statuses_from_background_inventory():
     owner_id = _user("online@wave47.test")
     conn_id = _connection("online-wave47")
     vmids = [4780, 4781, 4782]
@@ -141,19 +140,25 @@ def test_online_state_primes_all_vm_statuses_from_one_inventory():
             calls["current"] += 1
             raise AssertionError("state must use the primed inventory")
 
+    from app import inventory
+    saved_snapshot = inventory.get_snapshot
+    inventory.get_snapshot = lambda cid: {"status":"online", "version":"8.4", "vms":{
+        vmid: {"vmid":vmid, "node":"migrated", "type":"qemu", "status":"running" if vmid != 4781 else "stopped",
+               "cpu":0.1,"mem":128,"maxmem":1024,"uptime":60} for vmid in vmids
+    }, "stale":False, "error":None}
     saved_px = api.Proxmox
     api.Proxmox = _OnlinePx
-    api._CONN_STATUS_CACHE.clear()
     S._status_cache.clear()
     try:
         with session_scope() as session:
             state = api.state(_Request(), session.get(User, owner_id), session)
     finally:
         api.Proxmox = saved_px
+        inventory.get_snapshot = saved_snapshot
 
     by_name = {vm["name"]: vm["status"] for vm in state["VMS"]}
     assert by_name == {"online-0": "running", "online-1": "stopped", "online-2": "running"}
-    assert calls == {"version": 2, "inventory": 1, "current": 0}
+    assert calls == {"version": 0, "inventory": 0, "current": 0}
 
 
 def test_base_image_source_url_is_admin_only_in_state():
@@ -291,8 +296,8 @@ def test_connection_numeric_contracts_match_deployment_limits():
 
 
 if __name__ == "__main__":
-    test_offline_state_uses_one_connection_probe_and_no_per_vm_probes()
-    test_online_state_primes_all_vm_statuses_from_one_inventory()
+    test_cold_state_uses_no_connection_or_per_vm_probes()
+    test_online_state_reads_all_vm_statuses_from_background_inventory()
     test_base_image_source_url_is_admin_only_in_state()
     test_vm_detail_preserves_unknown_status_and_disables_console_on_probe_failure()
     test_referenced_network_cannot_move_and_mismatch_fails_closed()

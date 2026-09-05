@@ -32,6 +32,7 @@ from .network_pool import StaticPoolError, parse_static_pool
 from .proxmox import Proxmox
 from .recipes import recipe_block_chips
 from .security import mask
+from .inventory import freshness
 
 # cache live status briefly to avoid hammering Proxmox on every poll. Keyed by
 # (connection_id, node, vmid) — NOT vmid alone — so two Proxmox clusters that
@@ -97,6 +98,9 @@ def _elapsed(start: Optional[datetime], end: Optional[datetime]) -> str:
 
 
 def _live_status(px: Proxmox, vmid: int, node: str) -> dict:
+    from .inventory import SnapshotProxmox
+    if isinstance(px, SnapshotProxmox):
+        return _live_status_from_current(px.vm_current(vmid, node))
     now = time.time()
     key = (getattr(getattr(px, "conn", None), "id", None), node, vmid)
     cached = _status_cache.get(key)
@@ -206,6 +210,8 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     owner = users.get(dep.owner_id)
     return {
         "id": f"vm-{dep.id}",
+        "inventory": freshness(
+            getattr(px_cache.get(conn.id), "snapshot", {}) if conn else {}),
         "depId": dep.id,
         "vmid": dep.vmid,
         "name": dep.name,
@@ -303,6 +309,7 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
 
 def base_image_dict(img: Image, *, include_source_url: bool = False,
                     can_delete: bool = False) -> dict:
+    from .image_cache import is_pinned
     out = {
         "id": f"img-{img.id}",
         "imgId": img.id,
@@ -311,6 +318,7 @@ def base_image_dict(img: Image, *, include_source_url: bool = False,
         "size": img.size or "—",
         "checksum": img.checksum or "",
         "canDelete": can_delete is True,
+        "pinned": is_pinned(img),
     }
     if include_source_url:
         out["source_url"] = img.source_url
@@ -484,6 +492,7 @@ def connection_dict(session: Session, c: Connection, status: Optional[dict] = No
         "url": f"https://{c.host}:{safe_port}",
         "disabled": bool(c.disabled),
         "status": (status or {}).get("status", "unknown"),
+        "inventory": freshness(status or {}),
         "version": (status or {}).get("version", "—"),
         "storage": c.storage or "—",
         "bridge": c.bridge,
@@ -518,6 +527,7 @@ def connection_public_dict(session: Session, c: Connection, status: Optional[dic
         "name": c.name,
         "disabled": bool(c.disabled),
         "status": (status or {}).get("status", "unknown"),
+        "inventory": freshness(status or {}),
         "version": (status or {}).get("version", "—"),
         "node": c.node,
         "vms": len(vms),

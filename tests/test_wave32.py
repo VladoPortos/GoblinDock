@@ -52,6 +52,7 @@ def _agent_ipv4(ifaces):
     class _Self:
         api = _Api()
         def pick_node(self): return "pve"
+        def _existing_vm_node(self, vmid): return "pve"
     return Proxmox.agent_ipv4(_Self(), settings.vmid_min, "pve")
 
 

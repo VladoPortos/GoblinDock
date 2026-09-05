@@ -13,6 +13,7 @@ import ipaddress
 import logging
 import os
 import re
+import shlex
 import threading
 import time
 from pathlib import Path
@@ -187,15 +188,82 @@ class Proxmox:
     def list_qemu(self, node: Optional[str] = None) -> list[dict]:
         return self.api.nodes(node or self.pick_node()).qemu.get()
 
+    def list_cluster_guests(self) -> list[dict]:
+        """Read validated cluster guest identity, including containers.
+
+        The resources API filters guests by ACL. A propagated VM.Audit grant on
+        /vms is required. Child ACLs may still hide individual guests, so negative
+        decisions additionally require _assert_vmid_free's unfiltered registry.
+        Never fall back to the configured node: a guest may have migrated.
+        """
+        try:
+            permissions = self.api.access.permissions.get(path="/vms")
+            if not isinstance(permissions, dict) or permissions.get("/vms", {}).get("VM.Audit") != 1:
+                raise ProxmoxError("complete cluster inventory requires propagated VM.Audit on /vms")
+            guests = self.api.cluster.resources.get(type="vm")
+            if not isinstance(guests, list):
+                raise ProxmoxError("cluster guest inventory is unavailable or incomplete")
+            seen = set()
+            for guest in guests:
+                if (not isinstance(guest, dict) or guest.get("type") not in {"qemu", "lxc"}
+                        or not isinstance(guest.get("node"), str) or not guest["node"].strip()
+                        or not re.fullmatch(r"[0-9]+", str(guest.get("vmid")))):
+                    raise ProxmoxError("cluster guest inventory has incomplete identity")
+                vmid = int(guest["vmid"])
+                if vmid <= 0 or vmid in seen:
+                    raise ProxmoxError("cluster guest inventory has ambiguous identity")
+                seen.add(vmid)
+            return guests
+        except ProxmoxError:
+            raise
+        except Exception as exc:
+            raise ProxmoxError(f"complete cluster inventory unavailable: {exc}") from exc
+
+    def find_vm_node(self, vmid: int, node: Optional[str] = None) -> Optional[str]:
+        """Find current QEMU placement; None means proven cluster-wide absence."""
+        guard_vmid(vmid)
+        for guest in self.list_cluster_guests():
+            if int(guest["vmid"]) == int(vmid):
+                if guest["type"] != "qemu":
+                    raise ProxmoxError(f"VM ID {vmid} belongs to a container")
+                return guest["node"]
+        self._assert_vmid_free(vmid)
+        return None
+
+    def _assert_vmid_free(self, vmid: int) -> None:
+        """Corroborate negative ACL-filtered inventory with the unfiltered registry.
+
+        /cluster/nextid?vmid= is a read-only assertion, available to every user.
+        Unlike /cluster/resources it checks all QEMU/LXC identities even when a
+        child NoAccess ACL hides one despite inherited VM.Audit on /vms.
+        """
+        try:
+            free = self.api.cluster.nextid.get(vmid=int(vmid))
+            if not re.fullmatch(r"[0-9]+", str(free)) or int(free) != int(vmid):
+                raise ProxmoxError("cluster registry did not confirm the requested VM ID is free")
+        except Exception as exc:
+            raise ProxmoxError(f"cannot confirm VM {vmid} is absent: {exc}") from exc
+
+    def _existing_vm_node(self, vmid: int) -> str:
+        node = self.find_vm_node(vmid)
+        if node is None:
+            raise ProxmoxError(f"VM {vmid} is absent from the cluster")
+        return node
+
     def vm_current(self, vmid: int, node: Optional[str] = None) -> dict:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.current.get()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.current.get()
 
     def vm_config(self, vmid: int, node: Optional[str] = None) -> dict:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).config.get()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).config.get()
 
     # ---- task polling --------------------------------------------------
+    def task_status(self, upid: str, node: Optional[str] = None) -> dict:
+        """Read a recorded task's status on its owning node without stopping it."""
+        task_node = upid.split(":", 2)[1] if isinstance(upid, str) and upid.startswith("UPID:") else ""
+        return self.api.nodes(task_node or node or self.pick_node()).tasks(upid).status.get()
+
     def wait_task(
         self,
         upid: str,
@@ -206,13 +274,14 @@ class Proxmox:
     ) -> None:
         """Block until the task finishes OK; raise ProxmoxError on failure/timeout,
         or JobCancelled if the `cancelled` predicate fires."""
-        node = node or self.pick_node()
+        task_node = upid.split(":", 2)[1] if isinstance(upid, str) and upid.startswith("UPID:") else ""
+        node = task_node or node or self.pick_node()
         deadline = time.time() + timeout
         while time.time() < deadline:
             if cancelled and cancelled():
                 try:
                     self.api.nodes(node).tasks(upid).delete()
-                except ResourceException:
+                except Exception:  # transport failures must not mask requested cancellation
                     pass
                 raise JobCancelled()
             st = self.api.nodes(node).tasks(upid).status.get()
@@ -243,20 +312,20 @@ class Proxmox:
     # ---- lifecycle -----------------------------------------------------
     def start(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.start.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.start.post()
 
     def stop(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.stop.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.stop.post()
 
     def reboot(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.reboot.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.reboot.post()
 
     def destroy(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
         return (
-            self.api.nodes(node or self.pick_node())
+            self.api.nodes(self._existing_vm_node(vmid))
             .qemu(vmid)
             .delete(purge=1, **{"destroy-unreferenced-disks": 1})
         )
@@ -266,7 +335,7 @@ class Proxmox:
         """Raw snapshot list incl. the synthetic 'current' entry (its parent is the
         snapshot the VM currently sits on)."""
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot.get()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot.get()
 
     def create_snapshot(self, vmid: int, name: str, description: str = "",
                         vmstate: bool = False, node: Optional[str] = None) -> str:
@@ -275,33 +344,57 @@ class Proxmox:
         params: dict[str, Any] = {"snapname": name, "vmstate": 1 if vmstate else 0}
         if description:
             params["description"] = description
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot.post(**params)
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot.post(**params)
 
     def delete_snapshot(self, vmid: int, name: str, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
         guard_snapname(name)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot(name).delete()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot(name).delete()
 
     def rollback_snapshot(self, vmid: int, name: str, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
         guard_snapname(name)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot(name).rollback.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot(name).rollback.post()
 
     # ---- vmid allocation ----------------------------------------------
     def next_free_vmid(self, lo: int, hi: int, node: Optional[str] = None) -> int:
-        used = {int(v["vmid"]) for v in self.list_qemu(node)}
+        used = {int(v["vmid"]) for v in self.list_cluster_guests()}
         for vmid in range(lo, hi + 1):
             if vmid not in used:
+                self._assert_vmid_free(vmid)
                 return vmid
         raise ProxmoxError(f"no free VMID in range {lo}-{hi}")
 
-    def set_config(self, vmid: int, node: Optional[str] = None, **params) -> None:
-        guard_vmid(vmid)
-        self.api.nodes(node or self.pick_node()).qemu(vmid).config.post(**params)
+    def _wait_submitted_task(self, upid, node: str, on_task=None, cancelled=None) -> None:
+        if not isinstance(upid, str) or not upid.startswith("UPID:"):
+            raise ProxmoxError("Proxmox did not return an identifiable task; outcome is unknown")
+        if on_task:
+            on_task(upid)
+        self.wait_task(upid, node=node, cancelled=cancelled)
 
-    def resize_disk(self, vmid: int, disk: str, size: str, node: Optional[str] = None) -> None:
+    def set_config(self, vmid: int, node: Optional[str] = None, *,
+                   on_task: Optional[Callable[[str], None]] = None,
+                   cancelled: Optional[Callable[[], bool]] = None, **params) -> None:
         guard_vmid(vmid)
-        self.api.nodes(node or self.pick_node()).qemu(vmid).resize.put(disk=disk, size=size)
+        if cancelled and cancelled():
+            raise JobCancelled()
+        node = self._existing_vm_node(vmid)
+        upid = self.api.nodes(node).qemu(vmid).config.post(**params)
+        # The API's explicit background_delay option returns null only after it
+        # has verified success itself; without that option null is ambiguous.
+        if upid is None and params.get("background_delay"):
+            return
+        self._wait_submitted_task(upid, node, on_task, cancelled)
+
+    def resize_disk(self, vmid: int, disk: str, size: str, node: Optional[str] = None, *,
+                    on_task: Optional[Callable[[str], None]] = None,
+                    cancelled: Optional[Callable[[], bool]] = None) -> None:
+        guard_vmid(vmid)
+        if cancelled and cancelled():
+            raise JobCancelled()
+        node = self._existing_vm_node(vmid)
+        upid = self.api.nodes(node).qemu(vmid).resize.put(disk=disk, size=size)
+        self._wait_submitted_task(upid, node, on_task, cancelled)
 
     # ---- base image download / import helpers -------------------------
     def download_url(
@@ -405,9 +498,61 @@ class Proxmox:
         return self.api.nodes(node).qemu.post(**params)
 
     # ---- guest agent ---------------------------------------------------
+    def wait_guest_ready(self, vmid: int, node: Optional[str] = None,
+                         cancelled: Optional[Callable[[], bool]] = None,
+                         timeout: float = 900, *, require_marker: bool = True) -> None:
+        """Wait for cloud-init and the generated recipe through guest-agent exec.
+
+        These Linux cloud images must provide cloud-init and /bin/sh; this uses no
+        distro-specific package/status paths. Exec is asynchronous (PID/status),
+        and a running agent alone is not readiness. Missing/failed recipe output,
+        including cloud-init's recoverable-error exit code 2, fails deployment.
+        """
+        guard_vmid(vmid)
+        if cancelled and cancelled():
+            raise JobCancelled()
+        node = self._existing_vm_node(vmid)
+        script = ('state=$(cloud-init status --wait 2>&1) || exit 20; '
+                  'case "$state" in *"status: done") ;; *) exit 20;; esac')
+        if require_marker:
+            script += '; [ "$(cat /var/lib/goblindock-recipe-result 2>/dev/null)" = 0 ] || exit 21'
+        command = "/bin/sh -c " + shlex.quote(script)
+        deadline = time.monotonic() + timeout
+        pid = None
+        last_error = "guest agent has not responded"
+        while time.monotonic() < deadline:
+            if cancelled and cancelled():
+                raise JobCancelled()
+            try:
+                agent = self.api.nodes(node).qemu(vmid).agent
+                if pid is None:
+                    started = agent("exec").post(command=command)
+                    pid = started.get("pid") if isinstance(started, dict) else None
+                    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                        raise ProxmoxError("guest agent returned no valid readiness process ID")
+                state = agent("exec-status").get(pid=pid)
+            except ResourceException as exc:
+                # Agent startup races are expected after boot. Keep an accepted PID
+                # so transient polling errors never launch duplicate guest commands.
+                last_error = str(exc)
+                time.sleep(min(1.5, max(0, deadline - time.monotonic())))
+                continue
+            if not isinstance(state, dict):
+                raise ProxmoxError("guest readiness returned malformed process status")
+            if state.get("exited"):
+                if state.get("exitcode") != 0:
+                    raise ProxmoxError(
+                        "guest initialization failed: cloud-init or recipe result was unsuccessful "
+                        f"(exit {state.get('exitcode', 'unknown')})"
+                    )
+                return
+            last_error = "cloud-init is still running"
+            time.sleep(min(1.5, max(0, deadline - time.monotonic())))
+        raise ProxmoxError(f"guest initialization timed out: {last_error}")
+
     def agent_ipv4(self, vmid: int, node: Optional[str] = None) -> Optional[str]:
         guard_vmid(vmid)
-        node = node or self.pick_node()
+        node = self._existing_vm_node(vmid)
         try:
             res = self.api.nodes(node).qemu(vmid).agent("network-get-interfaces").get()
         except ResourceException:
@@ -455,7 +600,7 @@ class Proxmox:
     def agent_osinfo(self, vmid: int, node: Optional[str] = None) -> dict:
         guard_vmid(vmid)
         try:
-            r = self.api.nodes(node or self.pick_node()).qemu(vmid).agent("get-osinfo").get()
+            r = self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).agent("get-osinfo").get()
             return r.get("result", {}) if isinstance(r, dict) else {}
         except ResourceException:
             return {}
@@ -463,7 +608,7 @@ class Proxmox:
     def agent_interfaces(self, vmid: int, node: Optional[str] = None) -> list[dict]:
         guard_vmid(vmid)
         try:
-            r = self.api.nodes(node or self.pick_node()).qemu(vmid).agent("network-get-interfaces").get()
+            r = self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).agent("network-get-interfaces").get()
             return r.get("result", []) if isinstance(r, dict) else []
         except ResourceException:
             return []
@@ -482,19 +627,20 @@ class Proxmox:
     def termproxy(self, vmid: int, node: Optional[str] = None) -> dict:
         """Open a serial term proxy — returns {ticket, port, user, ...}."""
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).termproxy.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).termproxy.post()
 
     def vncproxy(self, vmid: int, node: Optional[str] = None) -> dict:
         """Open a VNC (graphical console) proxy — returns {ticket, port, user, ...}.
         The ticket doubles as the VNC password the client must send."""
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).vncproxy.post(websocket=1)
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).vncproxy.post(websocket=1)
 
     def token_auth_header(self) -> str:
         return f"PVEAPIToken={self.conn.token_id}={decrypt(self.conn.token_secret_enc)}"
 
     def console_ws_url(self, vmid: int, node: str, port, ticket: str) -> str:
         from urllib.parse import quote
+        node = self._existing_vm_node(vmid)
         host, pp = self.conn.host, _proxmox_port(self.conn.port)
         return (f"wss://{host}:{pp}/api2/json/nodes/{node}/qemu/{vmid}"
                 f"/vncwebsocket?port={port}&vncticket={quote(str(ticket))}")
@@ -694,7 +840,9 @@ def probe_vm_presence(
     if px is None:
         return VM_UNKNOWN, "Proxmox client unavailable"
     try:
-        present = vmid in {int(v["vmid"]) for v in px.list_qemu(node)}
+        present = vmid in {int(v["vmid"]) for v in px.list_cluster_guests()}
+        if not present:
+            px._assert_vmid_free(vmid)
     except Exception as exc:  # noqa: BLE001
         return VM_UNKNOWN, f"Proxmox inventory probe failed: {exc}"
     if present:

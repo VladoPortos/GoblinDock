@@ -228,11 +228,18 @@ def _stub_px(record=None, present=()):
     class _Px:
         node = "pve"
         def __init__(self, conn): pass
+        def find_vm_node(self, vmid, node=None): return "pve"
+        def vm_current(self, vmid, node=None): return {"status": "stopped"}
         def destroy(self, vmid, node=None):
             if record is not None:
                 record.append(vmid)
             return "UPID:destroy"
         def wait_task(self, upid, node=None, cancelled=None, timeout=0): pass
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None):
             return [{"vmid": v} for v in present]
     return _Px
@@ -245,6 +252,11 @@ def test_probe_vm_presence_distinguishes_present_absent_and_unknown():
             self.inventory = inventory
             self.error = error
 
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None):
             if self.error:
                 raise self.error
@@ -271,6 +283,11 @@ def test_failed_cancellation_keeps_ambiguous_vm_identity():
         node = "pve"
         def __init__(self, conn): pass
         def destroy(self, vmid, node=None): raise RuntimeError("destroy unavailable")
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
 
     saved = worker.Proxmox
@@ -299,6 +316,11 @@ def test_canceled_destroy_with_unknown_inventory_becomes_cleanup_pending():
     class _UnknownPx:
         node = "pve"
         def __init__(self, conn): pass
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
 
     saved = worker.Proxmox
@@ -518,6 +540,11 @@ def test_run_destroy_idempotent_when_vm_already_gone():
         def stop(self, vmid, node=None): return "UPID:stop"
         def destroy(self, vmid, node=None): raise RuntimeError("500 no such VM")
         def wait_task(self, *a, **k): pass
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None): return []   # already gone
 
     ctx = worker.JobCtx(jid)
@@ -549,6 +576,11 @@ def test_destroy_wait_success_retains_ownership_when_absence_is_unknown():
         def stop(self, vmid, node=None): return "UPID:stop"
         def destroy(self, vmid, node=None): return "UPID:destroy"
         def wait_task(self, *args, **kwargs): return None
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None): raise RuntimeError("inventory unavailable")
 
     saved_px, saved_sleep = worker.Proxmox, worker.time.sleep
@@ -612,6 +644,11 @@ def test_execute_failure_rebuild_keeps_ip():
 def test_vm_exists_helper():
     class _Px:
         def __init__(self, present): self.present = present
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None):
             if self.present is None:
                 raise RuntimeError("listing down")
@@ -636,6 +673,11 @@ def test_rebuild_aborts_when_old_vm_survives_destroy():
         def stop(self, vmid, node=None): return "UPID:stop"
         def destroy(self, vmid, node=None): raise RuntimeError("destroy failed: VM busy")
         def wait_task(self, *a, **k): pass
+        def list_cluster_guests(self):
+            self._cluster_fixture = self.list_qemu(node=getattr(self, "node", None))
+            return self._cluster_fixture
+        def _assert_vmid_free(self, vmid):
+            assert vmid not in {int(v["vmid"]) for v in self._cluster_fixture}
         def list_qemu(self, node=None): return [{"vmid": 9300}]   # old VM SURVIVED
         def create_vm_import(self, *a, **k): created.append(a); return "UPID:create"
 
@@ -646,12 +688,17 @@ def test_rebuild_aborts_when_old_vm_survives_destroy():
     worker.Proxmox = _Px
     worker.time.sleep = lambda *a, **k: None
     raised = None
+    orig_base, orig_preflight = worker._ensure_base_disk, worker._preflight_deploy_cloud_init
+    # Exercise the old-VM survival gate after successful prerequisite checks.
+    worker._ensure_base_disk = lambda *a, **k: "base.img"
+    worker._preflight_deploy_cloud_init = lambda *a, **k: worker.DeployPreflight({}, '', '', '')
     try:
         worker._run_rebuild(ctx, job_copy)
     except RuntimeError as e:
         raised = e
     finally:
         worker.Proxmox, worker.time.sleep = orig_px, orig_sleep
+        worker._ensure_base_disk, worker._preflight_deploy_cloud_init = orig_base, orig_preflight
 
     assert raised is not None and "aborted" in str(raised), raised
     assert created == [], "rebuild must NOT recreate over the surviving old VM"

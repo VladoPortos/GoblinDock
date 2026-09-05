@@ -3,7 +3,7 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { Menu, ConfirmModal, Field, CopyField, OSGlyph, copyToClipboard } = window.UI;
+  const { Menu, ConfirmModal, FormModal, SelectField, Field, CopyField, OSGlyph, copyToClipboard } = window.UI;
   const h = React.createElement;
 
   /* ============ PROFILE ============ */
@@ -151,6 +151,82 @@
   }
 
   /* ============ TEMPLATES LIST ============ */
+  function parseTemplateBundle(text) {
+    if (text.length > 2000000) throw new Error('Template bundle exceeds 2 MB.');
+    let bundle;
+    try { bundle = JSON.parse(text); } catch (_) { throw new Error('Choose a valid JSON template bundle.'); }
+    if (!bundle || bundle.format !== 'goblindock-template' || bundle.version !== 1 || !bundle.template)
+      throw new Error('Unsupported template bundle format or version.');
+    return bundle;
+  }
+
+  function templateImportPayload(bundle, baseImageId, connectionId, networkId, name) {
+    const ids = [baseImageId, connectionId, networkId].map(Number);
+    if (ids.some((id) => !Number.isSafeInteger(id) || id <= 0))
+      throw new Error('Choose a local base image, connection and network.');
+    return { bundle, baseImageId: ids[0], connectionId: ids[1], networkId: ids[2], name };
+  }
+
+  async function downloadTemplate(t) {
+    try {
+      const bundle = await window.API.exportTemplate(t.templateId);
+      const url = URL.createObjectURL(new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' }));
+      const link = document.createElement('a');
+      link.href = url; link.download = (t.name || 'template').replace(/[^a-zA-Z0-9_-]/g, '-') + '.goblindock.json';
+      document.body.appendChild(link); link.click(); link.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (e) { window.GDStore.toast(e.message || 'Export failed', 'err'); }
+  }
+
+  function ImportTemplateModal({ onClose }) {
+    const [bundle, setBundle] = useState(null);
+    const [name, setName] = useState('');
+    const [baseId, setBaseId] = useState('');
+    const [connId, setConnId] = useState('');
+    const [netId, setNetId] = useState('');
+    const [busy, setBusy] = useState(false);
+    const [error, setError] = useState('');
+    const busyRef = React.useRef(false);
+    const chooseFile = async (event) => {
+      const file = event.target.files?.[0]; setError(''); setBundle(null);
+      if (!file) return;
+      try {
+        if (file.size > 2000000) throw new Error('Template bundle exceeds 2 MB.');
+        const parsed = parseTemplateBundle(await file.text());
+        setBundle(parsed); setName(parsed.template.name || 'Imported template');
+      } catch (e) { setError(e.message); }
+    };
+    const submit = async () => {
+      if (busyRef.current) return;
+      setError('');
+      try {
+        if (!bundle) throw new Error('Choose a template bundle first.');
+        const payload = templateImportPayload(bundle, baseId, connId, netId, name);
+        busyRef.current = true; setBusy(true);
+        await window.API.importTemplate(payload);
+        await window.GDStore.refresh();
+        window.GDStore.toast('Template imported', 'ok'); onClose();
+      } catch (e) { setError(e.message || 'Import failed'); }
+      finally { busyRef.current = false; setBusy(false); }
+    };
+    const options = (rows, id) => [{ value: '', label: 'Choose…' }, ...rows.map((r) => ({ value: r[id], label: r.name }))];
+    return h(FormModal, { title: 'Import template', icon: 'upload', onClose: busy ? () => {} : onClose,
+      onSubmit: submit, submitLabel: 'Import template', busy },
+      h('label', { className: 'field-label' }, 'Template bundle JSON', h('input', {
+        className: 'input', type: 'file', accept: '.json,application/json', disabled: busy, onChange: chooseFile })),
+      bundle && h('p', { className: 'hint' }, (bundle.customBlocks || []).length + ' custom blocks. Source image: ' +
+        (bundle.baseImage?.name || 'unspecified') + '. Select its matching local image below.'),
+      h(Field, { label: 'Template name', value: name, onChange: setName }),
+      h(SelectField, { label: 'Local base image', value: baseId, onChange: setBaseId, options: options(GD.BASE_IMAGES || [], 'imgId') }),
+      h(SelectField, { label: 'Connection', value: connId, onChange: (v) => { setConnId(v); setNetId(''); },
+        options: options((GD.CONNECTIONS || []).filter((c) => !c.disabled), 'connId') }),
+      h(SelectField, { label: 'Network', value: netId, onChange: setNetId,
+        options: options((GD.NETWORKS || []).filter((n) => n.connId === Number(connId)), 'netId') }),
+      bundle?.secretReferences?.length > 0 && h('p', { className: 'hint' }, 'Required secret references: ' + bundle.secretReferences.join(', ')),
+      h('p', { className: 'hint' }, 'The imported template is private. Review its scripts before deploying.'),
+      error && h('p', { role: 'alert', style: { color: 'var(--err)' } }, error));
+  }
+
   function templateActionFlags(template) {
     const canEdit = template?.canEdit === true;
     return {
@@ -190,6 +266,7 @@
       h('div', { style: { display: 'flex', borderTop: '1px solid var(--border-soft)' } },
         h('button', { className: 'card-act', disabled: !deployable, title: deployable ? 'One-click deploy from this template' : 'Pick a base image + location first (Edit)', onClick: () => onDeploy(r) }, h(Icon, { name: 'play', size: 14 }), 'Deploy'),
         actions.canEdit && h('button', { className: 'card-act', onClick: () => go('newtemplate', { templateId: r.templateId }) }, h(Icon, { name: 'edit', size: 14 }), 'Edit'),
+        actions.canEdit && h('button', { className: 'card-act', onClick: () => downloadTemplate(r) }, h(Icon, { name: 'download', size: 14 }), 'Export'),
         actions.canDelete && h(Menu, { align: 'right', items: [
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onDelete(r) },
         ] }, h('button', { className: 'card-act', style: { flex: '0 0 44px' }, 'aria-label': 'Template actions' }, h(Icon, { name: 'more', size: 16 })))));
@@ -198,6 +275,7 @@
   function TemplatesList({ go }) {
     const [confirm, setConfirm] = useState(null);
     const [deploying, setDeploying] = useState(null);
+    const [importing, setImporting] = useState(false);
     const templates = GD.TEMPLATES || [];
     // toast + rethrow: ConfirmModal keeps itself open for retry when the handler throws
     const del = async (t) => {
@@ -210,6 +288,7 @@
           h('h1', { className: 'page-title' }, 'Templates'),
           h('div', { className: 'page-sub' }, 'Deployment presets — a base image + blocks + defaults. Deploy in one click.')),
         h('div', { className: 'spacer' }),
+        h('button', { className: 'btn', onClick: () => setImporting(true) }, h(Icon, { name: 'upload', size: 16 }), 'Import'),
         h('button', { className: 'btn primary', onClick: () => go('newtemplate') }, h(Icon, { name: 'plus', size: 16 }), 'New template')),
       templates.length === 0
         ? h('div', { className: 'card' }, h('div', { className: 'empty' },
@@ -220,6 +299,7 @@
         : h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(300px, 1fr))', gap: 14 } },
             templates.map((t) => h(TemplateCard, { key: t.id, r: t, go, onDelete: (x) => setConfirm(x), onDeploy: (x) => setDeploying(x) }))),
       deploying && h(window.DeployModal, { tpl: deploying, go, onClose: () => setDeploying(null) }),
+      importing && h(ImportTemplateModal, { onClose: () => setImporting(false) }),
       confirm && h(ConfirmModal, {
         onClose: () => setConfirm(null), tone: 'danger', icon: 'trash',
         title: 'Delete ' + confirm.name + '?',
@@ -230,5 +310,5 @@
 
   window.Profile = Profile;
   window.TemplatesList = TemplatesList;
-  window.TemplateUI = { templateActionFlags };
+  window.TemplateUI = { templateActionFlags, parseTemplateBundle, templateImportPayload };
 })();

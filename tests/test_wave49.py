@@ -200,8 +200,8 @@ def test_db_upgrade_encrypts_and_drops_legacy_plaintext_column():
         conn.exec_driver_sql(
             "INSERT INTO deployments (name, node, cpu, ram, disk, ip, mac, status, tags, "
             "notes, error, root_password_enc, cred_user, deploy_inputs_json, deploy_inputs_enc, "
-            "created_at) VALUES (?, '', 1, 2, 20, '', '', 'stopped', '', '', '', '', '', ?, '', "
-            "CURRENT_TIMESTAMP)",
+            "identity_state, original_execution_plan_enc, original_context_enc, created_at) "
+            "VALUES (?, '', 1, 2, 20, '', '', 'stopped', '', '', '', '', '', ?, '', '', '', '', CURRENT_TIMESTAMP)",
             (f"wave49-legacy-vm-{suffix}", legacy),
         )
     db._migrate()
