@@ -1,7 +1,7 @@
 """Wave 30 — review Batch E: resource limits / availability.
 
-E1: the in-memory login throttle dict must not grow without bound. Empty windows are
-    evicted, and an opportunistic sweep drops stale keys once the dict is large, so an
+E1: the in-memory login throttle must not grow without bound. Empty windows are evicted,
+    and every recorded attempt enforces a hard least-recently-used key cap, so an
     unauthenticated attacker varying the email can't leak memory. The per-key block at
     8 attempts / 5 min is preserved.
 E2 (QA-M2): POST /images/{id}/sync is admin-only and de-duplicates an already
@@ -66,17 +66,15 @@ def test_throttle_evicts_empty_window():
     print("test_throttle_evicts_empty_window OK")
 
 
-def test_throttle_sweeps_stale_keys_when_large():
+def test_throttle_hard_caps_recent_keys_by_lru():
     api._login_attempts.clear()
-    old = time.time() - 400
     for i in range(api._MAX_THROTTLE_KEYS + 25):
-        api._login_attempts[f"junk{i}|9.9.9.9"] = [old]
-    assert len(api._login_attempts) > api._MAX_THROTTLE_KEYS
-    api._throttle("trigger|1.1.1.1")   # crossing the cap triggers the sweep
-    assert len(api._login_attempts) < api._MAX_THROTTLE_KEYS, \
-        f"stale keys must be swept, still {len(api._login_attempts)}"
+        api._record_attempt(f"recent{i}|9.9.9.9")
+    assert len(api._login_attempts) == api._MAX_THROTTLE_KEYS
+    assert "recent0|9.9.9.9" not in api._login_attempts
+    assert f"recent{api._MAX_THROTTLE_KEYS + 24}|9.9.9.9" in api._login_attempts
     api._login_attempts.clear()
-    print("test_throttle_sweeps_stale_keys_when_large OK")
+    print("test_throttle_hard_caps_recent_keys_by_lru OK")
 
 
 def test_throttle_still_blocks_after_8_recent():
@@ -124,7 +122,7 @@ def test_sync_image_dedupes_active_job():
 
 if __name__ == "__main__":
     test_throttle_evicts_empty_window()
-    test_throttle_sweeps_stale_keys_when_large()
+    test_throttle_hard_caps_recent_keys_by_lru()
     test_throttle_still_blocks_after_8_recent()
     test_sync_image_is_admin_gated()
     test_sync_image_dedupes_active_job()

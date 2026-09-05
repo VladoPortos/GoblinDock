@@ -13,8 +13,12 @@ import ipaddress
 import logging
 import os
 import re
+import shlex
+import threading
 import time
+from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlsplit
 
 from proxmoxer import ProxmoxAPI
 from proxmoxer.core import ResourceException
@@ -32,6 +36,16 @@ _warned_insecure_tls: set = set()
 # Docker's default bridge subnet — a guest running containers can report docker0's
 # 172.17.x gateway, which must never be mistaken for the VM's real management IP.
 _DOCKER_BRIDGE_NET = ipaddress.ip_network("172.17.0.0/16")
+_ssh_tofu_lock = threading.Lock()
+
+
+def _proxmox_port(value) -> int:
+    """Normalize legacy database values before constructing network endpoints."""
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        return 8006
+    return port if 1 <= port <= 65535 else 8006
 
 
 class ProxmoxError(RuntimeError):
@@ -48,14 +62,25 @@ class JobCancelled(Exception):
     pass
 
 
-def base_disk_filename(src_url: str) -> str:
-    """Cached per-URL qcow2 name on node storage. 'import' content needs a
-    recognised extension (cloud .img files are qcow2), and the name flows into
-    the comma-delimited import-from config — strict allowlist, URL-hash namespaced."""
-    raw_name = (src_url.rsplit("/", 1)[-1] if src_url else "image") or "image"
+def base_disk_filename(
+    src_url: str, checksum: str = "", checksum_algorithm: str = "",
+) -> str:
+    """Safe cache identity for one source and, when declared, one digest.
+
+    Checksum-less images retain the historical URL-only identity.  A declared
+    checksum becomes part of the identity so adding or changing verification can
+    never reuse bytes cached under a different integrity contract.  Only the URL
+    path contributes human-readable text; credentials and query tokens never do.
+    """
+    raw_name = ((urlsplit(src_url or "").path.rsplit("/", 1)[-1]) or "image")
     safe = re.sub(r"[^A-Za-z0-9._-]", "_", raw_name).lstrip(".-") or "image"
     stem = safe.rsplit(".", 1)[0] or "image"
-    url_tag = hashlib.sha256((src_url or "").encode()).hexdigest()[:8]
+    digest = (checksum or "").strip().lower()
+    algorithm = (checksum_algorithm or "").strip().lower()
+    identity = src_url or ""
+    if digest:
+        identity = f"{identity}\0{algorithm}\0{digest}"
+    url_tag = hashlib.sha256(identity.encode()).hexdigest()[:8]
     filename = f"{stem}-{url_tag}.qcow2"
     if not re.fullmatch(r"[A-Za-z0-9._-]+", filename):
         raise RuntimeError(f"unsafe image filename derived from URL: {raw_name!r}")
@@ -119,7 +144,7 @@ class Proxmox:
             token_value=decrypt(conn.token_secret_enc),
             verify_ssl=conn.verify_tls,
             service="PVE",
-            port=conn.port or 8006,
+            port=_proxmox_port(conn.port),
             timeout=30,
         )
 
@@ -163,15 +188,82 @@ class Proxmox:
     def list_qemu(self, node: Optional[str] = None) -> list[dict]:
         return self.api.nodes(node or self.pick_node()).qemu.get()
 
+    def list_cluster_guests(self) -> list[dict]:
+        """Read validated cluster guest identity, including containers.
+
+        The resources API filters guests by ACL. A propagated VM.Audit grant on
+        /vms is required. Child ACLs may still hide individual guests, so negative
+        decisions additionally require _assert_vmid_free's unfiltered registry.
+        Never fall back to the configured node: a guest may have migrated.
+        """
+        try:
+            permissions = self.api.access.permissions.get(path="/vms")
+            if not isinstance(permissions, dict) or permissions.get("/vms", {}).get("VM.Audit") != 1:
+                raise ProxmoxError("complete cluster inventory requires propagated VM.Audit on /vms")
+            guests = self.api.cluster.resources.get(type="vm")
+            if not isinstance(guests, list):
+                raise ProxmoxError("cluster guest inventory is unavailable or incomplete")
+            seen = set()
+            for guest in guests:
+                if (not isinstance(guest, dict) or guest.get("type") not in {"qemu", "lxc"}
+                        or not isinstance(guest.get("node"), str) or not guest["node"].strip()
+                        or not re.fullmatch(r"[0-9]+", str(guest.get("vmid")))):
+                    raise ProxmoxError("cluster guest inventory has incomplete identity")
+                vmid = int(guest["vmid"])
+                if vmid <= 0 or vmid in seen:
+                    raise ProxmoxError("cluster guest inventory has ambiguous identity")
+                seen.add(vmid)
+            return guests
+        except ProxmoxError:
+            raise
+        except Exception as exc:
+            raise ProxmoxError(f"complete cluster inventory unavailable: {exc}") from exc
+
+    def find_vm_node(self, vmid: int, node: Optional[str] = None) -> Optional[str]:
+        """Find current QEMU placement; None means proven cluster-wide absence."""
+        guard_vmid(vmid)
+        for guest in self.list_cluster_guests():
+            if int(guest["vmid"]) == int(vmid):
+                if guest["type"] != "qemu":
+                    raise ProxmoxError(f"VM ID {vmid} belongs to a container")
+                return guest["node"]
+        self._assert_vmid_free(vmid)
+        return None
+
+    def _assert_vmid_free(self, vmid: int) -> None:
+        """Corroborate negative ACL-filtered inventory with the unfiltered registry.
+
+        /cluster/nextid?vmid= is a read-only assertion, available to every user.
+        Unlike /cluster/resources it checks all QEMU/LXC identities even when a
+        child NoAccess ACL hides one despite inherited VM.Audit on /vms.
+        """
+        try:
+            free = self.api.cluster.nextid.get(vmid=int(vmid))
+            if not re.fullmatch(r"[0-9]+", str(free)) or int(free) != int(vmid):
+                raise ProxmoxError("cluster registry did not confirm the requested VM ID is free")
+        except Exception as exc:
+            raise ProxmoxError(f"cannot confirm VM {vmid} is absent: {exc}") from exc
+
+    def _existing_vm_node(self, vmid: int) -> str:
+        node = self.find_vm_node(vmid)
+        if node is None:
+            raise ProxmoxError(f"VM {vmid} is absent from the cluster")
+        return node
+
     def vm_current(self, vmid: int, node: Optional[str] = None) -> dict:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.current.get()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.current.get()
 
     def vm_config(self, vmid: int, node: Optional[str] = None) -> dict:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).config.get()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).config.get()
 
     # ---- task polling --------------------------------------------------
+    def task_status(self, upid: str, node: Optional[str] = None) -> dict:
+        """Read a recorded task's status on its owning node without stopping it."""
+        task_node = upid.split(":", 2)[1] if isinstance(upid, str) and upid.startswith("UPID:") else ""
+        return self.api.nodes(task_node or node or self.pick_node()).tasks(upid).status.get()
+
     def wait_task(
         self,
         upid: str,
@@ -182,13 +274,14 @@ class Proxmox:
     ) -> None:
         """Block until the task finishes OK; raise ProxmoxError on failure/timeout,
         or JobCancelled if the `cancelled` predicate fires."""
-        node = node or self.pick_node()
+        task_node = upid.split(":", 2)[1] if isinstance(upid, str) and upid.startswith("UPID:") else ""
+        node = task_node or node or self.pick_node()
         deadline = time.time() + timeout
         while time.time() < deadline:
             if cancelled and cancelled():
                 try:
                     self.api.nodes(node).tasks(upid).delete()
-                except ResourceException:
+                except Exception:  # transport failures must not mask requested cancellation
                     pass
                 raise JobCancelled()
             st = self.api.nodes(node).tasks(upid).status.get()
@@ -219,20 +312,20 @@ class Proxmox:
     # ---- lifecycle -----------------------------------------------------
     def start(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.start.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.start.post()
 
     def stop(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.stop.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.stop.post()
 
     def reboot(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).status.reboot.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).status.reboot.post()
 
     def destroy(self, vmid: int, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
         return (
-            self.api.nodes(node or self.pick_node())
+            self.api.nodes(self._existing_vm_node(vmid))
             .qemu(vmid)
             .delete(purge=1, **{"destroy-unreferenced-disks": 1})
         )
@@ -242,7 +335,7 @@ class Proxmox:
         """Raw snapshot list incl. the synthetic 'current' entry (its parent is the
         snapshot the VM currently sits on)."""
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot.get()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot.get()
 
     def create_snapshot(self, vmid: int, name: str, description: str = "",
                         vmstate: bool = False, node: Optional[str] = None) -> str:
@@ -251,33 +344,57 @@ class Proxmox:
         params: dict[str, Any] = {"snapname": name, "vmstate": 1 if vmstate else 0}
         if description:
             params["description"] = description
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot.post(**params)
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot.post(**params)
 
     def delete_snapshot(self, vmid: int, name: str, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
         guard_snapname(name)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot(name).delete()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot(name).delete()
 
     def rollback_snapshot(self, vmid: int, name: str, node: Optional[str] = None) -> str:
         guard_vmid(vmid)
         guard_snapname(name)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).snapshot(name).rollback.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).snapshot(name).rollback.post()
 
     # ---- vmid allocation ----------------------------------------------
     def next_free_vmid(self, lo: int, hi: int, node: Optional[str] = None) -> int:
-        used = {int(v["vmid"]) for v in self.list_qemu(node)}
+        used = {int(v["vmid"]) for v in self.list_cluster_guests()}
         for vmid in range(lo, hi + 1):
             if vmid not in used:
+                self._assert_vmid_free(vmid)
                 return vmid
         raise ProxmoxError(f"no free VMID in range {lo}-{hi}")
 
-    def set_config(self, vmid: int, node: Optional[str] = None, **params) -> None:
-        guard_vmid(vmid)
-        self.api.nodes(node or self.pick_node()).qemu(vmid).config.post(**params)
+    def _wait_submitted_task(self, upid, node: str, on_task=None, cancelled=None) -> None:
+        if not isinstance(upid, str) or not upid.startswith("UPID:"):
+            raise ProxmoxError("Proxmox did not return an identifiable task; outcome is unknown")
+        if on_task:
+            on_task(upid)
+        self.wait_task(upid, node=node, cancelled=cancelled)
 
-    def resize_disk(self, vmid: int, disk: str, size: str, node: Optional[str] = None) -> None:
+    def set_config(self, vmid: int, node: Optional[str] = None, *,
+                   on_task: Optional[Callable[[str], None]] = None,
+                   cancelled: Optional[Callable[[], bool]] = None, **params) -> None:
         guard_vmid(vmid)
-        self.api.nodes(node or self.pick_node()).qemu(vmid).resize.put(disk=disk, size=size)
+        if cancelled and cancelled():
+            raise JobCancelled()
+        node = self._existing_vm_node(vmid)
+        upid = self.api.nodes(node).qemu(vmid).config.post(**params)
+        # The API's explicit background_delay option returns null only after it
+        # has verified success itself; without that option null is ambiguous.
+        if upid is None and params.get("background_delay"):
+            return
+        self._wait_submitted_task(upid, node, on_task, cancelled)
+
+    def resize_disk(self, vmid: int, disk: str, size: str, node: Optional[str] = None, *,
+                    on_task: Optional[Callable[[str], None]] = None,
+                    cancelled: Optional[Callable[[], bool]] = None) -> None:
+        guard_vmid(vmid)
+        if cancelled and cancelled():
+            raise JobCancelled()
+        node = self._existing_vm_node(vmid)
+        upid = self.api.nodes(node).qemu(vmid).resize.put(disk=disk, size=size)
+        self._wait_submitted_task(upid, node, on_task, cancelled)
 
     # ---- base image download / import helpers -------------------------
     def download_url(
@@ -318,6 +435,40 @@ class Proxmox:
         except Exception:  # noqa: BLE001
             return False
 
+    def delete_storage_volume(self, filename: str, node: Optional[str] = None):
+        """Delete one safe import-cache volume, returning a task id when PVE does."""
+        if not re.fullmatch(r"[A-Za-z0-9._-]+", filename or ""):
+            raise ProxmoxError(f"invalid storage filename: {filename!r}")
+        node = node or self.pick_node()
+        volid = self.iso_volume_path(filename)
+        return self.api.nodes(node).storage(self.iso_storage).content(volid).delete()
+
+    def validate_snippet_volume(self, volid: str, node: Optional[str] = None) -> None:
+        """Require a normalized, configured, and API-visible cloud-init snippet.
+
+        SSH/SFTP success alone does not prove that Proxmox can attach the volume.
+        Check the active snippet storage advertises ``snippets`` and that its content
+        API lists this exact volume before accepting a VM-create request.
+        """
+        match = re.fullmatch(r"([A-Za-z0-9_.-]+):snippets/([A-Za-z0-9_.-]+)", volid or "")
+        if not match:
+            raise ProxmoxError(f"invalid snippet volume id: {volid!r}")
+        storage = match.group(1)
+        if storage != self.snippet_storage:
+            raise ProxmoxError(
+                f"snippet volume storage {storage!r} does not match configured storage "
+                f"{self.snippet_storage!r}"
+            )
+        node = node or self.pick_node()
+        stores = self.api.nodes(node).storage.get() or []
+        active = next((item for item in stores if (item or {}).get("storage") == storage), None)
+        contents = [part.strip() for part in str((active or {}).get("content", "")).split(",")]
+        if not active or not active.get("active") or "snippets" not in contents:
+            raise ProxmoxError(f"storage {storage!r} is not active for snippets on {node}")
+        volumes = self.api.nodes(node).storage(storage).content.get(content="snippets") or []
+        if volid not in {(item or {}).get("volid") for item in volumes}:
+            raise ProxmoxError(f"snippet volume {volid!r} is not visible on {node}")
+
     def create_vm_import(
         self, vmid: int, name: str, import_path: str, cores: int, ram_mb: int,
         node: Optional[str] = None,
@@ -347,9 +498,61 @@ class Proxmox:
         return self.api.nodes(node).qemu.post(**params)
 
     # ---- guest agent ---------------------------------------------------
+    def wait_guest_ready(self, vmid: int, node: Optional[str] = None,
+                         cancelled: Optional[Callable[[], bool]] = None,
+                         timeout: float = 900, *, require_marker: bool = True) -> None:
+        """Wait for cloud-init and the generated recipe through guest-agent exec.
+
+        These Linux cloud images must provide cloud-init and /bin/sh; this uses no
+        distro-specific package/status paths. Exec is asynchronous (PID/status),
+        and a running agent alone is not readiness. Missing/failed recipe output,
+        including cloud-init's recoverable-error exit code 2, fails deployment.
+        """
+        guard_vmid(vmid)
+        if cancelled and cancelled():
+            raise JobCancelled()
+        node = self._existing_vm_node(vmid)
+        script = ('state=$(cloud-init status --wait 2>&1) || exit 20; '
+                  'case "$state" in *"status: done") ;; *) exit 20;; esac')
+        if require_marker:
+            script += '; [ "$(cat /var/lib/goblindock-recipe-result 2>/dev/null)" = 0 ] || exit 21'
+        command = "/bin/sh -c " + shlex.quote(script)
+        deadline = time.monotonic() + timeout
+        pid = None
+        last_error = "guest agent has not responded"
+        while time.monotonic() < deadline:
+            if cancelled and cancelled():
+                raise JobCancelled()
+            try:
+                agent = self.api.nodes(node).qemu(vmid).agent
+                if pid is None:
+                    started = agent("exec").post(command=command)
+                    pid = started.get("pid") if isinstance(started, dict) else None
+                    if not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0:
+                        raise ProxmoxError("guest agent returned no valid readiness process ID")
+                state = agent("exec-status").get(pid=pid)
+            except ResourceException as exc:
+                # Agent startup races are expected after boot. Keep an accepted PID
+                # so transient polling errors never launch duplicate guest commands.
+                last_error = str(exc)
+                time.sleep(min(1.5, max(0, deadline - time.monotonic())))
+                continue
+            if not isinstance(state, dict):
+                raise ProxmoxError("guest readiness returned malformed process status")
+            if state.get("exited"):
+                if state.get("exitcode") != 0:
+                    raise ProxmoxError(
+                        "guest initialization failed: cloud-init or recipe result was unsuccessful "
+                        f"(exit {state.get('exitcode', 'unknown')})"
+                    )
+                return
+            last_error = "cloud-init is still running"
+            time.sleep(min(1.5, max(0, deadline - time.monotonic())))
+        raise ProxmoxError(f"guest initialization timed out: {last_error}")
+
     def agent_ipv4(self, vmid: int, node: Optional[str] = None) -> Optional[str]:
         guard_vmid(vmid)
-        node = node or self.pick_node()
+        node = self._existing_vm_node(vmid)
         try:
             res = self.api.nodes(node).qemu(vmid).agent("network-get-interfaces").get()
         except ResourceException:
@@ -397,7 +600,7 @@ class Proxmox:
     def agent_osinfo(self, vmid: int, node: Optional[str] = None) -> dict:
         guard_vmid(vmid)
         try:
-            r = self.api.nodes(node or self.pick_node()).qemu(vmid).agent("get-osinfo").get()
+            r = self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).agent("get-osinfo").get()
             return r.get("result", {}) if isinstance(r, dict) else {}
         except ResourceException:
             return {}
@@ -405,7 +608,7 @@ class Proxmox:
     def agent_interfaces(self, vmid: int, node: Optional[str] = None) -> list[dict]:
         guard_vmid(vmid)
         try:
-            r = self.api.nodes(node or self.pick_node()).qemu(vmid).agent("network-get-interfaces").get()
+            r = self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).agent("network-get-interfaces").get()
             return r.get("result", []) if isinstance(r, dict) else []
         except ResourceException:
             return []
@@ -424,20 +627,21 @@ class Proxmox:
     def termproxy(self, vmid: int, node: Optional[str] = None) -> dict:
         """Open a serial term proxy — returns {ticket, port, user, ...}."""
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).termproxy.post()
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).termproxy.post()
 
     def vncproxy(self, vmid: int, node: Optional[str] = None) -> dict:
         """Open a VNC (graphical console) proxy — returns {ticket, port, user, ...}.
         The ticket doubles as the VNC password the client must send."""
         guard_vmid(vmid)
-        return self.api.nodes(node or self.pick_node()).qemu(vmid).vncproxy.post(websocket=1)
+        return self.api.nodes(self._existing_vm_node(vmid)).qemu(vmid).vncproxy.post(websocket=1)
 
     def token_auth_header(self) -> str:
         return f"PVEAPIToken={self.conn.token_id}={decrypt(self.conn.token_secret_enc)}"
 
     def console_ws_url(self, vmid: int, node: str, port, ticket: str) -> str:
         from urllib.parse import quote
-        host, pp = self.conn.host, self.conn.port or 8006
+        node = self._existing_vm_node(vmid)
+        host, pp = self.conn.host, _proxmox_port(self.conn.port)
         return (f"wss://{host}:{pp}/api2/json/nodes/{node}/qemu/{vmid}"
                 f"/vncwebsocket?port={port}&vncticket={quote(str(ticket))}")
 
@@ -454,6 +658,41 @@ def _load_ssh_key(path: str):
     return None
 
 
+def _tofu_host_key_policy(paramiko, tofu_path: Path):
+    """Persist the first key for a hostname, then reject every unknown key type.
+
+    Paramiko's AutoAddPolicy works per hostname *and algorithm*, which would accept
+    an ECDSA attacker key after an RSA key was pinned.  TOFU is hostname-wide here:
+    once any algorithm is known, only an exact previously pinned key is acceptable.
+    """
+    class _HostnameTofuPolicy(paramiko.MissingHostKeyPolicy):
+        def missing_host_key(self, client, hostname, key):
+            with _ssh_tofu_lock:
+                persisted = paramiko.HostKeys()
+                persisted.load(str(tofu_path))
+                pinned = []
+                for host_keys in (
+                    getattr(client, "_system_host_keys", None),
+                    getattr(client, "_host_keys", None),
+                    persisted,
+                ):
+                    known = host_keys.lookup(hostname) if host_keys is not None else None
+                    if known:
+                        pinned.extend(known.values())
+                if any(existing == key for existing in pinned):
+                    # A concurrent first connection may have persisted this exact key
+                    # after this client loaded its snapshot but before its handshake.
+                    client._host_keys.add(hostname, key.get_name(), key)
+                    return
+                if pinned:
+                    raise paramiko.BadHostKeyException(hostname, key, pinned[0])
+                client._host_keys.add(hostname, key.get_name(), key)
+                client.save_host_keys(str(tofu_path))
+                os.chmod(tofu_path, 0o600)
+
+    return _HostnameTofuPolicy()
+
+
 def _ssh_client(conn: Connection, key, timeout: int):
     """Connected paramiko SSHClient for the node — shared by snippet write/delete.
     Honours any known_hosts we have so a pinned node can't be MITM'd. Strict
@@ -467,11 +706,27 @@ def _ssh_client(conn: Connection, key, timeout: int):
         pass
     if settings.ssh_known_hosts and os.path.exists(settings.ssh_known_hosts):
         try:
-            client.load_host_keys(settings.ssh_known_hosts)
+            # Explicit pins are read-only and checked before the writable TOFU set.
+            client.load_system_host_keys(settings.ssh_known_hosts)
         except Exception:  # noqa: BLE001
             pass
+    if not settings.ssh_strict:
+        tofu_path = Path(settings.data_dir) / "ssh_known_hosts"
+        tofu_path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            fd = os.open(str(tofu_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            pass
+        else:
+            os.close(fd)
+        # Existing installations may have created the file under a permissive umask.
+        # Tighten it before loading; AutoAddPolicy preserves the mode when truncating.
+        os.chmod(tofu_path, 0o600)
+        client.load_host_keys(str(tofu_path))
     client.set_missing_host_key_policy(
-        paramiko.RejectPolicy() if settings.ssh_strict else paramiko.AutoAddPolicy()
+        paramiko.RejectPolicy()
+        if settings.ssh_strict
+        else _tofu_host_key_policy(paramiko, tofu_path)
     )
     client.connect(conn.ssh_host or conn.host, username=conn.ssh_user or "root", pkey=key, timeout=timeout)
     return client
@@ -514,18 +769,30 @@ def write_snippet_over_ssh(conn: Connection, filename: str, content: str) -> str
         # Pure SFTP — no shell exec, so nothing user-influenced reaches a shell.
         sftp = client.open_sftp()
         try:
-            sftp.stat(base)
-        except IOError:
             try:
-                sftp.mkdir(base)
+                sftp.stat(base)
             except IOError:
-                pass  # parent may be missing; putfo below will surface a clear error
-        sftp.putfo(io.BytesIO(content.encode("utf-8")), remote)
-        sftp.close()
+                try:
+                    sftp.mkdir(base)
+                except IOError:
+                    pass  # parent may be missing; putfo below will surface a clear error
+            sftp.putfo(io.BytesIO(content.encode("utf-8")), remote)
+            # The cloud-config may contain resolved password/secret inputs.  Fail
+            # closed unless the node-side copy is readable only by its SSH owner.
+            try:
+                sftp.chmod(remote, 0o600)
+            except Exception:
+                try:
+                    sftp.remove(remote)
+                except Exception:  # noqa: BLE001
+                    pass
+                raise
+        finally:
+            sftp.close()
     finally:
         client.close()
 
-    return f"{conn.snippet_storage}:snippets/{filename}"
+    return f"{store}:snippets/{filename}"
 
 
 def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:
@@ -554,3 +821,30 @@ def delete_snippet_over_ssh(conn: Connection, filename: str) -> None:
         pass
     finally:
         client.close()
+
+
+# --------------------------------------------------------------------------- #
+# read-only inventory truth                                                    #
+# --------------------------------------------------------------------------- #
+VM_PRESENT = "present"
+VM_ABSENT = "absent"
+VM_UNKNOWN = "unknown"
+
+
+def probe_vm_presence(
+    px: Optional["Proxmox"], vmid: Optional[int], node: Optional[str]
+) -> tuple[str, str]:
+    """Return tri-state Proxmox inventory truth without collapsing errors to absence."""
+    if vmid is None:
+        return VM_ABSENT, "VM ID was never assigned"
+    if px is None:
+        return VM_UNKNOWN, "Proxmox client unavailable"
+    try:
+        present = vmid in {int(v["vmid"]) for v in px.list_cluster_guests()}
+        if not present:
+            px._assert_vmid_free(vmid)
+    except Exception as exc:  # noqa: BLE001
+        return VM_UNKNOWN, f"Proxmox inventory probe failed: {exc}"
+    if present:
+        return VM_PRESENT, f"VM {vmid} is present in Proxmox inventory"
+    return VM_ABSENT, f"VM {vmid} is absent from Proxmox inventory"

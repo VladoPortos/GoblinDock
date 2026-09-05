@@ -109,16 +109,18 @@ def test_ansible_phase_redacts_literal_password_in_job_log():
     with session_scope() as s:
         j = Job(type="deploy", status="running"); s.add(j); s.flush(); jid = j.id
     ctx = worker.JobCtx(jid)
-    saved = {k: getattr(worker, k) for k in ("run_playbook", "_blocks_by_key", "compile_ansible")}
+    saved = {k: getattr(worker, k) for k in ("run_playbook", "compile_ansible")}
 
     def _fake_run(playbook, ip, user, key, on_line=None, cancelled=None, timeout=1200):
         on_line(f"FAILED! cmd: mysql -e \"CREATE USER x IDENTIFIED BY '{SECRET}'\"")
         return ("successful", 0)
     worker.run_playbook = _fake_run
-    worker._blocks_by_key = lambda: {"b-pw26c": blk}
     worker.compile_ansible = lambda *a, **k: "- hosts: all\n  tasks: []"
     try:
-        worker._run_ansible_phase(ctx, _recipe("b-pw26c", SECRET), None, "10.0.0.5", "KEY", "cfg")
+        worker._run_ansible_phase(
+            ctx, _recipe("b-pw26c", SECRET), {"b-pw26c": blk}, None,
+            "10.0.0.5", "KEY", "cfg",
+        )
     finally:
         for k, v in saved.items():
             setattr(worker, k, v)

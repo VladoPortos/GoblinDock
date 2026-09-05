@@ -20,6 +20,9 @@
   }
 
   const STATUS_LABEL = { running:'Running', stopped:'Stopped', working:'Working', error:'Error', unknown:'Unknown' };
+  function isVmLifecycleLocked(vm) {
+    return !!vm && (vm.status === 'working' || vm.status === 'cleanup_pending');
+  }
   function StatusBadge({ status, label }) {
     return h('span', { className: 'badge ' + status },
       h('span', { className: 'dot ' + status }),
@@ -129,27 +132,32 @@
 
   // ---- reusable form fields ----
   function Field({ label, value, onChange, mono, type, placeholder, hint }) {
+    const inputId = React.useId();
     return h('div', null,
-      label && h('label', { className: 'field-label' }, label),
+      label && h('label', { className: 'field-label', htmlFor: inputId }, label),
       h('input', {
+        id: inputId,
         className: 'input' + (mono ? ' mono' : ''), type: type || 'text', value: value == null ? '' : value,
         placeholder: placeholder || '', onChange: (e) => onChange && onChange(e.target.value),
       }),
       hint && h('div', { className: 'hint', style: { fontSize: 11, marginTop: 4 } }, hint));
   }
   function TextArea({ label, value, onChange, rows, mono }) {
+    const inputId = React.useId();
     return h('div', null,
-      label && h('label', { className: 'field-label' }, label),
+      label && h('label', { className: 'field-label', htmlFor: inputId }, label),
       h('textarea', {
+        id: inputId,
         className: 'input' + (mono ? ' mono' : ''), value: value == null ? '' : value,
         style: { height: (rows || 4) * 22, padding: 10, resize: 'vertical', lineHeight: 1.5 },
         onChange: (e) => onChange && onChange(e.target.value),
       }));
   }
   function SelectField({ label, value, onChange, options }) {
+    const inputId = React.useId();
     return h('div', null,
-      label && h('label', { className: 'field-label' }, label),
-      h('select', { className: 'select', value: value, onChange: (e) => onChange && onChange(e.target.value) },
+      label && h('label', { className: 'field-label', htmlFor: inputId }, label),
+      h('select', { id: inputId, className: 'select', value: value, onChange: (e) => onChange && onChange(e.target.value) },
         options.map((o) => {
           const val = typeof o === 'object' ? o.value : o;
           const lbl = typeof o === 'object' ? o.label : o;
@@ -218,35 +226,78 @@
 
   // small dropdown menu — rendered in a portal so it is NEVER clipped by a card's
   // overflow:hidden, and positioned with fixed coords from the trigger's rect.
+  function menuItems(menu) {
+    return menu ? Array.from(menu.querySelectorAll('[role="menuitem"]:not(:disabled)')) : [];
+  }
+
+  function focusLater(node) {
+    if (!node || typeof node.focus !== 'function') return;
+    const focus = () => { if (node && typeof node.focus === 'function') node.focus(); };
+    if (typeof requestAnimationFrame === 'function') requestAnimationFrame(focus);
+    else setTimeout(focus, 0);
+  }
+
+  function handleMenuKey(event, menu, close) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (!['ArrowDown', 'ArrowUp', 'Home', 'End'].includes(event.key)) return;
+    const enabled = menuItems(menu);
+    if (!enabled.length) return;
+    event.preventDefault();
+    event.stopPropagation();
+    const active = document.activeElement;
+    const current = enabled.indexOf(active);
+    let next = 0;
+    if (event.key === 'End') next = enabled.length - 1;
+    else if (event.key === 'ArrowDown') next = current < 0 ? 0 : (current + 1) % enabled.length;
+    else if (event.key === 'ArrowUp') next = current < 0 ? enabled.length - 1 : (current - 1 + enabled.length) % enabled.length;
+    enabled[next].focus();
+  }
+
   function Menu({ items, children, align = 'right' }) {
     const [open, setOpen] = useState(false);
     const [pos, setPos] = useState(null);
-    const ref = React.useRef(null);
-    const openMenu = (e) => {
+    const triggerRef = React.useRef(null);
+    const menuRef = React.useRef(null);
+    const focusEdgeRef = React.useRef('first');
+    const menuId = React.useId();
+    const closeMenu = (restore = true) => {
+      setOpen(false);
+      if (restore) focusLater(triggerRef.current);
+    };
+    const openMenu = (e, edge = 'first') => {
       e.stopPropagation();
-      const r = ref.current.getBoundingClientRect();
+      if (open) { closeMenu(true); return; }
+      const r = triggerRef.current.getBoundingClientRect();
+      focusEdgeRef.current = edge;
       setPos({ top: Math.round(r.bottom + 6), left: Math.round(r.left), right: Math.round(window.innerWidth - r.right) });
       setOpen(true);
     };
     React.useEffect(() => {
       if (!open) return undefined;
-      const close = () => setOpen(false);
-      const onKey = (e) => { if (e.key === 'Escape') setOpen(false); };
+      const enabled = menuItems(menuRef.current);
+      const initial = focusEdgeRef.current === 'last' ? enabled[enabled.length - 1] : enabled[0];
+      if (initial) initial.focus();
+      const close = () => closeMenu(true);
       window.addEventListener('scroll', close, true);
       window.addEventListener('resize', close);
-      document.addEventListener('keydown', onKey);
       return () => {
         window.removeEventListener('scroll', close, true);
         window.removeEventListener('resize', close);
-        document.removeEventListener('keydown', onKey);
       };
     }, [open]);
 
     const dropdown = open && pos && ReactDOM.createPortal(
       h(React.Fragment, null,
-        h('div', { style: { position: 'fixed', inset: 0, zIndex: 200 }, onMouseDown: (e) => { e.stopPropagation(); setOpen(false); } }),
+        h('div', { style: { position: 'fixed', inset: 0, zIndex: 200 }, onMouseDown: (e) => { e.stopPropagation(); closeMenu(true); } }),
         h('div', {
+          id: menuId, ref: menuRef, role: 'menu',
           onMouseDown: (e) => e.stopPropagation(),
+          onKeyDown: (event) => handleMenuKey(event, menuRef.current, () => closeMenu(true)),
           style: {
             position: 'fixed', top: pos.top, zIndex: 201,
             ...(align === 'right' ? { right: pos.right } : { left: pos.left }),
@@ -254,12 +305,22 @@
             background: 'var(--surface)', border: '1px solid var(--border)', boxShadow: 'var(--shadow-lg)',
           },
         }, items.map((it, i) => it.sep
-          ? h('div', { key: i, className: 'divider', style: { margin: '5px 4px' } })
+          ? h('div', { key: i, role: 'separator', className: 'divider', style: { margin: '5px 4px' } })
+          : it.header
+            ? h('div', {
+                key: i, role: 'presentation', className: 'menu-item',
+                style: {
+                  display: 'flex', alignItems: 'center', gap: 9, width: '100%',
+                  padding: '8px 9px', color: 'var(--text-faint)',
+                  fontFamily: 'JetBrains Mono, monospace', fontSize: 11.5,
+                },
+              }, it.icon && h(Icon, { name: it.icon, size: 15 }), it.label)
           : h('button', {
               key: i, className: 'menu-item' + (it.danger ? ' danger' : ''),
+              type: 'button', role: 'menuitem',
               disabled: !!it.disabled,
               title: it.title || null,
-              onClick: (e) => { e.stopPropagation(); if (it.disabled) return; setOpen(false); it.onClick && it.onClick(); },
+              onClick: (e) => { e.stopPropagation(); if (it.disabled) return; closeMenu(true); it.onClick && it.onClick(); },
               style: {
                 display: 'flex', alignItems: 'center', gap: 9, width: '100%', textAlign: 'left',
                 padding: '8px 9px', borderRadius: 7, border: 'none', cursor: 'pointer',
@@ -272,8 +333,26 @@
         )),
       ), document.body);
 
-    return h('div', { ref, style: { display: 'inline-flex' }, onClick: openMenu },
-      children, dropdown);
+    const childProps = (children && children.props) || {};
+    const trigger = React.cloneElement(children, {
+      ref: triggerRef,
+      'aria-haspopup': 'menu',
+      'aria-expanded': open,
+      'aria-controls': open ? menuId : undefined,
+      onClick: (event) => {
+        if (childProps.onClick) childProps.onClick(event);
+        if (!event.defaultPrevented) openMenu(event, 'first');
+      },
+      onKeyDown: (event) => {
+        if (childProps.onKeyDown) childProps.onKeyDown(event);
+        if (event.defaultPrevented) return;
+        if (event.key === 'ArrowDown' || event.key === 'ArrowUp') {
+          event.preventDefault();
+          openMenu(event, event.key === 'ArrowUp' ? 'last' : 'first');
+        }
+      },
+    });
+    return h('div', { style: { display: 'inline-flex' } }, trigger, dropdown);
   }
 
   // ---- ask-on-deploy helpers (shared by the Deploy modal and anything that prompts for template inputs) ----
@@ -283,9 +362,14 @@
     (tpl.recipe || []).forEach((sec, si) => (sec.blocks || []).forEach((b, bi) => {
       (Array.isArray(b.ask) ? b.ask : []).forEach((n) => {
         const pal = (GDx.PALETTE || []).find((p) => p.id === b.ref) || {};
-        const field = (pal.schema || []).find((x) => x.name === n);
+        const carried = Array.isArray(b.askSchema) ? b.askSchema : [];
+        const field = carried.find((x) => x && x.name === n)
+          || (pal.schema || []).find((x) => x.name === n);
         if (!field) return;  // ask references an input the block no longer has — no prompt
-        asks.push({ addr: si + '.' + bi, blockName: b.name || pal.name || b.ref, field, def: (b.inputs || {})[n] });
+        const rawDefault = (b.inputs || {})[n];
+        const sensitive = field.type === 'password' || field.type === 'secret';
+        const def = sensitive || rawDefault === '********' ? '' : rawDefault;
+        asks.push({ addr: si + '.' + bi, blockName: b.name || pal.name || b.ref, field, def });
       });
     }));
     return asks;
@@ -294,7 +378,9 @@
     const out = {};
     asks.forEach((a) => {
       out[a.addr] = out[a.addr] || {};
-      out[a.addr][a.field.name] = a.def != null && a.def !== '' ? a.def
+      const sensitive = a.field.type === 'password' || a.field.type === 'secret';
+      const usableDefault = sensitive || a.def === '********' ? '' : a.def;
+      out[a.addr][a.field.name] = usableDefault != null && usableDefault !== '' ? usableDefault
         : a.field.type === 'bool' ? false : (a.field.type === 'tags' || a.field.type === 'list') ? [] : '';
     });
     return out;
@@ -336,6 +422,6 @@
     Field, TextArea, SelectField, Toggle, TagInput, FormModal,
     collectAsks, initAskAnswers, asksMissing, AskInputs,
     SizeField,
-    copyToClipboard, readClipboard, fmtBytes, useFetched,
+    copyToClipboard, readClipboard, fmtBytes, useFetched, isVmLifecycleLocked,
   };
 })();

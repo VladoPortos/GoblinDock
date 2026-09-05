@@ -1,11 +1,11 @@
 """Wave 31 — review Batch F: /state & SSE performance (all Low, hot-path).
 
 F1: /state probed px.version() per connection on every call; under SSE-driven refetch
-    that amplifies. Now cached with a short TTL (_CONN_STATUS_CACHE).
+    that amplifies. Now read from the background inventory snapshot.
 F2: vm_dict ran one active-job SELECT per deployment (N+1) on /state. The lookup is now
     batched once in state() and passed in.
 F3: GET /images/cached did one uncached Proxmox listing per call. Now TTL-cached per
-    connection (_CACHED_IMAGES_CACHE).
+    connection in the bounded background inventory.
 F4: SSE generators get a wall-clock lifetime cap (_SSE_MAX_LIFETIME) so a stale
     connection (where is_disconnected can fail behind BaseHTTPMiddleware) can't poll
     forever — EventSource just reconnects.
@@ -49,18 +49,22 @@ def _mk_user(email, role="user"):
 # F1 — connection status cache                                                 #
 # --------------------------------------------------------------------------- #
 def test_conn_status_cached_within_ttl():
+    from app import inventory
     class _Px:
         def __init__(self): self.calls = 0
         def version(self):
             self.calls += 1
             return {"version": "8.1"}
-    api._CONN_STATUS_CACHE.clear()
     px = _Px()
-    a = api._conn_status(px, 4242)
-    b = api._conn_status(px, 4242)
-    assert a == b and a["status"] == "online", a
-    assert px.calls == 1, f"px.version() must be cached within the TTL, called {px.calls}x"
-    api._CONN_STATUS_CACHE.clear()
+    orig = inventory.get_snapshot
+    inventory.get_snapshot = lambda cid: {"status":"online", "version":"8.1"}
+    try:
+        a = api._conn_status(px, 4242)
+        b = api._conn_status(px, 4242)
+        assert a == b and a["status"] == "online", a
+        assert px.calls == 0, "connection status reads must not probe Proxmox"
+    finally:
+        inventory.get_snapshot = orig
     print("test_conn_status_cached_within_ttl OK")
 
 
@@ -109,7 +113,9 @@ def test_cached_images_cached_within_ttl():
             return ["local:iso/x.img"]
         def iso_volume_path(self, fn): return "local:iso/" + fn
 
-    api._CACHED_IMAGES_CACHE.clear()
+    from app import inventory
+    original_snapshot = inventory.get_snapshot
+    inventory.get_snapshot = lambda cid: {"status":"online", "volumes":set(), "stale":False}
     orig = api.Proxmox
     api.Proxmox = _Px
     try:
@@ -119,9 +125,9 @@ def test_cached_images_cached_within_ttl():
             r2 = api.cached_images(cid, user=s.get(User, adm), session=s)
     finally:
         api.Proxmox = orig
+        inventory.get_snapshot = original_snapshot
     assert r1 == r2 and r1["online"] is True, r1
-    assert _Px.calls["n"] == 1, f"Proxmox listing must be cached within TTL, called {_Px.calls['n']}x"
-    api._CACHED_IMAGES_CACHE.clear()
+    assert _Px.calls["n"] == 0, "cache reads must not trigger upstream listings"
     print("test_cached_images_cached_within_ttl OK")
 
 

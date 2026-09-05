@@ -69,6 +69,20 @@ def start_scheduler() -> None:
     log.info("scheduler started")
 
 
+def scheduler_health() -> dict:
+    """Running state + registered jobs, for the admin Health page."""
+    if _scheduler is None:
+        return {"running": False, "jobs": []}
+    return {
+        "running": bool(_scheduler.running),
+        "jobs": [
+            {"id": job.id,
+             "nextRun": job.next_run_time.isoformat() if job.next_run_time else None}
+            for job in _scheduler.get_jobs()
+        ],
+    }
+
+
 def stop_scheduler() -> None:
     global _scheduler
     if _scheduler is not None:

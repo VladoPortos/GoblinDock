@@ -20,6 +20,7 @@ os.environ.setdefault("GOBLINDOCK_DATA_DIR", "/tmp/gd-data-test")
 from app.db import init_db, session_scope          # noqa: E402
 from app import worker                              # noqa: E402
 from app.models import Job, Deployment, Image, IpAllocation  # noqa: E402
+from sqlmodel import select                                 # noqa: E402
 
 init_db()
 
@@ -44,7 +45,7 @@ def test_claim_skips_cancelled():
 
 def test_recover_orphans():
     with session_scope() as s:
-        dep = Deployment(name="d1", status="working", vmid=8001)
+        dep = Deployment(name="d1", status="working", vmid=None)
         img = Image(kind="golden", name="g1", build_status="building", template_vmid=8002)
         s.add(dep)
         s.add(img)
@@ -73,7 +74,46 @@ def test_recover_orphans():
     print("test_recover_orphans OK")
 
 
+def test_recover_orphans_commits_running_jobs_before_reconciliation_and_ignores_waiting():
+    """Restart recovery must reconcile committed running jobs and leave future waiting jobs alone."""
+    with session_scope() as s:
+        running_dep = Deployment(name="running-dep", status="working")
+        waiting_dep = Deployment(name="waiting-dep", status="working")
+        s.add(running_dep); s.add(waiting_dep); s.flush()
+        s.add(IpAllocation(network_id=2, ip="10.0.0.6", deployment_id=running_dep.id))
+        s.add(IpAllocation(network_id=2, ip="10.0.0.7", deployment_id=waiting_dep.id))
+        running_job = Job(type="deploy", status="running", deployment_id=running_dep.id)
+        waiting_job = Job(type="deploy", status="waiting", deployment_id=waiting_dep.id)
+        s.add(running_job); s.add(waiting_job); s.flush()
+        running_job_id, waiting_job_id = running_job.id, waiting_job.id
+        waiting_dep_id = waiting_dep.id
+
+    reconciled = []
+    original = worker._reconcile_failed_job
+
+    def observed_reconcile(job_id):
+        with session_scope() as s:
+            assert s.get(Job, job_id).status == "failed", "reconciliation must see committed restart state"
+        reconciled.append(job_id)
+        original(job_id)
+
+    worker._reconcile_failed_job = observed_reconcile
+    try:
+        worker._recover_orphans()
+    finally:
+        worker._reconcile_failed_job = original
+
+    assert reconciled == [running_job_id]
+    with session_scope() as s:
+        assert s.get(Job, waiting_job_id).status == "waiting"
+        assert s.get(Deployment, waiting_dep_id).status == "working"
+        waiting_allocs = s.exec(select(IpAllocation).where(
+            IpAllocation.deployment_id == waiting_dep_id)).all()
+        assert len(waiting_allocs) == 1
+
+
 if __name__ == "__main__":
     test_claim_skips_cancelled()
     test_recover_orphans()
+    test_recover_orphans_commits_running_jobs_before_reconciliation_and_ignores_waiting()
     print("\nALL WAVE 2 UNIT TESTS PASSED")

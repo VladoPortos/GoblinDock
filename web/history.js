@@ -4,7 +4,7 @@
 (function () {
   const { useState, useEffect } = React;
   const Icon = window.Icon;
-  const { ConfirmModal } = window.UI;
+  const { ConfirmModal, jobPresentation } = window.UI;
   const h = React.createElement;
 
   const RETENTION_OPTS = [
@@ -13,6 +13,18 @@
     { v: 30, label: '30 days' },
     { v: 90, label: '90 days' },
   ];
+
+  function activateHistoryRow(event, toggle) {
+    if (event.target !== event.currentTarget && event.target && event.target.closest) {
+      const nested = event.target.closest('button, a, input, select, textarea');
+      if (nested && (!event.currentTarget.contains || event.currentTarget.contains(nested))) return;
+    }
+    const click = event.type === 'click';
+    const key = event.type === 'keydown' ? event.key : '';
+    if (!click && key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return;
+    if ((key === ' ' || key === 'Spacebar') && event.preventDefault) event.preventDefault();
+    toggle();
+  }
 
   function History() {
     const isAdmin = window.GD.me && window.GD.me.isAdmin;
@@ -64,20 +76,22 @@
       if (!log.length) return '(no output)';
       return log.map((l, i) => h('div', { key: i, className: l.cls || '' }, l.text));
     };
-    const tone = (s) => (s === 'done' ? 'running' : s === 'error' ? 'error' : s === 'working' ? 'working' : 'stopped');
-
     const renderRow = (j) => {
+      const presentation = jobPresentation(j.rawStatus);
       const header = h('div', {
-        className: 'row',
+        className: 'row history-toggle', role: 'button', tabIndex: 0,
+        'aria-expanded': open === j.jobId,
+        'aria-label': (open === j.jobId ? 'Collapse ' : 'Expand ') + (j.title || j.type),
         style: { justifyContent: 'space-between', padding: '10px 14px', cursor: 'pointer' },
-        onClick: () => expand(j.jobId),
+        onClick: (event) => activateHistoryRow(event, () => expand(j.jobId)),
+        onKeyDown: (event) => activateHistoryRow(event, () => expand(j.jobId)),
       },
         h('div', { className: 'row', style: { gap: 10, minWidth: 0 } },
-          h('span', { className: 'dot ' + tone(j.status) }),
+          h('span', { className: 'dot ' + presentation.dotClass }),
           h('span', { className: 'mono', style: { fontSize: 12.5, whiteSpace: 'nowrap', overflow: 'hidden', textOverflow: 'ellipsis' } }, j.title || j.type),
-          h('span', { className: 'badge ' + (j.status === 'done' ? 'running' : j.status === 'error' ? 'error' : '') }, j.status)),
+          h('span', { className: 'badge ' + presentation.badgeClass }, presentation.label)),
         h('span', { onClick: (e) => e.stopPropagation() },
-          h('button', { className: 'icon-btn', title: 'Purge permanently', onClick: () => purge(j.jobId) },
+          h('button', { className: 'icon-btn', title: 'Purge permanently', 'aria-label': 'Purge ' + (j.title || j.type) + ' permanently', onClick: () => purge(j.jobId) },
             h(Icon, { name: 'trash', size: 15 }))));
       const body = open === j.jobId
         ? h('pre', { className: 'mono', style: { fontSize: 11, padding: '8px 14px', margin: 0, maxHeight: 280, overflow: 'auto', background: 'var(--surface)' } }, logBody())

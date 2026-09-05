@@ -16,6 +16,8 @@ from sqlmodel import Session, SQLModel, create_engine
 
 from .config import settings
 
+SCHEMA_VERSION = 1
+
 engine: Engine = create_engine(
     settings.database_url,
     echo=False,
@@ -46,9 +48,17 @@ def init_db() -> None:
     # Import models so they register with SQLModel.metadata before create_all.
     from . import models  # noqa: F401
 
+    with engine.connect() as conn:
+        version = conn.exec_driver_sql("PRAGMA user_version").scalar()
+        if version > SCHEMA_VERSION:
+            raise RuntimeError("Database belongs to a newer GoblinDock version; restore a compatible backup before downgrading")
+
     _rename_legacy()   # MUST run before create_all — see docstring
     SQLModel.metadata.create_all(engine)
     _migrate()
+    _backfill_original_plans()
+    with engine.begin() as conn:
+        conn.exec_driver_sql(f"PRAGMA user_version={SCHEMA_VERSION}")
     # The DB file holds Argon2 password hashes, Fernet-encrypted secrets and the
     # plaintext audit log — keep it readable only by the owner.
     if settings.db_path and os.path.exists(settings.db_path):
@@ -97,12 +107,14 @@ def _migrate() -> None:
             ("max_cores", "INTEGER NOT NULL DEFAULT 0"),
             ("max_ram_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("max_disk_gb", "INTEGER NOT NULL DEFAULT 0"),
+            ("disabled", "INTEGER NOT NULL DEFAULT 0"),
         ],
         "audit": [
             ("ip", "TEXT NOT NULL DEFAULT ''"),
         ],
         "users": [
             ("session_epoch", "INTEGER NOT NULL DEFAULT 0"),
+            ("deleted_at", "TIMESTAMP"),
             ("failed_logins", "INTEGER NOT NULL DEFAULT 0"),
             ("locked_until", "TIMESTAMP"),
             ("widget_key_hash", "TEXT"),
@@ -116,13 +128,23 @@ def _migrate() -> None:
             ("network_id", "INTEGER"),
         ],
         "deployments": [
-            ("deploy_inputs_json", "TEXT NOT NULL DEFAULT '{}'"),
+            ("identity_state", "TEXT NOT NULL DEFAULT ''"),
+            ("deploy_inputs_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("original_execution_plan_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("original_context_enc", "TEXT NOT NULL DEFAULT ''"),
             ("root_password_enc", "TEXT NOT NULL DEFAULT ''"),
             ("cred_user", "TEXT NOT NULL DEFAULT ''"),
+            ("cleanup_last_attempt_at", "TIMESTAMP"),
+            ("cleanup_origin", "TEXT"),
         ],
         "jobs": [
             ("dismissed", "INTEGER NOT NULL DEFAULT 0"),
             ("dismissed_at", "TIMESTAMP"),
+            ("execution_plan_enc", "TEXT NOT NULL DEFAULT ''"),
+            ("create_state", "TEXT NOT NULL DEFAULT ''"),
+            ("remote_task", "TEXT NOT NULL DEFAULT ''"),
+            ("remote_node", "TEXT NOT NULL DEFAULT ''"),
+            ("waiting_since", "TIMESTAMP"),
         ],
     }
     # Columns REMOVED from the models (2026-06 dead-code cleanup). They must be
@@ -135,7 +157,10 @@ def _migrate() -> None:
         # so they MUST go or inserts from the new model crash on upgraded DBs.
         "images": ["audit_log_json", "node", "storage", "base_image_id",
                    "recipe_json", "disk_gb", "progress", "built_at"],
-        "deployments": ["last_action"],
+        # deploy_inputs_json → deploy_inputs_enc (2026-09): ask-on-deploy answers can
+        # hold literal credentials; they are encrypted-then-blanked below before this
+        # drop runs, so no plaintext survives even where DROP COLUMN is unsupported.
+        "deployments": ["last_action", "deploy_inputs_json"],
         "blocks": ["editable"],
         "jobs": ["total_phases"],
         # templates.golden_image_id → superseded by base_image_id + connection_id
@@ -150,6 +175,27 @@ def _migrate() -> None:
             for name, ddl in cols:
                 if name not in existing:
                     conn.exec_driver_sql(f"ALTER TABLE {table} ADD COLUMN {name} {ddl}")
+        # 2026-09: ask-on-deploy answers (may contain literal secrets) move from
+        # plaintext deployments.deploy_inputs_json into Fernet-encrypted
+        # deploy_inputs_enc. Encrypt, blank the plaintext, then the drops below
+        # remove the legacy column entirely (blanking first means no plaintext
+        # survives even on SQLite < 3.35 where DROP COLUMN fails).
+        dep_cols = {row[1] for row in conn.exec_driver_sql("PRAGMA table_info(deployments)")}
+        if "deploy_inputs_json" in dep_cols and "deploy_inputs_enc" in dep_cols:
+            from .security import encrypt
+            rows = conn.exec_driver_sql(
+                "SELECT id, deploy_inputs_json FROM deployments "
+                "WHERE deploy_inputs_json IS NOT NULL AND deploy_inputs_json NOT IN ('', '{}') "
+                "AND (deploy_inputs_enc IS NULL OR deploy_inputs_enc = '')"
+            ).fetchall()
+            for dep_id, plaintext in rows:
+                conn.exec_driver_sql(
+                    "UPDATE deployments SET deploy_inputs_enc = ? WHERE id = ?",
+                    (encrypt(plaintext), dep_id),
+                )
+            if rows:
+                log.info("migrated: %d deployment answer row(s) encrypted", len(rows))
+            conn.exec_driver_sql("UPDATE deployments SET deploy_inputs_json = '{}'")
         for table, names in drops.items():
             existing = {row[1] for row in conn.exec_driver_sql(f"PRAGMA table_info({table})")}
             for name in names:
@@ -195,6 +241,81 @@ def _migrate() -> None:
         except Exception as e:  # noqa: BLE001
             log.warning("could not create uq_ipalloc_net_ip — pre-existing duplicate "
                         "(network_id, ip) rows? IP double-booking backstop is ABSENT: %s", e)
+
+
+def _backfill_original_plans() -> None:
+    """Recover originals only from the first successful deploy admission snapshot.
+
+    No mutable template/block/image rows are consulted. Never use a rebuild job
+    or a later deploy when the earliest successful deploy cannot be verified.
+    Existing or partially populated original snapshots are left untouched.
+    """
+    import json
+    import logging
+    from .execution_plan import open_execution_plan
+    from .security import encrypt
+
+    # Jobs accumulate runtime markers after admission. Copying e.g. ansible_state
+    # into a rebuild would incorrectly skip the saved configuration. Preserve
+    # only the original image, resource and network inputs, without filling gaps
+    # from today's deployment/template defaults.
+    admission_fields = {
+        "src_url", "checksum", "checksum_algorithm", "base_image_id",
+        "cpu", "ram", "disk", "network_mode", "static_ip", "ipconfig0",
+        "vlan", "bridge", "dns",
+    }
+    log = logging.getLogger("goblindock")
+    seen = set()
+    recovered = 0
+    with engine.begin() as conn:
+        candidates = conn.exec_driver_sql(
+            "SELECT d.id, d.owner_id, j.execution_plan_enc, j.context_json "
+            "FROM deployments d JOIN jobs j ON j.deployment_id = d.id "
+            "WHERE COALESCE(d.original_execution_plan_enc, '') = '' "
+            "AND COALESCE(d.original_context_enc, '') = '' "
+            "AND j.type = 'deploy' AND j.status = 'succeeded' "
+            "ORDER BY d.id, j.created_at, j.id"
+        ).fetchall()
+        for dep_id, owner_id, ciphertext, context_json in candidates:
+            if dep_id in seen:
+                continue
+            seen.add(dep_id)
+            try:
+                plan = open_execution_plan(ciphertext)
+                context = json.loads(context_json)
+                if plan["owner_id"] != owner_id or not isinstance(context, dict):
+                    raise ValueError("snapshot owner or context mismatch")
+                if (not isinstance(context.get("src_url"), str) or not context["src_url"].strip()
+                        or any(type(context.get(key)) is not int or context[key] < 1 for key in ("cpu", "ram", "disk"))
+                        or context.get("network_mode") not in ("dhcp", "static")):
+                    raise ValueError("incomplete admission context")
+                if context["network_mode"] == "static" and any(
+                    not isinstance(context.get(key), str) or not context[key]
+                    for key in ("static_ip", "ipconfig0")
+                ):
+                    raise ValueError("incomplete static network context")
+                if any(key in context and not isinstance(context[key], str) for key in (
+                    "checksum", "checksum_algorithm", "bridge", "dns", "static_ip", "ipconfig0",
+                )):
+                    raise ValueError("invalid admission context")
+                if "base_image_id" in context and (type(context["base_image_id"]) is not int or context["base_image_id"] < 1):
+                    raise ValueError("invalid image identity")
+                if "vlan" in context and (type(context["vlan"]) is not int or not 1 <= context["vlan"] <= 4094):
+                    raise ValueError("invalid VLAN")
+                context = {key: value for key, value in context.items() if key in admission_fields}
+                sealed_context = encrypt(json.dumps(context))
+            except (TypeError, ValueError, KeyError):
+                log.info("original deployment plan unavailable for deployment %s: historical snapshot could not be verified", dep_id)
+                continue
+            conn.exec_driver_sql(
+                "UPDATE deployments SET original_execution_plan_enc = ?, original_context_enc = ? "
+                "WHERE id = ? AND COALESCE(original_execution_plan_enc, '') = '' "
+                "AND COALESCE(original_context_enc, '') = ''",
+                (ciphertext, sealed_context, dep_id),
+            )
+            recovered += 1
+    if recovered:
+        log.info("migrated: %d original deployment plan(s) recovered from successful deploy history", recovered)
 
 
 def get_session() -> Iterator[Session]:

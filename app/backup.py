@@ -16,12 +16,15 @@ from __future__ import annotations
 import logging
 import os
 import sqlite3
+import tempfile
+import threading
 from datetime import datetime, timezone
 from pathlib import Path
 
 from .config import settings
 
 log = logging.getLogger("goblindock")
+_PUBLICATION_LOCK = threading.Lock()
 
 
 def _chmod(path, mode: int) -> None:
@@ -31,6 +34,40 @@ def _chmod(path, mode: int) -> None:
         os.chmod(path, mode)
     except OSError:
         pass
+
+
+def _verify_sqlite_backup(path) -> None:
+    """Reject a snapshot unless SQLite reports one exact successful quick check."""
+    con = sqlite3.connect(str(path))
+    try:
+        result = con.execute("PRAGMA quick_check").fetchall()
+    finally:
+        con.close()
+    if result != [("ok",)]:
+        raise sqlite3.DatabaseError(f"backup quick_check failed: {result!r}")
+
+
+def _flush_file(path) -> None:
+    """Make the completed snapshot durable before it becomes advertised."""
+    with open(path, "r+b") as snapshot:
+        os.fsync(snapshot.fileno())
+
+
+def _flush_directory(path) -> None:
+    """Best-effort persistence of the publication rename (unsupported on Windows)."""
+    fd = None
+    try:
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        fd = os.open(path, flags)
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
 
 # Backups are named so rotation can glob EXACTLY these and never touch the live DB
 # (goblindock.sqlite3 / -wal / -shm) or anything else that shares the directory.
@@ -92,27 +129,47 @@ def backup_now(reason: str = "scheduled") -> Path:
     backup glob because sqlite3's backup writes to its own destination file and we
     only rotate after it closes cleanly.
     """
-    d = backup_dir()
-    d.mkdir(parents=True, exist_ok=True)
-    _chmod(d, 0o700)
-    dest = d / f"{_PREFIX}{_timestamp()}{_SUFFIX}"
+    with _PUBLICATION_LOCK:
+        d = backup_dir()
+        d.mkdir(parents=True, exist_ok=True)
+        _chmod(d, 0o700)
+        dest = d / f"{_PREFIX}{_timestamp()}{_SUFFIX}"
+        fd, temp_name = tempfile.mkstemp(
+            prefix=".goblindock-backup-", suffix=".tmp", dir=d,
+        )
+        os.close(fd)
+        temp = Path(temp_name)
 
-    # Dedicated short-lived connections — NOT the pooled SQLAlchemy engine. A generous
-    # busy_timeout lets the page-by-page copy ride out a concurrent write instead of
-    # raising "database is locked".
-    src = sqlite3.connect(settings.db_path, timeout=30)
-    try:
-        src.execute("PRAGMA busy_timeout=30000")
-        dst = sqlite3.connect(str(dest))
         try:
-            src.backup(dst)
-        finally:
-            dst.close()
-    finally:
-        src.close()
-    _chmod(dest, 0o600)   # snapshot holds password hashes + encrypted secrets + audit log
+            # Dedicated short-lived connections — NOT the pooled SQLAlchemy engine. A
+            # generous busy_timeout lets the page-by-page copy ride out a concurrent
+            # write instead of raising "database is locked".
+            src = sqlite3.connect(settings.db_path, timeout=30)
+            try:
+                src.execute("PRAGMA busy_timeout=30000")
+                dst = sqlite3.connect(str(temp))
+                try:
+                    src.backup(dst)
+                finally:
+                    dst.close()
+            finally:
+                src.close()
 
-    deleted = _rotate(settings.backup_keep)
-    log.info("DB backup (%s) → %s (%d byte) · rotated %d old",
-             reason, dest.name, dest.stat().st_size, deleted)
-    return dest
+            _verify_sqlite_backup(temp)
+            _chmod(temp, 0o600)
+            _flush_file(temp)
+            size = temp.stat().st_size
+            os.replace(temp, dest)
+            _flush_directory(d)
+
+            deleted = _rotate(settings.backup_keep)
+            log.info("DB backup (%s) → %s (%d byte) · rotated %d old",
+                     reason, dest.name, size, deleted)
+            return dest
+        finally:
+            try:
+                temp.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as e:
+                log.warning("backup cleanup could not delete %s: %s", temp.name, e)

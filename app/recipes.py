@@ -19,6 +19,7 @@ from .models import Block
 
 # {{ secrets.NAME }} (encrypted, masked) and {{ variable.NAME }} (plaintext, visible)
 _REF_RE = re.compile(r"\{\{\s*(secrets|variable)\.([A-Za-z0-9_]+)\s*\}\}")
+_DEPLOYER_SECRET_REF_RE = re.compile(r"^\{\{\s*secrets\.[A-Za-z0-9_]+\s*\}\}$")
 
 
 _PLACEHOLDER_RE = re.compile(r"(?P<indent>[^\S\n]*)\{(?P<key>[A-Za-z0-9_]+)\}")
@@ -143,12 +144,175 @@ def mask_secrets(text: str) -> str:
     return _REF_RE.sub(lambda m: f"<{'secret' if m.group(1) == 'secrets' else 'variable'} {m.group(2)}>", text)
 
 
+def is_deployer_secret_ref(value: object) -> bool:
+    """Return true only for one complete ``{{ secrets.NAME }}`` reference."""
+    return isinstance(value, str) and _DEPLOYER_SECRET_REF_RE.fullmatch(value) is not None
+
+
 def load_recipe(recipe_json: str) -> list[dict]:
     try:
         data = json.loads(recipe_json or "[]")
         return data if isinstance(data, list) else []
     except (json.JSONDecodeError, TypeError):
         return []
+
+
+def validate_public_sensitive_inputs(
+    recipe,
+    schemas_by_ref,
+    *,
+    deploy_inputs=None,
+    cross_owner=False,
+    reject_unknown=False,
+) -> None:
+    """Reject author-supplied literals from public/cross-owner sensitive inputs.
+
+    ``schemas_by_ref`` contains immutable schema lists keyed by block reference. During
+    cross-owner admission, a sensitive ask-on-deploy field must have an answer at its
+    exact placement address; the merged recipe value is then deployer-supplied and may
+    be literal. A stored sensitive value may be blank only when that exact field is
+    ask-on-deploy; otherwise it must be a deployer-scoped secret reference. Error
+    messages intentionally contain block/field names only.
+    """
+    schemas_by_ref = schemas_by_ref if isinstance(schemas_by_ref, dict) else {}
+    deploy_inputs = deploy_inputs if isinstance(deploy_inputs, dict) else {}
+    if not isinstance(recipe, list):
+        raise ValueError("recipe is unavailable")
+    for si, section in enumerate(recipe):
+        if not isinstance(section, dict):
+            continue
+        placements = section.get("blocks") or []
+        if not isinstance(placements, list):
+            continue
+        for bi, placed in enumerate(placements):
+            if not isinstance(placed, dict):
+                continue
+            ref = placed.get("ref")
+            schema = schemas_by_ref.get(ref)
+            if not isinstance(ref, str) or not isinstance(schema, list):
+                if reject_unknown:
+                    block_name = ref if isinstance(ref, str) and ref else f"{si}.{bi}"
+                    raise ValueError(f"block {block_name!r} is unavailable")
+                continue
+            sensitive = {
+                field.get("name") for field in schema
+                if isinstance(field, dict)
+                and isinstance(field.get("name"), str)
+                and field.get("type") in ("password", "secret")
+            }
+            if not sensitive:
+                continue
+            inputs = placed.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                inputs = {}
+            asks = {
+                name for name in (placed.get("ask") or [])
+                if isinstance(name, str)
+            }
+            answers = deploy_inputs.get(f"{si}.{bi}") or {}
+            if not isinstance(answers, dict):
+                answers = {}
+            for name in sorted(sensitive):
+                if cross_owner and name in asks:
+                    answer = answers.get(name)
+                    if name not in answers or answer in (None, ""):
+                        raise ValueError(
+                            f"block {ref!r} field {name!r} requires a deploy-time answer"
+                        )
+                    continue
+                value = inputs.get(name)
+                if is_deployer_secret_ref(value):
+                    continue
+                if value in (None, "") and name in asks:
+                    continue
+                raise ValueError(
+                    f"block {ref!r} field {name!r} must use ask-on-deploy "
+                    "or a deployer secret reference"
+                )
+
+
+def reject_cross_owner_hidden_references(recipe, schemas_by_ref, sources_by_ref,
+                                         deploy_inputs=None) -> None:
+    """Fail a cross-owner plan whose author-controlled text carries deployer refs.
+
+    Every ``{{ secrets.NAME }}`` / ``{{ variable.NAME }}`` reference resolves in the
+    DEPLOYER's scope at compile time. The only legitimate cross-owner carriers are a
+    sensitive stored input (exactly one full deployer secret reference, enforced by
+    validate_public_sensitive_inputs) and the deployer's own deploy-time answers.
+    A reference anywhere else — block source templates, non-sensitive schema
+    defaults, non-sensitive stored input values — would silently resolve the
+    deployer's secrets inside author-controlled text that can ship them anywhere
+    (exfiltration primitive), so admission fails closed on any such reference.
+    Error messages intentionally contain block/field names only.
+    """
+    schemas_by_ref = schemas_by_ref if isinstance(schemas_by_ref, dict) else {}
+    sources_by_ref = sources_by_ref if isinstance(sources_by_ref, dict) else {}
+    deploy_inputs = deploy_inputs if isinstance(deploy_inputs, dict) else {}
+
+    def _carries_ref(value) -> bool:
+        if isinstance(value, str):
+            return _REF_RE.search(value) is not None
+        if isinstance(value, list):
+            return any(_carries_ref(item) for item in value)
+        return False
+
+    for ref, sources in sources_by_ref.items():
+        if any(isinstance(text, str) and _REF_RE.search(text) for text in (sources or ())):
+            raise ValueError(
+                f"block {ref!r} source must not reference deployer secrets or variables"
+            )
+    if not isinstance(recipe, list):
+        raise ValueError("recipe is unavailable")
+    for si, section in enumerate(recipe):
+        if not isinstance(section, dict):
+            continue
+        placements = section.get("blocks") or []
+        if not isinstance(placements, list):
+            continue
+        for bi, placed in enumerate(placements):
+            if not isinstance(placed, dict):
+                continue
+            ref = placed.get("ref")
+            schema = schemas_by_ref.get(ref)
+            if not isinstance(ref, str) or not isinstance(schema, list):
+                continue
+            sensitive = {
+                field.get("name") for field in schema
+                if isinstance(field, dict)
+                and isinstance(field.get("name"), str)
+                and field.get("type") in ("password", "secret")
+            }
+            for field in schema:
+                if not isinstance(field, dict):
+                    continue
+                name = field.get("name")
+                if not isinstance(name, str) or name in sensitive:
+                    continue
+                if _carries_ref(field.get("default")):
+                    raise ValueError(
+                        f"block {ref!r} field {name!r} default must not reference "
+                        "deployer secrets or variables"
+                    )
+            asks = {
+                name for name in (placed.get("ask") or [])
+                if isinstance(name, str)
+            }
+            answers = deploy_inputs.get(f"{si}.{bi}") or {}
+            if not isinstance(answers, dict):
+                answers = {}
+            inputs = placed.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                inputs = {}
+            for name, value in inputs.items():
+                if not isinstance(name, str) or name in sensitive:
+                    continue
+                if name in asks and name in answers:
+                    continue  # deployer-supplied answer — their own scope by choice
+                if _carries_ref(value):
+                    raise ValueError(
+                        f"block {ref!r} field {name!r} must not reference "
+                        "deployer secrets or variables"
+                    )
 
 
 def _placed_blocks(recipe):
@@ -164,6 +328,47 @@ def _placed_blocks(recipe):
         for placed in blocks:
             if isinstance(placed, dict):
                 yield placed
+
+
+def ensure_placement_ids(recipe: list[dict]) -> list[dict]:
+    """Copy a recipe, retaining stable placement IDs and assigning missing IDs.
+
+    Positional addresses remain accepted by legacy clients for fresh admission.
+    IDs distinguish repeated uses of the same block and survive reorder/edit.
+    """
+    import uuid
+    out = json.loads(json.dumps(recipe))
+    seen = set()
+    for placed in _placed_blocks(out):
+        pid = placed.get("placementId")
+        if pid is None:
+            pid = "p-" + uuid.uuid4().hex
+            placed["placementId"] = pid
+        if not isinstance(pid, str) or not re.fullmatch(r"[A-Za-z][A-Za-z0-9_-]{0,79}", pid) or pid in seen:
+            raise ValueError("placementId must be a unique identifier")
+        seen.add(pid)
+    return out
+
+
+def positional_deploy_inputs(recipe: list[dict], supplied: dict) -> dict:
+    """Resolve stable IDs to current positions, rejecting ambiguous aliases."""
+    aliases = {}
+    for si, sec in enumerate(recipe):
+        if not isinstance(sec, dict) or not isinstance(sec.get("blocks", []), list):
+            continue
+        for bi, placed in enumerate(sec.get("blocks") or []):
+            if isinstance(placed, dict) and isinstance(placed.get("placementId"), str) and placed["placementId"]:
+                pid = placed["placementId"]
+                if pid in aliases:
+                    raise ValueError("duplicate placementId")
+                aliases[pid] = f"{si}.{bi}"
+    out = {}
+    for addr, answers in supplied.items():
+        resolved = aliases.get(addr, addr)
+        if resolved in out:
+            raise ValueError("duplicate answers for the same placement")
+        out[resolved] = answers
+    return out
 
 
 def ask_map(recipe: list[dict]) -> dict[str, list[str]]:
@@ -193,6 +398,7 @@ def merge_deploy_inputs(recipe: list[dict], overrides: dict) -> list[dict]:
     out = json.loads(json.dumps(recipe))  # deep copy — never hand back the stored object
     if not overrides or not isinstance(overrides, dict):
         return out
+    overrides = positional_deploy_inputs(recipe, overrides)
     allowed = ask_map(recipe)
     for addr, answers in overrides.items():
         names = allowed.get(addr)
@@ -366,6 +572,65 @@ _ALLOWED_INPUT_TYPES = {
 _INPUT_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 
 
+def normalize_input_schema(schema):
+    """Copy an accepted authoring/legacy schema with implicit text types made explicit."""
+    if not isinstance(schema, list):
+        return schema
+    normalized = []
+    for field in schema:
+        if not isinstance(field, dict):
+            normalized.append(field)
+            continue
+        normalized_field = dict(field)
+        if normalized_field.get("type") is None:
+            normalized_field["type"] = "text"
+        normalized.append(normalized_field)
+    return normalized
+
+
+def input_schema_problems(schema, *, require_type=False) -> list[str]:
+    """Return authoritative structural/name/type problems for one input schema."""
+    if not isinstance(schema, list):
+        return ["input schema must be a list of fields"]
+    problems: list[str] = []
+    seen: set[str] = set()
+    for i, field in enumerate(schema):
+        if not isinstance(field, dict):
+            problems.append(f"input field #{i + 1} must be an object")
+            continue
+        name = field.get("name")
+        if not isinstance(name, str) or not name.strip():
+            problems.append(f"input field #{i + 1} is missing a name")
+            continue
+        if not _INPUT_NAME_RE.fullmatch(name):
+            problems.append(
+                f"input name {name!r} must start with a letter/underscore and use "
+                "only letters, digits or underscores"
+            )
+        if name in seen:
+            problems.append(f"duplicate input name {name!r}")
+        seen.add(name)
+        field_type = field.get("type")
+        if field_type is None and require_type:
+            problems.append(f"input {name!r} is missing a type")
+        elif field_type is not None and (not isinstance(field_type, str) or not field_type):
+            problems.append(f"input {name!r} has an invalid type")
+        elif field_type is not None and field_type not in _ALLOWED_INPUT_TYPES:
+            problems.append(f"input {name!r} has unknown type {field_type!r}")
+        if field_type == "select":
+            options = field.get("options")
+            if not isinstance(options, list) or not options:
+                problems.append(f"select input {name!r} needs at least one option")
+            elif any(not isinstance(option, str) or not option.strip()
+                     for option in options):
+                problems.append(f"select input {name!r} options must be non-empty strings")
+            elif len(set(options)) != len(options):
+                problems.append(f"select input {name!r} has duplicate options")
+            elif field.get("default") not in (None, "") and field.get("default") not in options:
+                problems.append(f"select input {name!r} default must be one of its options")
+    return problems
+
+
 def _lint_sample(field: dict):
     """A representative sample value for a schema field, used only to render the
     template during a dry-run (never executed)."""
@@ -405,25 +670,7 @@ def lint_block(phase: str, input_schema, ansible_template: str,
     if not isinstance(schema, list):
         return ["input schema must be a list of fields"]
 
-    seen: set[str] = set()
-    for i, f in enumerate(schema):
-        if not isinstance(f, dict):
-            problems.append(f"input field #{i + 1} must be an object")
-            continue
-        name = f.get("name")
-        if not isinstance(name, str) or not name.strip():
-            problems.append(f"input field #{i + 1} is missing a name")
-            continue
-        if not _INPUT_NAME_RE.fullmatch(name):
-            problems.append(
-                f"input name {name!r} must start with a letter/underscore and use "
-                "only letters, digits or underscores")
-        if name in seen:
-            problems.append(f"duplicate input name {name!r}")
-        seen.add(name)
-        t = f.get("type")
-        if t is not None and t not in _ALLOWED_INPUT_TYPES:
-            problems.append(f"input {name!r} has unknown type {t!r}")
+    problems.extend(input_schema_problems(schema))
 
     phase = "cloudinit" if phase == "cloudinit" else "ansible"
     active_tmpl = cloudinit_template if phase == "cloudinit" else ansible_template

@@ -43,7 +43,11 @@ RUN useradd -r -u 10001 -m -d /home/appuser appuser \
     && chmod +x /usr/local/bin/docker-entrypoint.sh
 USER appuser
 
-ENV HOME=/home/appuser
+# Build identity for the admin Health page (CI passes "<ref>@<sha>"; empty for
+# local builds). ARG after USER keeps it out of every cached layer above.
+ARG GOBLINDOCK_BUILD=""
+ENV HOME=/home/appuser \
+    GOBLINDOCK_BUILD=$GOBLINDOCK_BUILD
 
 VOLUME ["/data"]
 EXPOSE 8080

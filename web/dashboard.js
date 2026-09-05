@@ -3,18 +3,40 @@
   const { useState } = React;
   const Icon = window.Icon;
   const GD = window.GD;
-  const { OSGlyph, StatusBadge, CopyField, Meter, Sparkline, Menu, ConfirmModal, FormModal, Field } = window.UI;
+  const { OSGlyph, StatusBadge, CopyField, Meter, Sparkline, Menu, ConfirmModal,
+          FormModal, Field, isVmLifecycleLocked } = window.UI;
   const h = React.createElement;
+
+  function InventoryNotice({ connections }) {
+    const stale = (connections || []).filter(c => !c.disabled && c.inventory && c.inventory.stale);
+    if (!stale.length) return null;
+    return h('div', { className: 'hint', role: 'status', style: { marginBottom: 14, color: 'var(--warn)' } },
+      stale.map(c => h('div', { key: c.connId }, c.name, ': ', c.inventory.error || 'Inventory check pending',
+        c.inventory.updatedAt ? ' · Showing last known state from ' + new Date(c.inventory.updatedAt).toLocaleString() : ' · No snapshot yet')));
+  }
 
   // Transitional label for the uptime cell while an optimistic power action is in
   // flight (store sets vm._act + status='working') — gives immediate visual feedback
   // instead of the cell sitting at '—'/'offline' until the real Proxmox status lands.
   const _actLabel = (a) => ({ start: 'Starting…', stop: 'Stopping…', restart: 'Restarting…' }[a] || 'Working…');
+  const vmActionable = (vm) => !isVmLifecycleLocked(vm) && vm.status !== 'unknown';
 
   const VIEWS_KEY = 'gd.savedViews';
   function parseTags(s) { return (s || '').split(',').map((t) => t.trim()).filter(Boolean); }
   function loadViews() { try { return JSON.parse(localStorage.getItem(VIEWS_KEY)) || []; } catch (e) { return []; } }
   function saveViews(v) { try { localStorage.setItem(VIEWS_KEY, JSON.stringify(v)); } catch (e) { /* quota/denied */ } }
+
+  function activateVmSurface(event, open) {
+    if (event.target !== event.currentTarget && event.target && event.target.closest) {
+      const nested = event.target.closest('button, a, input, select, textarea');
+      if (nested && (!event.currentTarget.contains || event.currentTarget.contains(nested))) return;
+    }
+    const click = event.type === 'click';
+    const key = event.type === 'keydown' ? event.key : '';
+    if (!click && key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return;
+    if ((key === ' ' || key === 'Spacebar') && event.preventDefault) event.preventDefault();
+    open();
+  }
 
   function VmEditModal({ vm, onClose, onDone }) {
     const [name, setName] = useState(vm.name);
@@ -49,6 +71,7 @@
   }
 
   function ActionCluster({ vm, onAct }) {
+    if (!vmActionable(vm)) return null;
     const running = vm.status === 'running';
     return h('div', { className: 'row', style: { gap: 2, justifyContent: 'flex-end' } },
       running
@@ -61,6 +84,9 @@
           { label: 'Rebuild', icon: 'rebuild', onClick: () => onAct('rebuild', vm), disabled: !vm.templateId, title: 'legacy VM — redeploy from a template' },
           { sep: true },
           { label: 'Delete', icon: 'trash', danger: true, onClick: () => onAct('delete', vm) },
+          { label: 'Clean up (local only)', icon: 'cancel', danger: true,
+            title: 'Remove GoblinDock\'s record without touching Proxmox — for VMs already deleted upstream',
+            onClick: () => onAct('cleanupLocal', vm) },
         ]}, h('button', { className: 'icon-btn', title: 'More' }, h(Icon, { name: 'more', size: 16 }))))
     );
   }
@@ -87,17 +113,24 @@
     });
   }
 
-  function TableView({ vms, go, onAct, sel, toggleSel, allSel, toggleAll }) {
+  function TableView({ vms, go, onAct, sel, toggleSel, allSel, toggleAll, hasEligible }) {
     return h('div', { className: 'card', style: { overflow: 'hidden' } },
-      h('div', { style: { overflowX: 'auto' } },
+      h('div', { className: 'table-scroll' },
         h('table', { className: 'tbl' },
           h('thead', null, h('tr', null,
-            h('th', { style: { width: 34 } }, h(SelBox, { checked: allSel, onToggle: toggleAll, title: 'Select all' })),
+            h('th', { style: { width: 34 } }, hasEligible && h(SelBox, { checked: allSel, onToggle: toggleAll, title: 'Select all' })),
             ['', 'Name', 'IP', 'Lineage', 'Connection', 'CPU', 'RAM', 'Uptime', ''].map((hh, i) =>
               h('th', { key: i, style: i === 0 ? { width: 36 } : null }, hh)))),
           h('tbody', null, vms.map(vm =>
-            h('tr', { key: vm.id, style: { cursor: 'pointer' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
-              h('td', { onClick: (e) => e.stopPropagation() }, h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
+            h('tr', {
+              key: vm.id, className: 'vm-nav-surface', role: 'link', tabIndex: 0,
+              'aria-label': 'Open ' + vm.name,
+              style: { cursor: 'pointer' },
+              onClick: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+              onKeyDown: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+            },
+              h('td', { onClick: (e) => e.stopPropagation() }, vmActionable(vm)
+                && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name })),
               h('td', null, h('span', { className: 'dot ' + vm.status, title: vm.status })),
               h('td', null,
                 h('div', { className: 'mono', style: { fontWeight: 600, fontSize: 13.5 } }, vm.name),
@@ -128,7 +161,7 @@
                   ? h('span', { style: { color: 'var(--accent)' } },
                       h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
                   : vm.uptime),
-              h('td', null, h(ActionCluster, { vm, onAct }))
+              h('td', null, vmActionable(vm) && h(ActionCluster, { vm, onAct }))
             )))
         )
       )
@@ -137,9 +170,15 @@
 
   function CardView({ vms, go, onAct, sel, toggleSel }) {
     return h('div', { style: { display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(310px, 1fr))', gap: 14 } },
-      vms.map(vm => h('div', { key: vm.id, className: 'card card-pad', style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' }, onClick: () => go('vmdetail', { depId: vm.depId }) },
+      vms.map(vm => h('div', {
+        key: vm.id, className: 'card card-pad vm-nav-surface', role: 'link', tabIndex: 0,
+        'aria-label': 'Open ' + vm.name,
+        style: { cursor: 'pointer', display: 'flex', flexDirection: 'column', gap: 13, outline: vmActionable(vm) && sel.has(vm.depId) ? '1.5px solid var(--accent)' : 'none' },
+        onClick: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+        onKeyDown: (event) => activateVmSurface(event, () => go('vmdetail', { depId: vm.depId })),
+      },
         h('div', { className: 'row' },
-          h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
+          vmActionable(vm) && h(SelBox, { checked: sel.has(vm.depId), onToggle: () => toggleSel(vm.depId), title: 'Select ' + vm.name }),
           h('span', { className: 'dot ' + vm.status }),
           h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 15 } }, vm.name),
           h('div', { style: { marginLeft: 'auto' } }, h(StatusBadge, { status: vm.status }))
@@ -165,8 +204,8 @@
           vm.status === 'working'
             ? h('span', { className: 'hint mono', style: { fontSize: 11, color: 'var(--accent)' } },
                 h('span', { className: 'dot working', style: { marginRight: 5 } }), _actLabel(vm._act))
-            : h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : 'offline'),
-          h('div', { style: { marginLeft: 'auto' } }, h(ActionCluster, { vm, onAct }))
+            : h('span', { className: 'hint mono', style: { fontSize: 11 } }, vm.status === 'running' ? '↑ ' + vm.uptime : vm.status === 'unknown' ? 'status unavailable' : 'offline'),
+          h('div', { style: { marginLeft: 'auto' } }, vmActionable(vm) && h(ActionCluster, { vm, onAct }))
         )
       ))
     );
@@ -248,19 +287,28 @@
     if (q) vms = vms.filter(v => (v.name + v.ip + v.template + (v.tags || '')).toLowerCase().includes(q.toLowerCase()));
 
     // ---- selection ----
-    const toggleSel = (depId) => setSel((prev) => { const n = new Set(prev); if (n.has(depId)) n.delete(depId); else n.add(depId); return n; });
-    const clearSel = () => setSel(new Set());
-    const allSel = vms.length > 0 && vms.every(v => sel.has(v.depId));
-    const toggleAll = () => setSel((prev) => {
+    const toggleSel = (depId) => setSel((prev) => {
       const n = new Set(prev);
-      if (vms.every(v => n.has(v.depId))) vms.forEach(v => n.delete(v.depId));
-      else vms.forEach(v => n.add(v.depId));
+      const vm = GD.VMS.find((candidate) => candidate.depId === depId);
+      if (n.has(depId) || !vmActionable(vm)) n.delete(depId);
+      else if (vm) n.add(depId);
       return n;
     });
-    const selectedVms = () => GD.VMS.filter(v => sel.has(v.depId));
+    const clearSel = () => setSel(new Set());
+    const eligibleVms = vms.filter(vmActionable);
+    const allSel = eligibleVms.length > 0 && eligibleVms.every(v => sel.has(v.depId));
+    const toggleAll = () => setSel((prev) => {
+      const n = new Set(prev);
+      if (eligibleVms.every(v => n.has(v.depId))) eligibleVms.forEach(v => n.delete(v.depId));
+      else eligibleVms.forEach(v => n.add(v.depId));
+      return n;
+    });
+    const selectedVms = () => GD.VMS.filter(v => sel.has(v.depId) && vmActionable(v));
+    const selectedCount = selectedVms().length;
 
     const onAct = async (action, vm) => {
-      if (action === 'delete' || action === 'rebuild') { setConfirm({ action, vm }); return; }
+      if (!vmActionable(vm)) return;
+      if (action === 'delete' || action === 'rebuild' || action === 'cleanupLocal') { setConfirm({ action, vm }); return; }
       if (action === 'edit') { setEdit(vm); return; }
       if (action === 'start' || action === 'stop' || action === 'restart') {
         window.GDStore.vmAction(vm.depId, action).catch(() => {});
@@ -319,6 +367,7 @@
           h(Icon, { name: 'plus', size: 16 }), 'Deploy VM')
       ),
 
+      h(InventoryNotice, { connections: GD.CONNECTIONS }),
       h('div', { className: 'row wrap', style: { marginBottom: 16, gap: 10 } },
         h('div', { className: 'seg' },
           h('button', { className: scope === 'mine' ? 'active' : '', onClick: () => setScope('mine') }, 'My VMs'),
@@ -358,8 +407,8 @@
       ),
 
       // ---- bulk action bar (appears when something is selected) ----
-      sel.size > 0 && h('div', { className: 'card card-pad', style: { marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', borderColor: 'var(--accent)' } },
-        h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, sel.size, ' selected'),
+      selectedCount > 0 && h('div', { className: 'card card-pad', style: { marginBottom: 14, display: 'flex', alignItems: 'center', gap: 8, flexWrap: 'wrap', borderColor: 'var(--accent)' } },
+        h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 13 } }, selectedCount, ' selected'),
         h('div', { className: 'spacer' }),
         h('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('start') }, h(Icon, { name: 'play', size: 14 }), 'Start'),
         h('button', { className: 'btn sm', disabled: bulkBusy, onClick: () => bulk('stop') }, h(Icon, { name: 'stop', size: 14 }), 'Stop'),
@@ -376,24 +425,39 @@
                 h('p', null, 'Try clearing the filters above.')))
             : h(FirstRunChecklist, { go }))
         : view === 'table'
-          ? h(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll })
+          ? h(TableView, { vms, go, onAct, sel, toggleSel, allSel, toggleAll, hasEligible: eligibleVms.length > 0 })
           : h(CardView, { vms, go, onAct, sel, toggleSel }),
 
-      confirm && h(ConfirmModal, {
+      confirm && confirm.action === 'rebuild' && h(window.RebuildModal, {
+        depId: confirm.vm.depId, name: confirm.vm.name, go, onClose: () => setConfirm(null),
+      }),
+      confirm && confirm.action !== 'rebuild' && h(ConfirmModal, {
         onClose: () => setConfirm(null),
-        tone: confirm.action === 'delete' ? 'danger' : 'accent',
-        icon: confirm.action === 'delete' ? 'trash' : 'rebuild',
-        title: confirm.action === 'delete' ? 'Delete ' + confirm.vm.name + '?' : 'Rebuild ' + confirm.vm.name + '?',
+        tone: confirm.action === 'rebuild' ? 'accent' : 'danger',
+        icon: confirm.action === 'delete' ? 'trash' : confirm.action === 'cleanupLocal' ? 'warn' : 'rebuild',
+        title: confirm.action === 'delete' ? 'Delete ' + confirm.vm.name + '?'
+          : confirm.action === 'cleanupLocal' ? 'Clean up ' + confirm.vm.name + ' locally?'
+          : 'Rebuild ' + confirm.vm.name + '?',
         body: confirm.action === 'delete'
           ? 'This destroys the VM and its disk on ' + confirm.vm.conn + '. The IP ' + confirm.vm.ip + ' returns to the pool. This cannot be undone.'
-          : 'Re-clones from image ' + confirm.vm.image + ', keeping the name and IP (' + confirm.vm.ip + '). Anything written on disk is lost.',
-        confirmLabel: confirm.action === 'delete' ? 'Delete VM' : 'Rebuild',
+          : confirm.action === 'cleanupLocal'
+            ? 'Removes only GoblinDock\'s record of this VM — NOTHING is deleted in Proxmox. Meant for a VM already deleted upstream (or stranded on a disabled/unreachable source). If the VM still exists on the node it keeps running unmanaged; GoblinDock refuses the cleanup if it can confirm the VM is still there.'
+            : 'Re-clones from image ' + confirm.vm.image + ', keeping the name and IP (' + confirm.vm.ip + '). Anything written on disk is lost.',
+        confirmLabel: confirm.action === 'delete' ? 'Delete VM'
+          : confirm.action === 'cleanupLocal' ? 'Remove local record' : 'Rebuild',
         onConfirm: async () => {
           // toast + rethrow: ConfirmModal stays open for retry when the call fails
           try {
-            if (confirm.action === 'rebuild') {
-              const r = await window.API.vmRebuild(confirm.vm.depId);
-              go('job', { jobId: r.jobId });
+            if (confirm.action === 'cleanupLocal') {
+              const r = await window.API.vmCleanupLocal(confirm.vm.depId);
+              // drop the row NOW — the next /state fetch can be seconds away when
+              // the VM's Proxmox is unreachable, and an in-flight stale response
+              // must not resurrect it (removeVm tombstones + fresh refetch)
+              window.GDStore.removeVm(confirm.vm.depId);
+              window.GDStore.toast(r.verified
+                ? confirm.vm.name + ' removed (VM confirmed absent in Proxmox)'
+                : confirm.vm.name + ' removed — upstream could not be verified', r.verified ? 'ok' : 'warn');
+              window.GDStore.refresh({ fresh: true }).catch(() => {});
             } else {
               const r = await window.API.vmDestroy(confirm.vm.depId);
               window.GDStore.toast('Destroying ' + confirm.vm.name, 'warn');
@@ -405,9 +469,9 @@
 
       bulkDel && h(ConfirmModal, {
         onClose: () => setBulkDel(false), tone: 'danger', icon: 'trash',
-        title: 'Destroy ' + sel.size + ' VM' + (sel.size === 1 ? '' : 's') + '?',
-        body: 'This destroys ' + sel.size + ' VM' + (sel.size === 1 ? '' : 's') + ' and their disks, returning their IPs to the pool. This cannot be undone.',
-        confirmLabel: 'Destroy ' + sel.size,
+        title: 'Destroy ' + selectedCount + ' VM' + (selectedCount === 1 ? '' : 's') + '?',
+        body: 'This destroys ' + selectedCount + ' VM' + (selectedCount === 1 ? '' : 's') + ' and their disks, returning their IPs to the pool. This cannot be undone.',
+        confirmLabel: 'Destroy ' + selectedCount,
         onConfirm: bulkDelete,
       }),
 
@@ -420,4 +484,5 @@
   }
 
   window.Dashboard = Dashboard;
+  window.InventoryNotice = InventoryNotice;
 })();

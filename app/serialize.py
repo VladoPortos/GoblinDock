@@ -28,9 +28,11 @@ from .models import (
     User,
     ensure_utc,
 )
+from .network_pool import StaticPoolError, parse_static_pool
 from .proxmox import Proxmox
 from .recipes import recipe_block_chips
 from .security import mask
+from .inventory import freshness
 
 # cache live status briefly to avoid hammering Proxmox on every poll. Keyed by
 # (connection_id, node, vmid) — NOT vmid alone — so two Proxmox clusters that
@@ -38,9 +40,11 @@ from .security import mask
 _status_cache: dict[tuple, tuple[float, dict]] = {}
 _STATUS_TTL = 3.0
 
-# DB job status → the 3-state status vocabulary the UI renders (chips, meters).
-_UI_STATUS = {"running": "working", "queued": "working", "succeeded": "done",
-              "failed": "error", "canceled": "error"}
+# DB job status → the status vocabulary the UI renders (chips, meters).
+_UI_STATUS = {
+    "running": "working", "queued": "working", "waiting": "working",
+    "succeeded": "done", "failed": "error", "canceled": "canceled",
+}
 
 
 def _fmt_uptime(seconds: int) -> str:
@@ -54,6 +58,20 @@ def _fmt_uptime(seconds: int) -> str:
     if h:
         return f"{h}h {m}m"
     return f"{m}m"
+
+
+def _unknown_live_status() -> dict:
+    return {"status": "unknown", "cpu_pct": 0, "mem": 0, "maxmem": 1, "uptime": 0}
+
+
+def _live_status_from_current(cur: dict) -> dict:
+    return {
+        "status": cur.get("status", "unknown"),
+        "cpu_pct": round(float(cur.get("cpu", 0)) * 100),
+        "mem": cur.get("mem", 0),
+        "maxmem": cur.get("maxmem", 1) or 1,
+        "uptime": cur.get("uptime", 0),
+    }
 
 
 def _rel(dt: Optional[datetime]) -> str:
@@ -80,6 +98,9 @@ def _elapsed(start: Optional[datetime], end: Optional[datetime]) -> str:
 
 
 def _live_status(px: Proxmox, vmid: int, node: str) -> dict:
+    from .inventory import SnapshotProxmox
+    if isinstance(px, SnapshotProxmox):
+        return _live_status_from_current(px.vm_current(vmid, node))
     now = time.time()
     key = (getattr(getattr(px, "conn", None), "id", None), node, vmid)
     cached = _status_cache.get(key)
@@ -87,17 +108,46 @@ def _live_status(px: Proxmox, vmid: int, node: str) -> dict:
         return cached[1]
     try:
         cur = px.vm_current(vmid, node)
-        out = {
-            "status": cur.get("status", "unknown"),
-            "cpu_pct": round(float(cur.get("cpu", 0)) * 100),
-            "mem": cur.get("mem", 0),
-            "maxmem": cur.get("maxmem", 1) or 1,
-            "uptime": cur.get("uptime", 0),
-        }
+        out = _live_status_from_current(cur)
     except Exception:  # noqa: BLE001
-        out = {"status": "unknown", "cpu_pct": 0, "mem": 0, "maxmem": 1, "uptime": 0}
+        out = _unknown_live_status()
     _status_cache[key] = (now, out)
     return out
+
+
+def prime_live_statuses(px: Optional[Proxmox], conn_id: int, node: str,
+                        vmids: list[int], online: bool) -> None:
+    """Prime one connection/node's VM status cache with one inventory request.
+
+    `/state` may contain many VMs on the same node. Fetching `status/current` for each
+    makes an offline node cost N full network timeouts. A node inventory contains the
+    dashboard fields we need, so use it once and explicitly cache `unknown` on failure.
+    """
+    now = time.time()
+    wanted = list(dict.fromkeys(int(vmid) for vmid in vmids))
+    if not wanted:
+        return
+    keys = [(conn_id, node, vmid) for vmid in wanted]
+    if all((cached := _status_cache.get(key)) and now - cached[0] < _STATUS_TTL
+           for key in keys):
+        return
+    if not online or px is None:
+        for key in keys:
+            _status_cache[key] = (now, _unknown_live_status())
+        return
+    try:
+        inventory = px.list_qemu(node)
+        by_vmid = {
+            int(item["vmid"]): item for item in (inventory or [])
+            if isinstance(item, dict) and item.get("vmid") is not None
+        }
+    except Exception:  # noqa: BLE001
+        by_vmid = {}
+    for key, vmid in zip(keys, wanted):
+        cur = by_vmid.get(vmid)
+        _status_cache[key] = (
+            now, _live_status_from_current(cur) if cur else _unknown_live_status(),
+        )
 
 
 def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: dict,
@@ -120,11 +170,11 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     cpu_pct = 0
     ram_pct = 0
     uptime = "—"
-    if conn and dep.vmid and dep.status not in ("working", "error"):
+    if conn and dep.vmid and dep.status not in ("working", "error", "cleanup_pending"):
         px = px_cache.get(conn.id)
         if px:
             live = _live_status(px, dep.vmid, dep.node or conn.node)
-            status = "running" if live["status"] == "running" else "stopped"
+            status = live["status"] if live["status"] in ("running", "stopped") else "unknown"
             cpu_pct = live["cpu_pct"]
             ram_pct = round(live["mem"] / max(1, live["maxmem"]) * 100)
             uptime = _fmt_uptime(live["uptime"]) if status == "running" else "—"
@@ -137,9 +187,9 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
     else:
         active = session.exec(
             select(Job).where(Job.deployment_id == dep.id,
-                              Job.status.in_(["queued", "running"])).order_by(Job.id.desc())
+                              Job.status.in_(["queued", "running", "waiting"])).order_by(Job.id.desc())
         ).first()
-    if active:
+    if active and dep.status != "cleanup_pending":
         steps = session.exec(select(JobStep).where(JobStep.job_id == active.id)).all()
         done = sum(1 for s in steps if s.state in ("done", "skipped"))
         label = {"deploy": "Deploying", "rebuild": "Rebuilding", "destroy": "Destroying"}.get(active.type, "Working")
@@ -147,13 +197,26 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
                     "phase": active.phase or "", "pct": active.pct or 0}
         status = "working"
 
+    display_ip = dep.ip
+    if dep.status == "cleanup_pending" and not display_ip:
+        allocation = session.exec(
+            select(IpAllocation).where(
+                IpAllocation.deployment_id == dep.id,
+                IpAllocation.state == "reserved",
+            ).order_by(IpAllocation.id)
+        ).first()
+        display_ip = allocation.ip if allocation else ""
+
     owner = users.get(dep.owner_id)
     return {
         "id": f"vm-{dep.id}",
+        "inventory": freshness(
+            getattr(px_cache.get(conn.id), "snapshot", {}) if conn else {}),
         "depId": dep.id,
+        "vmid": dep.vmid,
         "name": dep.name,
         "status": status,
-        "ip": dep.ip or "—",
+        "ip": display_ip or "—",
         "owner": "you" if dep.owner_id == me.id else "other",
         "ownerName": owner.name if owner else "—",
         "conn": conn.name if conn else "—",
@@ -167,7 +230,7 @@ def vm_dict(session: Session, dep: Deployment, me: User, px_cache: dict, users: 
         "tags": dep.tags or "",
         "notes": dep.notes or "",
         **({"job": job_chip} if job_chip else {}),
-        **({"err": dep.error} if dep.status == "error" and dep.error else {}),
+        **({"err": dep.error} if dep.status in ("error", "cleanup_pending") and dep.error else {}),
     }
 
 
@@ -181,6 +244,7 @@ def job_brief(session: Session, job: Job) -> dict:
         "title": job.title,
         "type": job.type,
         "status": _UI_STATUS.get(job.status, "working"),
+        "rawStatus": job.status,
         "pct": job.pct,
         "phase": job.phase or job.status.title(),
         "elapsed": _elapsed(job.started_at, job.finished_at),
@@ -243,16 +307,22 @@ def job_detail(session: Session, job: Job, include_log: bool = True,
     }
 
 
-def base_image_dict(img: Image) -> dict:
-    return {
+def base_image_dict(img: Image, *, include_source_url: bool = False,
+                    can_delete: bool = False) -> dict:
+    from .image_cache import is_pinned
+    out = {
         "id": f"img-{img.id}",
         "imgId": img.id,
         "name": img.name,
         "os": img.os_family,
         "size": img.size or "—",
-        "checksum": img.checksum or "cloud-init ready",
-        "source_url": img.source_url,
+        "checksum": img.checksum or "",
+        "canDelete": can_delete is True,
+        "pinned": is_pinned(img),
     }
+    if include_source_url:
+        out["source_url"] = img.source_url
+    return out
 
 
 def _mask_recipe_passwords(session: Session, recipe: list) -> list:
@@ -265,26 +335,65 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
     which redacts both types from job logs."""
     refs = {b.get("ref") for sec in recipe if isinstance(sec, dict)
             for b in (sec.get("blocks") or []) if isinstance(b, dict) and b.get("ref")}
-    if not refs:
-        return recipe
-    blocks = {b.key: b for b in session.exec(select(Block).where(Block.key.in_(refs))).all()}
+    blocks = ({b.key: b for b in session.exec(
+        select(Block).where(Block.key.in_(refs))).all()} if refs else {})
     masked = json.loads(json.dumps(recipe))
     for sec in masked:
         for b in (sec.get("blocks") or []) if isinstance(sec, dict) else []:
             if not isinstance(b, dict):
                 continue
+            # Never trust presentation metadata embedded in recipe_json. For a public
+            # cross-owner view it is rebuilt from the authoritative Block schema below.
+            b.pop("askSchema", None)
             blk = blocks.get(b.get("ref"))
-            if not blk:
+            inputs = b.get("inputs") or {}
+            if not isinstance(inputs, dict):
+                inputs = {}
+            schema = None
+            if blk:
+                try:
+                    parsed = json.loads(blk.input_schema_json or "[]")
+                    if isinstance(parsed, list):
+                        schema = parsed
+                except (json.JSONDecodeError, TypeError):
+                    pass
+            if schema is None:
+                for name, value in inputs.items():
+                    if value:
+                        inputs[name] = "********"
+                b["inputs"] = inputs
                 continue
-            try:
-                schema = json.loads(blk.input_schema_json or "[]")
-            except (json.JSONDecodeError, TypeError):
-                continue
+            asks = {
+                name for name in (b.get("ask") or [])
+                if isinstance(name, str)
+            }
+            ask_schema = []
+            for field in schema:
+                if not isinstance(field, dict) or field.get("name") not in asks:
+                    continue
+                descriptor = {
+                    "name": field["name"],
+                    "type": field.get("type") or "text",
+                }
+                if isinstance(field.get("label"), str):
+                    descriptor["label"] = field["label"]
+                if isinstance(field.get("optional"), bool):
+                    descriptor["optional"] = field["optional"]
+                if (descriptor["type"] == "select"
+                        and isinstance(field.get("options"), list)
+                        and all(isinstance(option, str) for option in field["options"])):
+                    descriptor["options"] = list(field["options"])
+                ask_schema.append(descriptor)
+            if ask_schema:
+                b["askSchema"] = ask_schema
             pw_fields = {f.get("name") for f in schema
                          if isinstance(f, dict) and f.get("type") in ("password", "secret")}
-            inputs = b.get("inputs") or {}
             for name in pw_fields:
-                if inputs.get(name):
+                if name in asks:
+                    # A display mask is not a credential and must never be posted back
+                    # as one. Cross-owner sensitive asks always start blank.
+                    inputs[name] = ""
+                elif inputs.get(name):
                     inputs[name] = "********"
             b["inputs"] = inputs
     return masked
@@ -292,6 +401,7 @@ def _mask_recipe_passwords(session: Session, recipe: list) -> list:
 
 def template_dict(session: Session, t: Template, viewer: Optional["User"] = None) -> dict:
     used = session.exec(select(Deployment).where(Deployment.template_id == t.id)).all()
+    can_edit = viewer is not None and (viewer.role == "admin" or t.owner_id == viewer.id)
     recipe = json.loads(t.recipe_json or "[]")
     # Mask literal password-field values for anyone who isn't the owner or an admin —
     # public templates are visible to every authenticated user via /api/state.
@@ -301,6 +411,10 @@ def template_dict(session: Session, t: Template, viewer: Optional["User"] = None
     if base and base.kind != "base":
         base = None
     conn = session.get(Connection, t.connection_id) if t.connection_id else None
+    network = session.get(Network, t.network_id) if t.network_id else None
+    network_matches = not t.network_id or bool(
+        network and conn and network.connection_id == conn.id
+    )
     return {
         "id": f"t-{t.id}",
         "templateId": t.id,
@@ -311,6 +425,8 @@ def template_dict(session: Session, t: Template, viewer: Optional["User"] = None
         "mem": t.default_ram,
         "disk": t.default_disk,
         "used": len(used),
+        "canEdit": can_edit,
+        "canDelete": can_edit and not used,
         "public": t.public,
         "blocks": recipe_block_chips(recipe),
         "recipe": recipe,
@@ -318,12 +434,12 @@ def template_dict(session: Session, t: Template, viewer: Optional["User"] = None
         "connectionId": t.connection_id,
         "networkId": t.network_id,
         "base": base.name if base else None,
-        "deployable": bool(base and conn),
+        "deployable": bool(base and conn and network_matches),
         "location": ((conn.name + (" · " + conn.node if conn.node else "")) if conn else None),
     }
 
 
-def block_dict(b: Block) -> dict:
+def block_dict(b: Block, *, can_delete: bool = False) -> dict:
     return {
         "id": b.key,
         "key": b.key,
@@ -337,6 +453,7 @@ def block_dict(b: Block) -> dict:
         "ansible": b.ansible_template,
         "cloudinit": b.cloudinit_template,
         "schema": json.loads(b.input_schema_json or "[]"),
+        "canDelete": can_delete is True,
     }
 
 
@@ -367,29 +484,34 @@ def variable_dict(v: Variable, users: dict) -> dict:
 
 def connection_dict(session: Session, c: Connection, status: Optional[dict] = None) -> dict:
     vms = session.exec(select(Deployment).where(Deployment.connection_id == c.id)).all()
+    safe_port = c.port if 1 <= c.port <= 65535 else 8006
     return {
         "id": f"c-{c.id}",
         "connId": c.id,
         "name": c.name,
-        "url": f"https://{c.host}:{c.port}",
+        "url": f"https://{c.host}:{safe_port}",
+        "disabled": bool(c.disabled),
         "status": (status or {}).get("status", "unknown"),
+        "inventory": freshness(status or {}),
         "version": (status or {}).get("version", "—"),
         "storage": c.storage or "—",
         "bridge": c.bridge,
         "vms": len(vms),
         "node": c.node,
-        # round-trippable config for the edit form (token secret is NEVER sent; the
-        # SSH/TLS settings are env/API-managed and not exposed to the form)
+        # round-trippable config for the admin edit form (token secret is NEVER sent)
         "host": c.host,
-        "port": c.port,
+        "port": safe_port,
         "tokenId": c.token_id,
         "verifyTls": c.verify_tls,
         "isoStorage": c.iso_storage,
         "snippetStorage": c.snippet_storage,
+        "sshHost": c.ssh_host,
+        "sshUser": c.ssh_user,
+        "sshKeyPath": c.ssh_key_path,
         # per-target VM ceilings — authoritative; 0 = unlimited (no per-VM cap)
-        "maxCores": c.max_cores,
-        "maxRamGb": c.max_ram_mb // 1024,
-        "maxDiskGb": c.max_disk_gb,
+        "maxCores": min(max(0, c.max_cores), 256),
+        "maxRamGb": min(max(0, c.max_ram_mb // 1024), 1024),
+        "maxDiskGb": min(max(0, c.max_disk_gb), 16384),
     }
 
 
@@ -403,25 +525,28 @@ def connection_public_dict(session: Session, c: Connection, status: Optional[dic
         "id": f"c-{c.id}",
         "connId": c.id,
         "name": c.name,
+        "disabled": bool(c.disabled),
         "status": (status or {}).get("status", "unknown"),
+        "inventory": freshness(status or {}),
         "version": (status or {}).get("version", "—"),
         "node": c.node,
         "vms": len(vms),
         # per-target VM ceilings (used to size the deploy/build sliders); 0 = unlimited
-        "maxCores": c.max_cores,
-        "maxRamGb": c.max_ram_mb // 1024,
-        "maxDiskGb": c.max_disk_gb,
+        "maxCores": min(max(0, c.max_cores), 256),
+        "maxRamGb": min(max(0, c.max_ram_mb // 1024), 1024),
+        "maxDiskGb": min(max(0, c.max_disk_gb), 16384),
     }
 
 
 def _pool_total(n: Network) -> int:
-    import ipaddress
-    if n.mode != "static" or not n.range_start:
+    if n.mode != "static":
         return 254
     try:
-        return int(ipaddress.ip_address(n.range_end or n.range_start)) - int(ipaddress.ip_address(n.range_start)) + 1
-    except ValueError:
-        return 254
+        return parse_static_pool(
+            n.subnet_cidr, n.range_start, n.range_end, n.gateway,
+        ).usable_total
+    except StaticPoolError:
+        return 0
 
 
 def network_dict(session: Session, n: Network, conn_name: dict, public: bool = False) -> dict:

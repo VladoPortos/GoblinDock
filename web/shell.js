@@ -8,6 +8,7 @@
   const NAV = [
     { group: 'Operate', items: [
       { id: 'dashboard', label: 'Dashboard', icon: 'server' },
+      { id: 'recovery', label: 'Recovery', icon: 'warn' },
     ]},
     { group: 'Build', items: [
       { id: 'templates', label: 'Templates',   icon: 'template' },
@@ -22,39 +23,100 @@
     ]},
   ];
 
-  function Sidebar({ route, go, collapsed, setCollapsed }) {
-    return h('aside', { className: 'sidebar' + (collapsed ? ' collapsed' : '') },
+  function mobileNavKeydown(event, closeMobileNav) {
+    if (event.key === 'Escape') closeMobileNav(true);
+  }
+
+  function activateNavigationSurface(event, open) {
+    if (event.target !== event.currentTarget && event.target && event.target.closest) {
+      const nested = event.target.closest('button, a, input, select, textarea');
+      if (nested && (!event.currentTarget.contains || event.currentTarget.contains(nested))) return;
+    }
+    const click = event.type === 'click';
+    const key = event.type === 'keydown' ? event.key : '';
+    if (!click && key !== 'Enter' && key !== ' ' && key !== 'Spacebar') return;
+    if ((key === ' ' || key === 'Spacebar') && event.preventDefault) event.preventDefault();
+    open();
+  }
+
+  function activityFocusable(drawer) {
+    return drawer ? Array.from(drawer.querySelectorAll(
+      'button:not([disabled]), a[href], input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])',
+    )) : [];
+  }
+
+  function activityDialogKeydown(event, drawer, close) {
+    if (event.key === 'Escape') {
+      event.preventDefault();
+      event.stopPropagation();
+      close();
+      return;
+    }
+    if (event.key !== 'Tab') return;
+    const focusable = activityFocusable(drawer);
+    if (!focusable.length) return;
+    const first = focusable[0];
+    const last = focusable[focusable.length - 1];
+    if (event.shiftKey && document.activeElement === first) {
+      event.preventDefault();
+      last.focus();
+    } else if (!event.shiftKey && document.activeElement === last) {
+      event.preventDefault();
+      first.focus();
+    }
+  }
+
+  function Sidebar({ route, go, collapsed, setCollapsed, mobileOpen = false }) {
+    const presentationCollapsed = collapsed && !mobileOpen;
+    return h('aside', {
+      id: 'primary-navigation',
+      'aria-label': 'Primary navigation',
+      className: 'sidebar' + (presentationCollapsed ? ' collapsed' : '') + (mobileOpen ? ' mobile-open' : ''),
+    },
       h('div', { className: 'brand' },
         h('img', { src: 'assets/goblindock-logo.png', alt: 'GoblinDock',
           style: { width: 34, height: 34, objectFit: 'contain', flexShrink: 0, filter: 'drop-shadow(0 1px 3px rgba(0,0,0,.4))' } }),
-        !collapsed && h('span', { className: 'brand-word' }, 'Goblin', h('b', null, 'Dock'))
+        !presentationCollapsed && h('span', { className: 'brand-word' }, 'Goblin', h('b', null, 'Dock'))
       ),
       h('nav', { className: 'nav' },
         NAV.map(sec => h(React.Fragment, { key: sec.group },
-          !collapsed && h('div', { className: 'nav-label' }, sec.group),
-          collapsed && h('div', { style: { height: 10 } }),
-          sec.items.filter(it => !it.admin || (GD.me && GD.me.isAdmin)).map(it => h('div', {
+          !presentationCollapsed && h('div', { className: 'nav-label' }, sec.group),
+          presentationCollapsed && h('div', { style: { height: 10 } }),
+          sec.items.filter(it => !it.admin || (GD.me && GD.me.isAdmin)).map(it => h('button', {
             key: it.id,
+            type: 'button',
             className: 'nav-item' + (route === it.id ? ' active' : ''),
             onClick: () => go(it.id),
-            title: collapsed ? it.label : null,
+            title: presentationCollapsed ? it.label : null,
+            'aria-label': presentationCollapsed ? it.label : undefined,
+            'aria-current': route === it.id ? 'page' : undefined,
           },
             h(Icon, { name: it.icon, size: 18 }),
-            !collapsed && h('span', null, it.label),
-            !collapsed && it.id === 'dashboard' && (GD.VMS || []).length > 0 && h('span', { className: 'badge count', style: { fontSize: 11, fontWeight: 700, fontFamily: 'system-ui, -apple-system, sans-serif' } }, GD.VMS.length)
+            !presentationCollapsed && h('span', null, it.label),
+            !presentationCollapsed && it.id === 'dashboard' && (GD.VMS || []).length > 0 && h('span', { className: 'badge count', style: { fontSize: 11, fontWeight: 700, fontFamily: 'system-ui, -apple-system, sans-serif' } }, GD.VMS.length)
           ))
         ))
       ),
       h('div', { className: 'sidebar-foot' },
-        h('div', { className: 'nav-item', onClick: () => setCollapsed(c => !c), title: 'Collapse' },
+        h('button', { type: 'button', className: 'nav-item', onClick: () => setCollapsed(c => !c),
+          title: presentationCollapsed ? 'Expand' : 'Collapse', 'aria-label': presentationCollapsed ? 'Expand' : 'Collapse' },
           h(Icon, { name: 'collapse', size: 18 }),
-          !collapsed && h('span', null, 'Collapse')
+          !presentationCollapsed && h('span', null, 'Collapse')
         )
       )
     );
   }
 
-  const TITLES = {
+  function SidebarScrim({ onClose }) {
+    return h('button', {
+      type: 'button', className: 'sidebar-scrim',
+      'aria-label': 'Close navigation', 'aria-controls': 'primary-navigation',
+      onClick: () => onClose(true),
+    });
+  }
+
+    const TITLES = {
+      recovery: ['Operate', 'Recovery'],
     dashboard: ['Operate', 'Virtual Machines'], vmdetail: ['Operate', 'Virtual Machine'],
     job: ['Operate', 'Job Progress'],
     templates: ['Build', 'Templates'],
@@ -65,9 +127,15 @@
     settings: ['Manage', 'Settings'], profile: ['Account', 'Profile'],
   };
 
-  function TopBar({ route, go, theme, setTheme, openDrawer }) {
+  function TopBar({ route, go, theme, setTheme, openDrawer, mobileNavOpen = false,
+    mobileNavToggleRef, openMobileNav }) {
     const t = TITLES[route] || ['', route];
     return h('header', { className: 'topbar' },
+      h('button', {
+        ref: mobileNavToggleRef, type: 'button', className: 'icon-btn mobile-nav-toggle',
+        onClick: openMobileNav, 'aria-label': 'Open navigation',
+        'aria-controls': 'primary-navigation', 'aria-expanded': mobileNavOpen,
+      }, h(Icon, { name: 'menu', size: 18 })),
       h('div', { className: 'crumb' },
         h('span', null, t[0]),
         h(Icon, { name: 'chevronR', size: 14 }),
@@ -78,7 +146,8 @@
           const jobs = GD.JOBS || [];
           const total = jobs.length;
           const anyRunning = jobs.some(j => j.status === 'working');
-          return h('button', { className: 'icon-btn', onClick: openDrawer, title: 'Activity', style: { position: 'relative' } },
+          return h('button', { className: 'icon-btn', onClick: openDrawer, title: 'Activity',
+            'aria-label': 'Activity', 'aria-haspopup': 'dialog', style: { position: 'relative' } },
             h(Icon, { name: 'bell', size: 17 }),
             total > 0 && h('span', {
               style: { position: 'absolute', top: 1, right: 1, minWidth: 15, height: 15, padding: '0 3px',
@@ -91,12 +160,13 @@
         h('div', { style: { width: 1, height: 22, background: 'var(--border)' } }),
         h(Menu, {
           items: [
-            { label: ((GD.me && GD.me.name) || 'Account') + ' · ' + ((GD.me && GD.me.role) || ''), icon: 'user' },
+            { label: ((GD.me && GD.me.name) || 'Account') + ' · ' + ((GD.me && GD.me.role) || ''), icon: 'user', header: true },
             { sep: true },
             { label: 'Profile', icon: 'user', onClick: () => go('profile') },
             { label: 'Sign out', icon: 'logout', onClick: () => window.GDStore.signOut(go) },
           ]
-        }, h('div', { className: 'avatar', title: (GD.me && GD.me.name) || '' }, (GD.me && GD.me.initials) || '··'))
+        }, h('button', { type: 'button', className: 'avatar', title: (GD.me && GD.me.name) || '',
+          'aria-label': 'Account menu', 'aria-haspopup': 'menu' }, (GD.me && GD.me.initials) || '··'))
       )
     );
   }
@@ -104,6 +174,18 @@
   function ActivityDrawer({ onClose, go }) {
     const jobs = GD.JOBS || [];
     const finished = jobs.filter(j => j.status !== 'working').length;
+    const drawerRef = React.useRef(null);
+    const closeRef = React.useRef(null);
+    const openerRef = React.useRef(typeof document !== 'undefined' ? document.activeElement : null);
+    const onCloseRef = React.useRef(onClose);
+    onCloseRef.current = onClose;
+    React.useEffect(() => {
+      if (closeRef.current && typeof closeRef.current.focus === 'function') closeRef.current.focus();
+      const opener = openerRef.current;
+      return () => {
+        if (opener && typeof opener.focus === 'function') opener.focus();
+      };
+    }, []);
     const dismiss = async (e, j) => {
       e.stopPropagation();
       try { await window.API.deleteJob(j.jobId); window.GDStore.refresh().catch(() => {}); }
@@ -117,41 +199,54 @@
       // overlay must sit BELOW the drawer (z 55) so the drawer stays clickable;
       // it only catches clicks OUTSIDE the drawer to close it.
       h('div', { className: 'overlay', style: { background: 'transparent', backdropFilter: 'none', zIndex: 54 }, onClick: onClose }),
-      h('div', { className: 'drawer' },
+      h('div', {
+        ref: drawerRef, className: 'drawer', role: 'dialog', 'aria-modal': true,
+        'aria-labelledby': 'activity-drawer-title',
+        onKeyDown: (event) => activityDialogKeydown(
+          event, drawerRef.current, () => onCloseRef.current(),
+        ),
+      },
         h('div', { className: 'drawer-head' },
           h(Icon, { name: 'activity', size: 17 }),
-          h('span', { className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, 'Activity'),
+          h('span', { id: 'activity-drawer-title', className: 'mono', style: { fontWeight: 700, fontSize: 14 } }, 'Activity'),
           h('span', { className: 'badge accent', style: { marginLeft: 4 } }, jobs.filter(j => j.status === 'working').length, ' running'),
           h('div', { style: { marginLeft: 'auto', display: 'flex', gap: 4 } },
             finished > 0 && h('button', { className: 'btn ghost sm', onClick: clearAll, title: 'Clear finished' },
               h(Icon, { name: 'trash', size: 14 }), 'Clear'),
-            h('button', { className: 'icon-btn', onClick: onClose, 'aria-label': 'Close' },
+            h('button', { ref: closeRef, type: 'button', className: 'icon-btn', onClick: onClose, 'aria-label': 'Close activity' },
               h(Icon, { name: 'x', size: 16 })))
         ),
         h('div', { style: { padding: 12, overflowY: 'auto', flex: 1, display: 'flex', flexDirection: 'column', gap: 8 } },
           jobs.length === 0
             ? h('div', { className: 'hint', style: { textAlign: 'center', padding: 30, fontSize: 12.5 } }, 'No recent activity.')
-            : jobs.map(j => h('div', {
-                key: j.id, className: 'card', style: { padding: 13, cursor: 'pointer', position: 'relative' },
-                onClick: () => { onClose(); go('job', { jobId: j.jobId }); },
-              },
-                h('div', { className: 'row', style: { marginBottom: 9 } },
-                  h('span', { className: 'dot ' + j.status }),
-                  h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, j.title),
-                  h('span', { className: 'mono', style: { marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint)' } }, j.elapsed),
-                  j.status !== 'working' && h('button', { className: 'icon-btn sm', title: 'Dismiss', onClick: (e) => dismiss(e, j) }, h(Icon, { name: 'x', size: 13 }))
-                ),
-                h('div', { className: 'meter ' + (j.status === 'error' ? 'err' : j.status === 'done' ? 'ok' : '') },
-                  h('i', { style: { width: j.pct + '%' } })),
-                h('div', { className: 'row', style: { marginTop: 8, justifyContent: 'space-between' } },
-                  h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.phase),
-                  j.status === 'working' && h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.step, '/', j.total)
-                )
-              ))
+            : jobs.map(j => {
+                const presentation = window.UI.jobPresentation(j.rawStatus);
+                return h('div', {
+                  key: j.id, className: 'card activity-nav-surface', role: 'link', tabIndex: 0,
+                  'aria-label': 'Open ' + j.title,
+                  style: { padding: 13, cursor: 'pointer', position: 'relative' },
+                  onClick: (event) => activateNavigationSurface(event, () => { onClose(); go('job', { jobId: j.jobId }); }),
+                  onKeyDown: (event) => activateNavigationSurface(event, () => { onClose(); go('job', { jobId: j.jobId }); }),
+                },
+                  h('div', { className: 'row', style: { marginBottom: 9 } },
+                    h('span', { className: 'dot ' + presentation.dotClass }),
+                    h('span', { className: 'mono', style: { fontWeight: 600, fontSize: 12.5, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' } }, j.title),
+                    h('span', { className: 'badge ' + presentation.badgeClass }, presentation.label),
+                    h('span', { className: 'mono', style: { marginLeft: 'auto', fontSize: 11, color: 'var(--text-faint)' } }, j.elapsed),
+                    j.status !== 'working' && h('button', { className: 'icon-btn sm', title: 'Dismiss', 'aria-label': 'Dismiss ' + j.title, onClick: (e) => dismiss(e, j) }, h(Icon, { name: 'x', size: 13 }))
+                  ),
+                  h('div', { className: 'meter' + (presentation.failure ? ' err' : j.rawStatus === 'succeeded' ? ' ok' : '') },
+                    h('i', { style: { width: j.pct + '%' } })),
+                  h('div', { className: 'row', style: { marginTop: 8, justifyContent: 'space-between' } },
+                    h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.phase),
+                    j.status === 'working' && h('span', { className: 'hint mono', style: { fontSize: 11 } }, j.step, '/', j.total)
+                  )
+                );
+              })
         )
       )
     );
   }
 
-  window.Shell = { Sidebar, TopBar, ActivityDrawer };
+  window.Shell = { Sidebar, SidebarScrim, TopBar, ActivityDrawer, mobileNavKeydown, activityDialogKeydown };
 })();
