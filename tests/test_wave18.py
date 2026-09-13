@@ -1,13 +1,13 @@
-"""Wave 18 — connection-authoritative per-VM resource ceilings.
+"""Wave 18 — connection/global per-VM resource ceilings.
 
-The connection's "max per VM" limits (Settings → Proxmox connection) are the single
-authoritative ceiling for CPU, RAM and disk. A value of 0 means UNLIMITED for that
-dimension — identical to how disk already behaved. Two regressions are covered:
+The connection's "max per VM" limits (Settings → Proxmox connection) override the
+global finite ceiling for CPU, RAM and disk. A value of 0 inherits that global limit.
+Two regressions are covered:
 
   1. Template save/edit must store the authored vCPU/RAM/disk VERBATIM (it used to
      silently clamp cpu→1 / ram→2 to the global default cap, while disk survived).
-  2. Deploy clamps to the CONNECTION ceiling; 0 there = unlimited (not "fall back to
-     the global 1-core/2-GB default").
+  2. Deploy clamps to the explicit CONNECTION ceiling or, when it is 0, the global
+     finite default.
 
 Run (Linux/WSL/CI):   GOBLINDOCK_DEV=1 .venv/bin/python tests/test_wave18.py
 """
@@ -129,21 +129,27 @@ def test_template_edit_stores_resources_verbatim():
 
 
 # --------------------------------------------------------------------------- #
-# 2. deploy honours the connection ceiling; 0 = unlimited                      #
+# 2. deploy honours explicit connection caps; 0 inherits the global ceiling    #
 # --------------------------------------------------------------------------- #
-def test_deploy_unlimited_when_connection_cap_zero():
+def test_deploy_inherits_global_limits_when_connection_cap_zero():
     from app import api
+    from app.config import settings
     from app.models import User
     uid = _mk_user("w18-unlim@example.com")
     conn_id, base_id, net_id = _mk_conn_base_net(max_cores=0, max_ram_mb=0, max_disk_gb=0)
     tid = _mk_template(conn_id, base_id, net_id)
-    with session_scope() as s:
-        user = s.get(User, uid)
-        api.deploy(api.DeployBody(templateId=tid, name="unlim-vm",
-                                  cpu=8, ram=16, disk=500), user=user, session=s)
+    saved = (settings.max_cores, settings.max_ram_mb, settings.max_disk_gb)
+    settings.max_cores, settings.max_ram_mb, settings.max_disk_gb = 8, 32 * 1024, 256
+    try:
+        with session_scope() as s:
+            user = s.get(User, uid)
+            api.deploy(api.DeployBody(templateId=tid, name="unlim-vm",
+                                      cpu=16, ram=64, disk=500), user=user, session=s)
+    finally:
+        settings.max_cores, settings.max_ram_mb, settings.max_disk_gb = saved
     got = _deployed("unlim-vm")
-    assert got == (8, 16, 500), got
-    print("test_deploy_unlimited_when_connection_cap_zero OK")
+    assert got == (8, 32, 256), got
+    print("test_deploy_inherits_global_limits_when_connection_cap_zero OK")
 
 
 def test_deploy_clamps_to_connection_cap():
@@ -166,7 +172,7 @@ def test_deploy_uses_template_default_when_unspecified():
     from app import api
     from app.models import User
     uid = _mk_user("w18-default@example.com")
-    conn_id, base_id, net_id = _mk_conn_base_net()  # unlimited
+    conn_id, base_id, net_id = _mk_conn_base_net()  # inherits globals
     tid = _mk_template(conn_id, base_id, net_id, cpu=6, ram=12, disk=80)
     with session_scope() as s:
         user = s.get(User, uid)
@@ -179,7 +185,7 @@ def test_deploy_uses_template_default_when_unspecified():
 if __name__ == "__main__":
     test_template_save_stores_resources_verbatim()
     test_template_edit_stores_resources_verbatim()
-    test_deploy_unlimited_when_connection_cap_zero()
+    test_deploy_inherits_global_limits_when_connection_cap_zero()
     test_deploy_clamps_to_connection_cap()
     test_deploy_uses_template_default_when_unspecified()
     print("\nALL WAVE 18 UNIT TESTS PASSED")

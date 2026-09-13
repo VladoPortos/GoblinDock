@@ -1505,7 +1505,8 @@ def test_direct_lifecycle_task_failure_and_timeout_return_502():
                         )
                     except HTTPException as exc:
                         assert exc.status_code == 502, (action, message, exc.status_code)
-                        assert message in str(exc.detail), (action, message, exc.detail)
+                        assert "Proxmox power action failed (reference " in str(exc.detail)
+                        assert message not in str(exc.detail), (action, message, exc.detail)
                     else:
                         raise AssertionError((action, message, "task failure was acknowledged"))
                 assert calls == [(f"UPID:{action}", "pve", 120)], (action, message, calls)

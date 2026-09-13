@@ -20,6 +20,7 @@ from typing import Optional
 from sqlmodel import select
 
 from .config import settings
+from .resource_limits import effective_resource_limits
 from .db import session_scope
 from .execution_plan import (
     build_execution_plan,
@@ -630,10 +631,11 @@ def _preflight_deploy_cloud_init(
     ) else ""
     credential_user = ""
     import urllib.parse
+    cap_cores, cap_ram_mb, _cap_disk_gb = effective_resource_limits(conn)
     params = {
         "name": dep.name,
-        "cores": _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores),
-        "memory": _clamp_resource(int(cfg.get("ram", 2)) * 1024, conn.max_ram_mb),
+        "cores": _clamp_resource(int(cfg.get("cpu", 1)), cap_cores),
+        "memory": _clamp_resource(int(cfg.get("ram", 2)) * 1024, cap_ram_mb),
         "ipconfig0": "ip=dhcp" if cfg.get("network_mode", "dhcp") == "dhcp" else cfg.get("ipconfig0", "ip=dhcp"),
         "agent": "enabled=1",
         "serial0": "socket",
@@ -696,10 +698,11 @@ def _run_deploy(ctx: JobCtx, job: Job, phase_base: int = 0, phase_total: int = 5
     plan, recipe, blocks = _load_materialized_job_plan(job, dep)
     secret_owner_id, allow_global_secrets = _owner_secret_context(plan["owner_id"])
     # Clamp before the create request so a stale queued context cannot reserve more
-    # than the connection's current limits even temporarily.
-    cores = _clamp_resource(int(cfg.get("cpu", 1)), conn.max_cores)
-    ram_mb = _clamp_resource(int(cfg.get("ram", 2)) * 1024, conn.max_ram_mb)
-    disk_gb = _clamp_resource(int(cfg.get("disk", 20)), conn.max_disk_gb)
+    # than the target's current effective limits even temporarily.
+    cap_cores, cap_ram_mb, cap_disk_gb = effective_resource_limits(conn)
+    cores = _clamp_resource(int(cfg.get("cpu", 1)), cap_cores)
+    ram_mb = _clamp_resource(int(cfg.get("ram", 2)) * 1024, cap_ram_mb)
+    disk_gb = _clamp_resource(int(cfg.get("disk", 20)), cap_disk_gb)
 
     px = Proxmox(conn)
     # Build on the deployment's node — set at deploy-creation from the template's connection.

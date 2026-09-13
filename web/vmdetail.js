@@ -392,7 +392,8 @@
     };
     const cleanupLocal = async () => {
       try {
-        const r = await window.API.vmCleanupLocal(depId);
+        const isAdmin = !!(window.GD.me && window.GD.me.role === 'admin');
+        const r = await window.API.vmCleanupLocal(depId, isAdmin);
         // drop the row before landing on the dashboard — a stale in-flight
         // /state response must not show the just-removed VM there
         window.GDStore.removeVm(depId);
@@ -579,7 +580,10 @@
               + (d.connectionDisabled
                 ? ' Its connection is disabled, so GoblinDock cannot verify whether the VM still exists upstream.'
                 : ' GoblinDock refuses the cleanup if it can confirm the VM still exists upstream.')
-              + ' If the VM still exists on the node it keeps running unmanaged.',
+              + ' If the VM still exists on the node it keeps running unmanaged.'
+              + ((window.GD.me && window.GD.me.role === 'admin')
+                ? ' As an administrator, confirming also explicitly accepts that risk when absence cannot be verified.'
+                : ' If absence cannot be verified, an administrator must approve this cleanup.'),
             confirmLabel: 'Remove local record', onConfirm: cleanupLocal,
           })
         : confirm && h(ConfirmModal, {

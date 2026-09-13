@@ -104,6 +104,7 @@ def _migrate() -> None:
     (no Alembic for a single-file homelab DB)."""
     adds = {
         "connections": [
+            # Zero inherits the finite global resource defaults.
             ("max_cores", "INTEGER NOT NULL DEFAULT 0"),
             ("max_ram_mb", "INTEGER NOT NULL DEFAULT 0"),
             ("max_disk_gb", "INTEGER NOT NULL DEFAULT 0"),

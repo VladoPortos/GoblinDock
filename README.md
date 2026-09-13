@@ -259,8 +259,10 @@ it falls back to native cloud-init.
 | `GOBLINDOCK_SECRET_KEY` | — | session signing + at-rest encryption (**set a long, stable value**). Supports `GOBLINDOCK_SECRET_KEY_FILE` for Docker secrets. |
 | `GOBLINDOCK_FORWARDED_ALLOW_IPS` | — | behind a reverse proxy, set to the proxy IP/CIDR so the real client IP is used for the login throttle + audit log |
 | `GOBLINDOCK_VMID_MIN` / `_MAX` | `8000` / `8099` | VMID window GoblinDock may ever touch |
-| `GOBLINDOCK_MAX_CORES` / `_RAM_MB` / `_DISK_GB` | `1` / `2048` / `0` | global per-VM ceilings (a connection can set its own) |
-| `GOBLINDOCK_MAX_VMS_PER_USER` | `0` | per-user VM quota (`0` = unlimited; admins exempt) |
+| `GOBLINDOCK_MAX_CORES` / `_RAM_MB` / `_DISK_GB` | `8` / `32768` / `256` | finite global per-VM ceilings; a zero connection limit inherits these and a positive value overrides its dimension |
+| `GOBLINDOCK_MAX_VMS_PER_USER` | `10` | per-user VM quota (admins exempt) |
+| `GOBLINDOCK_MAX_ACTIVE_JOBS_PER_USER` | `10` | queued/running/waiting jobs allowed per user (admins exempt) |
+| `GOBLINDOCK_MAX_REQUEST_BODY_BYTES` | `4194304` | maximum HTTP request body, enforced before JSON/multipart parsing |
 | `GOBLINDOCK_DATA_DIR` / `GOBLINDOCK_DB` | `./data` / `<data>/goblindock.sqlite3` | data directory and SQLite file path |
 | `GOBLINDOCK_BACKUP_ENABLED` / `_INTERVAL_HOURS` / `_KEEP` / `_DIR` | `1` / `24` / `7` / `<data>/backups` | scheduled **online SQLite backups** (WAL-safe, rotating; backups carry the same encrypted secrets and need the matching `GOBLINDOCK_SECRET_KEY` to restore) |
 | `GOBLINDOCK_ADMIN_EMAIL` / `_PASSWORD` / `_NAME` | — | optional first-run admin bootstrap (skips the setup screen) |
@@ -297,7 +299,8 @@ it falls back to native cloud-init.
   paths, no user directory) and a **redacted** network view (no bridge / VLAN / subnet /
   gateway / DNS — just enough to pick one). Templates and blocks honour visibility — a
   private one can't be deployed, compiled, or forked by guessing its id. Optional
-  per-user VM **quota** (`GOBLINDOCK_MAX_VMS_PER_USER`).
+  finite per-user VM and active-job quotas (`GOBLINDOCK_MAX_VMS_PER_USER`,
+  `GOBLINDOCK_MAX_ACTIVE_JOBS_PER_USER`) plus finite per-VM resource defaults.
 - **Host-key / TLS verification** — Proxmox API TLS (`verify_tls`, per connection) is
   enabled by default. Snippet-upload SSH uses persistent trust-on-first-use at
   `<data>/ssh_known_hosts`; a changed node key is rejected. Set

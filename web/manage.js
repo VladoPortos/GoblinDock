@@ -389,7 +389,7 @@
         h(Field, { label: 'SSH key path', value: f.ssh_key_path, onChange: (v) => set('ssh_key_path', v), mono: true, placeholder: '/run/secrets/pve_key' }),
         h('div', { style: { gridColumn: '1 / -1' } },
           h('label', { className: 'field-label' }, 'Per-VM limits for this target ',
-            h('span', { className: 'hint', style: { fontWeight: 400, fontSize: 11 } }, '· 0 = unlimited')),
+            h('span', { className: 'hint', style: { fontWeight: 400, fontSize: 11 } }, '· 0 = global default')),
           h('div', { className: 'connection-limit-grid', style: { display: 'grid', gridTemplateColumns: '1fr 1fr 1fr', gap: 10 } },
             h(Field, { label: 'Max vCPU', value: f.max_cores, onChange: (v) => set('max_cores', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' }),
             h(Field, { label: 'Max RAM (GB)', value: f.max_ram_gb, onChange: (v) => set('max_ram_gb', v.replace(/[^0-9]/g, '')), mono: true, placeholder: '0' }),

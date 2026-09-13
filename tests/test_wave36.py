@@ -1718,7 +1718,9 @@ def test_serial_setup_does_not_block_unrelated_vm_and_reclaims_after_exception()
     websockets.connect = lambda *_args, **_kwargs: _ImmediateSerialPve()
     try:
         browser = _run_serial_console(failure_dep_id, uid)
-        assert any("serial setup failed" in str(value) for value in browser.sent)
+        messages = "\n".join(str(value) for value in browser.sent)
+        assert "console unavailable (reference " in messages
+        assert "serial setup failed" not in messages
     finally:
         api.Proxmox = saved_px
         websockets.connect = saved_connect

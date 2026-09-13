@@ -73,7 +73,7 @@ def test_settings_table_and_helpers():
     assert appsettings.get_setting("w14_absent", "def") == "def"
     # bad stored value never raises
     appsettings.set_setting(appsettings.JOB_RETENTION_DAYS, "not-a-number")
-    assert appsettings.get_job_retention_days() == 0
+    assert appsettings.get_job_retention_days() == 90
     print("test_settings_table_and_helpers OK")
 
 
@@ -85,7 +85,7 @@ def test_job_retention_endpoints_and_admin_only():
     plain = _mk_user("w14-user@example.com", role="user")
     appsettings.set_setting(appsettings.JOB_RETENTION_DAYS, "0")
     with session_scope() as s:
-        assert api.get_job_retention(user=s.get(User, plain))["days"] == 0    # default off
+        assert api.get_job_retention(user=s.get(User, plain))["days"] == 0    # explicit off
     with session_scope() as s:
         out = api.set_job_retention(api.JobRetentionBody(days=30), user=s.get(User, admin))
         assert out["days"] == 30

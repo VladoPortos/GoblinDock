@@ -14,6 +14,7 @@ from .execution_plan import open_execution_plan, materialize_execution_plan
 from .models import Connection, Deployment, Image, Job, Network, Secret, Template, User, Variable
 from .proxmox import Proxmox
 from .recipes import compile_ansible, compile_cloudinit, has_ansible_blocks
+from .resource_limits import effective_resource_limits
 from .security import decrypt
 from .template_ops import RebuildBody, prepare_rebuild, read_only_network_ctx
 
@@ -118,9 +119,10 @@ def deploy_preflight(body: api.DeployBody, user: User = Depends(current_user), s
     ram = body.ram if body.ram is not None else tpl.default_ram
     disk = body.disk if body.disk is not None else tpl.default_disk
     if conn:
-        cpu = min(cpu, conn.max_cores) if conn.max_cores else cpu
-        ram = max(1, min(ram, conn.max_ram_mb // 1024)) if conn.max_ram_mb else ram
-        disk = min(disk, conn.max_disk_gb) if conn.max_disk_gb else disk
+        cap_cores, cap_ram_mb, cap_disk_gb = effective_resource_limits(conn)
+        cpu = min(cpu, cap_cores)
+        ram = max(1, min(ram, cap_ram_mb // 1024))
+        disk = min(disk, cap_disk_gb)
     cfg = {'src_url': base.source_url if base and base.kind == 'base' else '',
            'checksum': base.checksum if base else '', 'checksum_algorithm': api._checksum_algo(base.checksum or '') if base else '',
            'cpu': cpu, 'ram': ram, 'disk': disk}
@@ -264,6 +266,7 @@ def retry_configuration(dep_id: int, body: RetryBody, user: User = Depends(curre
         api._assert_trusted_ansible_blocks(session, recipe, blocks)
         if not has_ansible_blocks(recipe, blocks):
             raise HTTPException(409, 'This recipe has no post-boot configuration; use rebuild for first-boot changes')
+        api._enforce_active_job_quota(session, user)
         job = Job(type='configure', title=f'Retrying configuration for {dep.name}',
                   deployment_id=dep.id, connection_id=conn.id, created_by=user.id,
                   context_json=prior.context_json, execution_plan_enc=prior.execution_plan_enc,

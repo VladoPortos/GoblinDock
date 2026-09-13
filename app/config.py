@@ -92,17 +92,22 @@ class Settings:
         self.vmid_min = int(os.environ.get("GOBLINDOCK_VMID_MIN", "8000"))
         self.vmid_max = int(os.environ.get("GOBLINDOCK_VMID_MAX", "8099"))
 
-        # Fallback per-VM cap, applied ONLY when a deploy target has no connection
-        # record (in practice never — deploys require a connection). The authoritative
-        # per-VM ceiling is set per-connection in the UI (Settings → Proxmox), where
-        # 0 = unlimited for that dimension.
-        self.max_cores = int(os.environ.get("GOBLINDOCK_MAX_CORES", "1"))
-        self.max_ram_mb = int(os.environ.get("GOBLINDOCK_MAX_RAM_MB", "2048"))
-        self.max_disk_gb = int(os.environ.get("GOBLINDOCK_MAX_DISK_GB", "0"))
+        # Finite global per-VM ceilings. A zero-valued connection limit inherits these;
+        # an administrator can set a positive per-connection override in the UI.
+        self.max_cores = max(1, min(256, int(os.environ.get("GOBLINDOCK_MAX_CORES", "8"))))
+        self.max_ram_mb = max(1024, min(1024 * 1024,
+                              int(os.environ.get("GOBLINDOCK_MAX_RAM_MB", "32768"))))
+        self.max_disk_gb = max(1, min(16384,
+                             int(os.environ.get("GOBLINDOCK_MAX_DISK_GB", "256"))))
 
-        # Per-user quotas (0 = unlimited). Stop one tenant exhausting the shared VMID
-        # pool / node storage. Admins are exempt.
-        self.max_vms_per_user = int(os.environ.get("GOBLINDOCK_MAX_VMS_PER_USER", "0"))
+        # Per-user admission limits stop one tenant exhausting the shared VMID pool,
+        # serial worker, jobs table, or node storage. Trusted administrators are exempt.
+        self.max_vms_per_user = max(
+            1, int(os.environ.get("GOBLINDOCK_MAX_VMS_PER_USER", "10")))
+        self.max_active_jobs_per_user = max(
+            1, int(os.environ.get("GOBLINDOCK_MAX_ACTIVE_JOBS_PER_USER", "10")))
+        self.max_request_body_bytes = max(
+            1024, int(os.environ.get("GOBLINDOCK_MAX_REQUEST_BODY_BYTES", str(4 * 1024 * 1024))))
 
         # Scheduled SQLite backups (driven by APScheduler — see app/scheduler.py).
         # The single SQLite file IS the whole datastore (users, deployments, audit,

@@ -442,6 +442,9 @@
           ? 'This destroys the VM and its disk on ' + confirm.vm.conn + '. The IP ' + confirm.vm.ip + ' returns to the pool. This cannot be undone.'
           : confirm.action === 'cleanupLocal'
             ? 'Removes only GoblinDock\'s record of this VM — NOTHING is deleted in Proxmox. Meant for a VM already deleted upstream (or stranded on a disabled/unreachable source). If the VM still exists on the node it keeps running unmanaged; GoblinDock refuses the cleanup if it can confirm the VM is still there.'
+              + ((window.GD.me && window.GD.me.role === 'admin')
+                ? ' Confirming also explicitly accepts that risk when absence cannot be verified.'
+                : ' If absence cannot be verified, an administrator must approve this cleanup.')
             : 'Re-clones from image ' + confirm.vm.image + ', keeping the name and IP (' + confirm.vm.ip + '). Anything written on disk is lost.',
         confirmLabel: confirm.action === 'delete' ? 'Delete VM'
           : confirm.action === 'cleanupLocal' ? 'Remove local record' : 'Rebuild',
@@ -449,7 +452,8 @@
           // toast + rethrow: ConfirmModal stays open for retry when the call fails
           try {
             if (confirm.action === 'cleanupLocal') {
-              const r = await window.API.vmCleanupLocal(confirm.vm.depId);
+              const isAdmin = !!(window.GD.me && window.GD.me.role === 'admin');
+              const r = await window.API.vmCleanupLocal(confirm.vm.depId, isAdmin);
               // drop the row NOW — the next /state fetch can be seconds away when
               // the VM's Proxmox is unreachable, and an in-flight stale response
               // must not resurrect it (removeVm tombstones + fresh refetch)

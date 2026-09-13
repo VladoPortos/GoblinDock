@@ -60,6 +60,63 @@ app.include_router(template_router)
 app.include_router(operations_router)
 
 
+class RequestBodyLimitMiddleware:
+    """Reject oversized HTTP bodies before FastAPI parses JSON or multipart data.
+
+    Content-Length is a fast path; buffering at most the configured cap also covers
+    chunked requests whose size is not declared up front.
+    """
+
+    def __init__(self, app, max_bytes: int):
+        self.app = app
+        self.max_bytes = max(1, int(max_bytes))
+
+    async def _reject(self, scope, receive, send):
+        response = JSONResponse(
+            {"detail": "request body too large"},
+            status_code=413,
+            headers={"X-Content-Type-Options": "nosniff", "Cache-Control": "no-store"},
+        )
+        await response(scope, receive, send)
+
+    async def __call__(self, scope, receive, send):
+        if scope.get("type") != "http":
+            await self.app(scope, receive, send)
+            return
+
+        for name, value in scope.get("headers") or []:
+            if name.lower() != b"content-length":
+                continue
+            try:
+                if int(value) > self.max_bytes:
+                    await self._reject(scope, receive, send)
+                    return
+            except (TypeError, ValueError):
+                pass
+
+        messages = []
+        total = 0
+        while True:
+            message = await receive()
+            messages.append(message)
+            if message.get("type") == "http.disconnect":
+                return
+            if message.get("type") == "http.request":
+                total += len(message.get("body") or b"")
+                if total > self.max_bytes:
+                    await self._reject(scope, receive, send)
+                    return
+                if not message.get("more_body", False):
+                    break
+
+        async def replay_receive():
+            if messages:
+                return messages.pop(0)
+            return {"type": "http.disconnect"}
+
+        await self.app(scope, replay_receive, send)
+
+
 async def csrf_and_security_headers(request: Request, call_next):
     # Stamp the real client IP for this request so record_audit / the login throttle
     # see the user's address (not the reverse proxy's) — see app/netutil.py.
@@ -110,6 +167,9 @@ app.add_middleware(
     https_only=settings.cookie_secure,
     max_age=14 * 24 * 3600,
 )
+# Added last so it is the outermost HTTP middleware and rejects oversized bodies
+# before session decoding, CSRF work, request parsing, or password hashing.
+app.add_middleware(RequestBodyLimitMiddleware, max_bytes=settings.max_request_body_bytes)
 
 app.include_router(api_router)
 

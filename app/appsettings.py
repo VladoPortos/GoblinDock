@@ -9,7 +9,7 @@ from .db import engine
 from .models import Setting
 
 # Keys
-JOB_RETENTION_DAYS = "job_retention_days"   # "0" = keep forever (no auto-prune)
+JOB_RETENTION_DAYS = "job_retention_days"   # explicit "0" = keep forever
 AUTO_ROOT_PASSWORD = "auto_root_password"   # "1" = generate a root password per deploy (default on)
 
 
@@ -31,11 +31,11 @@ def set_setting(key: str, value: str) -> None:
 
 
 def get_job_retention_days() -> int:
-    """Days to keep job history; 0 = forever. Never raises on a bad stored value."""
+    """Days to keep job history; default 90, explicit 0 = forever."""
     try:
-        return max(0, int(get_setting(JOB_RETENTION_DAYS, "0") or 0))
+        return max(0, int(get_setting(JOB_RETENTION_DAYS, "90") or 90))
     except (TypeError, ValueError):
-        return 0
+        return 90
 
 
 def auto_root_password_enabled() -> bool:

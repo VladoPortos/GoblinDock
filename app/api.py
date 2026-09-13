@@ -41,6 +41,7 @@ from .execution_plan import (
 from .deps import current_user, require_admin, widget_key_user
 from .netutil import client_ip, current_request_ip
 from .network_pool import StaticPool, StaticPoolError, parse_static_pool
+from .resource_limits import effective_resource_limits
 from .models import (
     Audit,
     Block,
@@ -101,6 +102,21 @@ log = logging.getLogger("goblindock")
 # --------------------------------------------------------------------------- #
 # cross-cutting helpers                                                        #
 # --------------------------------------------------------------------------- #
+def _log_proxmox_failure(operation: str, exc: Exception) -> str:
+    """Log full upstream diagnostics while returning a non-secret correlation id."""
+    reference = _secrets.token_hex(6)
+    log.error(
+        "Proxmox %s failed (reference %s)", operation, reference,
+        exc_info=(type(exc), exc, exc.__traceback__),
+    )
+    return reference
+
+
+def _proxmox_http_failure(operation: str, exc: Exception) -> HTTPException:
+    reference = _log_proxmox_failure(operation, exc)
+    return HTTPException(502, f"Proxmox {operation} failed (reference {reference})")
+
+
 def ensure_csrf(request: Request) -> str:
     tok = request.session.get("csrf")
     if not tok:
@@ -201,7 +217,7 @@ def _check_password(pw: str) -> None:
 
 
 def _enforce_quota(session: Session, user: User, kind: str) -> None:
-    """Per-user resource cap (0 = unlimited; admins exempt). kind: 'vm'."""
+    """Finite per-user resource cap; trusted administrators are exempt."""
     if user.role == "admin":
         return
     if kind == "vm" and settings.max_vms_per_user:
@@ -209,6 +225,22 @@ def _enforce_quota(session: Session, user: User, kind: str) -> None:
         if n >= settings.max_vms_per_user:
             raise HTTPException(429, f"VM quota reached ({settings.max_vms_per_user}) — "
                                      "destroy one first or ask an admin to raise your limit")
+
+
+def _enforce_active_job_quota(session: Session, user: User) -> None:
+    """Bound work queued/running/waiting for the single serial worker per tenant."""
+    if user.role == "admin":
+        return
+    active = len(session.exec(select(Job.id).where(
+        Job.created_by == user.id,
+        Job.status.in_(("queued", "running", "waiting")),
+    )).all())
+    if active >= settings.max_active_jobs_per_user:
+        raise HTTPException(
+            429,
+            f"Active job quota reached ({settings.max_active_jobs_per_user}) — "
+            "wait for an existing job to finish",
+        )
 
 
 def validate_image_url(url: str) -> str:
@@ -431,7 +463,7 @@ def _owned_deployment(session: Session, dep_id: int, user: User) -> Deployment:
 # --------------------------------------------------------------------------- #
 class LoginBody(BaseModel):
     email: str = Field(max_length=320)
-    password: str
+    password: str = Field(max_length=1024)
 
 
 class SetupBody(BaseModel):
@@ -528,9 +560,10 @@ def auth_setup(body: SetupBody, request: Request, session: Session = Depends(get
 _login_attempts: OrderedDict[str, list[float]] = OrderedDict()
 _login_attempts_lock = threading.Lock()
 _MAX_THROTTLE_KEYS = 10_000
+_IP_LOGIN_LIMIT = 40
 
 
-def _throttle(key: str) -> None:
+def _throttle(key: str, limit: int = 8) -> None:
     now = time.time()
     with _login_attempts_lock:
         window = [t for t in _login_attempts.get(key, []) if now - t < 300]
@@ -548,7 +581,7 @@ def _throttle(key: str) -> None:
                     _login_attempts.pop(stale_key, None)
             while len(_login_attempts) > _MAX_THROTTLE_KEYS:
                 _login_attempts.popitem(last=False)
-        if len(window) >= 8:
+        if len(window) >= limit:
             raise HTTPException(429, "too many attempts — try again in a few minutes")
 
 
@@ -606,6 +639,8 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
     ip = client_ip(request) or "?"
     email = body.email.strip().lower()
     key = f"{email}|{ip}"
+    ip_key = f"ip:{ip}"
+    _throttle(ip_key, _IP_LOGIN_LIMIT)
     _throttle(key)
     user = session.exec(select(User).where(
         User.email == email, User.deleted_at.is_(None),
@@ -625,6 +660,7 @@ def login(body: LoginBody, request: Request, session: Session = Depends(get_sess
         ok = False
     if not ok:
         _record_attempt(key)
+        _record_attempt(ip_key)
         if active:
             _record_account_login_failure(session, user.id, utcnow())
         # One identical response for every failure mode (unknown email, wrong password,
@@ -788,7 +824,7 @@ def state(request: Request, user: User = Depends(current_user), session: Session
         "me": S.me_dict(user),
         "csrf": ensure_csrf(request),
         "limits": {"maxCores": settings.max_cores, "maxRam": settings.max_ram_mb // 1024,
-                   "maxDisk": settings.max_disk_gb,  # 0 = no global cap
+                   "maxDisk": settings.max_disk_gb,
                    "vmidMin": settings.vmid_min, "vmidMax": settings.vmid_max},
         "VMS": vms,
         "BASE_IMAGES": base,
@@ -1095,6 +1131,7 @@ def deploy(body: DeployBody, user: User = Depends(current_user), session: Sessio
 
 
 def _deploy_transaction(body: DeployBody, user: User, session: Session):
+    _enforce_active_job_quota(session, user)
     _enforce_quota(session, user, "vm")
     tpl = session.get(Template, body.templateId)
     # TRUST BOUNDARY (accepted Run-Script model): a PUBLIC template may be deployed by
@@ -1122,12 +1159,8 @@ def _deploy_transaction(body: DeployBody, user: User, session: Session):
         session, tpl, user.id, deploy_inputs_json,
     )
 
-    # The connection's per-VM ceiling is authoritative; 0 = unlimited for that
-    # dimension (CPU, RAM and disk all behave identically). A connection is required
-    # above, so settings.max_* only act as a no-connection fallback.
-    cap_cores = conn.max_cores if conn else settings.max_cores
-    cap_ram_mb = conn.max_ram_mb if conn else settings.max_ram_mb
-    cap_disk_gb = conn.max_disk_gb if conn else settings.max_disk_gb
+    # A positive connection value overrides the finite global default; zero inherits.
+    cap_cores, cap_ram_mb, cap_disk_gb = effective_resource_limits(conn)
     cpu_req = body.cpu if body.cpu is not None else tpl.default_cpu
     ram_req = body.ram if body.ram is not None else tpl.default_ram
     disk_req = body.disk if body.disk is not None else tpl.default_disk
@@ -1204,7 +1237,7 @@ def vm_action(dep_id: int, body: ActionBody, user: User = Depends(current_user),
         except HTTPException:
             raise
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("power action", e) from None
         dep.status = "stopped" if body.action == "stop" else "running"
         dep.error = ""
         dep.cleanup_origin = None
@@ -1241,6 +1274,7 @@ def _vm_rebuild_transaction(dep_id: int, user: User, session: Session, body: Opt
     active = _active_lifecycle_job(session, dep.id)
     if active:
         raise HTTPException(409, f"{active.type} job already active for this deployment")
+    _enforce_active_job_quota(session, user)
     _reject_disabled_connection(session.get(Connection, dep.connection_id)
                                 if dep.connection_id else None)
     from .template_ops import prepare_rebuild
@@ -1308,8 +1342,13 @@ def _vm_destroy_transaction(dep_id: int, user: User, session: Session):
     return {"ok": True, "jobId": job.id}
 
 
+class CleanupLocalBody(BaseModel):
+    acknowledgeUnverified: bool = False
+
+
 @router.post("/deployments/{dep_id}/cleanup_local")
-def vm_cleanup_local(dep_id: int, user: User = Depends(current_user),
+def vm_cleanup_local(dep_id: int, body: Optional[CleanupLocalBody] = None,
+                     user: User = Depends(current_user),
                      session: Session = Depends(get_session)):
     """Remove GoblinDock's record of a VM WITHOUT deleting anything in Proxmox.
 
@@ -1323,10 +1362,14 @@ def vm_cleanup_local(dep_id: int, user: User = Depends(current_user),
     session.rollback()
     with _deployment_operation_lock(dep_id):
         with _lifecycle_admission_lock:
-            return _vm_cleanup_local_transaction(dep_id, user, session)
+            return _vm_cleanup_local_transaction(
+                dep_id, user, session,
+                acknowledge_unverified=bool(body and body.acknowledgeUnverified),
+            )
 
 
-def _vm_cleanup_local_transaction(dep_id: int, user: User, session: Session):
+def _vm_cleanup_local_transaction(dep_id: int, user: User, session: Session,
+                                  *, acknowledge_unverified: bool = False):
     dep = _owned_deployment(session, dep_id, user)
     active = _active_lifecycle_job(session, dep.id)
     if active:
@@ -1346,6 +1389,19 @@ def _vm_cleanup_local_transaction(dep_id: int, user: User, session: Session):
         raise HTTPException(409, "the VM still exists in Proxmox — use the normal "
                                  "Delete action so it is destroyed upstream first")
     verified = presence == VM_ABSENT
+    if not verified:
+        if user.role != "admin":
+            raise HTTPException(
+                409,
+                "Proxmox absence could not be verified — ask an administrator to "
+                "review and explicitly approve local-only cleanup",
+            )
+        if not acknowledge_unverified:
+            raise HTTPException(
+                409,
+                "Proxmox absence could not be verified — an administrator must "
+                "explicitly acknowledge the orphan-VM risk",
+            )
     for alloc in session.exec(select(IpAllocation).where(
             IpAllocation.deployment_id == dep.id)).all():
         session.delete(alloc)
@@ -1354,7 +1410,7 @@ def _vm_cleanup_local_transaction(dep_id: int, user: User, session: Session):
     record_audit(
         session, user, "vm.cleanup_local", "deployment", dep.id,
         f"{dep.name} — local record removed, Proxmox untouched "
-        f"({'upstream absence confirmed' if verified else f'unverified: {detail}'})",
+        f"({'upstream absence confirmed' if verified else f'unverified admin override: {detail}'})",
     )
     session.delete(dep)
     session.commit()
@@ -1427,17 +1483,17 @@ def vm_resize_config(dep_id: int, body: VmResizeBody, user: User = Depends(curre
         dep, conn = _resizable_deployment(session, dep_id, user)
         if body.cores is None and body.ramGb is None:
             raise HTTPException(400, "nothing to resize — supply cores and/or ramGb")
-        # Same per-VM ceiling authority as deploy: the connection's caps, 0 = unlimited.
-        if body.cores is not None and conn.max_cores and body.cores > conn.max_cores:
-            raise HTTPException(400, f"cores above this connection's per-VM limit ({conn.max_cores})")
-        if body.ramGb is not None and conn.max_ram_mb and body.ramGb * 1024 > conn.max_ram_mb:
-            raise HTTPException(400, f"RAM above this connection's per-VM limit ({conn.max_ram_mb // 1024} GB)")
+        cap_cores, cap_ram_mb, _cap_disk_gb = effective_resource_limits(conn)
+        if body.cores is not None and body.cores > cap_cores:
+            raise HTTPException(400, f"cores above this target's per-VM limit ({cap_cores})")
+        if body.ramGb is not None and body.ramGb * 1024 > cap_ram_mb:
+            raise HTTPException(400, f"RAM above this target's per-VM limit ({cap_ram_mb // 1024} GB)")
         px = Proxmox(conn)
         node = dep.node or conn.node
         try:
             status = str((px.vm_current(dep.vmid, node) or {}).get("status") or "").lower()
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("VM status lookup", e) from None
         if status != "stopped":
             raise HTTPException(409, "stop the VM first — CPU/memory changes apply "
                                      "to a stopped VM (same as Proxmox)")
@@ -1449,7 +1505,7 @@ def vm_resize_config(dep_id: int, body: VmResizeBody, user: User = Depends(curre
         try:
             px.set_config(dep.vmid, node=node, **params)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("VM resize", e) from None
         changes = []
         if body.cores is not None:
             changes.append(f"cores {dep.cpu}→{body.cores}")
@@ -1482,7 +1538,7 @@ def vm_disk_resize(dep_id: int, disk: str, body: DiskResizeBody,
         try:
             cfg = px.vm_config(dep.vmid, node)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("disk lookup", e) from None
         entry = next((e for e in _parse_disk_entries(cfg) if e["key"] == disk), None)
         if entry is None:
             raise HTTPException(400, f"disk {disk!r} not found "
@@ -1491,13 +1547,14 @@ def vm_disk_resize(dep_id: int, disk: str, body: DiskResizeBody,
         if current is not None and body.sizeGb <= current:
             raise HTTPException(400, f"grow only — {disk} is already {current}G "
                                      "and Proxmox cannot shrink a disk")
-        if conn.max_disk_gb and body.sizeGb > conn.max_disk_gb:
-            raise HTTPException(400, f"disk above this connection's per-VM limit "
-                                     f"({conn.max_disk_gb} GB)")
+        _cap_cores, _cap_ram_mb, cap_disk_gb = effective_resource_limits(conn)
+        if body.sizeGb > cap_disk_gb:
+            raise HTTPException(400, f"disk above this target's per-VM limit "
+                                     f"({cap_disk_gb} GB)")
         try:
             px.resize_disk(dep.vmid, disk, f"{body.sizeGb}G", node=node)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("disk resize", e) from None
         if disk == "scsi0":
             # the deploy-managed root disk — keep the row's size truthful
             dep.disk = body.sizeGb
@@ -1635,7 +1692,7 @@ def list_vm_snapshots(dep_id: int, user: User = Depends(current_user),
     try:
         raw = px.list_snapshots(dep.vmid, node)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
+        raise _proxmox_http_failure("snapshot list", e) from None
     # Proxmox includes a synthetic 'current' entry whose parent is the snapshot the
     # VM currently sits on — surface that as a "current" flag instead of a row.
     on_snap = next((s.get("parent") for s in raw if s.get("name") == "current"), None)
@@ -1665,7 +1722,7 @@ def create_vm_snapshot(dep_id: int, body: SnapshotBody, user: User = Depends(cur
                                       vmstate=body.includeRam, node=node)
             px.wait_task(upid, node=node, timeout=300)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("snapshot creation", e) from None
         record_audit(session, user, "vm.snapshot.create", "deployment", dep.id,
                      f"{dep.name} · {name}")
         session.commit()
@@ -1684,7 +1741,7 @@ def delete_vm_snapshot(dep_id: int, snapname: str, user: User = Depends(current_
             upid = px.delete_snapshot(dep.vmid, snapname, node=node)
             px.wait_task(upid, node=node, timeout=300)
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("snapshot deletion", e) from None
         record_audit(session, user, "vm.snapshot.delete", "deployment", dep.id,
                      f"{dep.name} · {snapname}")
         session.commit()
@@ -1713,7 +1770,7 @@ def rollback_vm_snapshot(dep_id: int, snapname: str, body: Optional[RollbackBody
                 px.wait_task(px.start(dep.vmid, node=node), node=node, timeout=120)
                 started = True
         except Exception as e:  # noqa: BLE001
-            raise HTTPException(502, f"proxmox: {e}")
+            raise _proxmox_http_failure("snapshot rollback", e) from None
         record_audit(session, user, "vm.snapshot.rollback", "deployment", dep.id,
                      f"{dep.name} · {snapname}")
         session.commit()
@@ -1755,17 +1812,31 @@ class _ConsoleGrant:
     session_epoch: int
 
 
+def _console_connection_identity(conn: Connection) -> tuple:
+    """Fields that bind a console bridge to one upstream trust relationship."""
+    return (
+        conn.id, ensure_utc(conn.created_at), conn.host, conn.port, conn.token_id,
+        conn.token_secret_enc, conn.verify_tls, conn.node,
+    )
+
+
 def _console_grant_still_valid(grant: _ConsoleGrant) -> bool:
     """Re-read every mutable authorization input in a fresh DB session."""
     try:
         with Session(engine) as session:
             user = session.get(User, grant.user_id)
             dep = session.get(Deployment, grant.deployment.id)
+            conn = session.get(Connection, grant.conn.id)
             return bool(
                 user
                 and not user.disabled
                 and user.session_epoch == grant.session_epoch
                 and dep
+                and conn
+                and not conn.disabled
+                and dep.connection_id == conn.id == grant.deployment.connection_id
+                and _console_connection_identity(conn)
+                    == _console_connection_identity(grant.conn)
                 and (dep.owner_id == user.id or user.role == "admin")
             )
     except Exception:  # noqa: BLE001 -- authorization storage errors fail closed
@@ -1881,6 +1952,9 @@ async def _ws_authorized_dep(websocket: WebSocket, dep_id: int):
             await websocket.close(code=4403)
             return None
         c = s.get(Connection, dep.connection_id)
+        if not c or c.disabled:
+            await websocket.close(code=4403)
+            return None
         conn = Connection(**c.model_dump()) if c else None
         dep = Deployment(**dep.model_dump())
         grant = _ConsoleGrant(
@@ -1972,9 +2046,17 @@ async def vm_console(websocket: WebSocket, dep_id: int):
         ) as pve:
             await pve.send(f"{prep.proxy_user}:{prep.ticket}\n")
             await _pump_ws(websocket, pve, prefer_bytes=False, grant=grant)
-    except Exception as e:  # noqa: BLE001
+    except HTTPException:
         try:
-            await websocket.send_text(f"\r\n[goblindock] console unavailable: {e}\r\n")
+            await websocket.send_text("\r\n[goblindock] console unavailable\r\n")
+        except Exception:  # noqa: BLE001
+            pass
+    except Exception as e:  # noqa: BLE001
+        reference = _log_proxmox_failure("serial console", e)
+        try:
+            await websocket.send_text(
+                f"\r\n[goblindock] console unavailable (reference {reference})\r\n"
+            )
         except Exception:  # noqa: BLE001
             pass
     finally:
@@ -2012,7 +2094,7 @@ def vm_vncproxy(dep_id: int, response: Response, user: User = Depends(current_us
     try:
         r = px.vncproxy(dep.vmid, node)
     except Exception as e:  # noqa: BLE001
-        raise HTTPException(502, f"proxmox: {e}")
+        raise _proxmox_http_failure("VNC console", e) from None
     import secrets as _secrets
     _sweep_vnc_sessions()
     now = time.time()
@@ -2619,9 +2701,9 @@ class ConnBody(BaseModel):
     ssh_host: str = ""
     ssh_user: str = "root"
     ssh_key_path: str = ""
-    max_cores: int = Field(default=0, ge=0, le=256)       # 0 = unlimited
-    max_ram_gb: int = Field(default=0, ge=0, le=1024)
-    max_disk_gb: int = Field(default=0, ge=0, le=16384)
+    max_cores: int = Field(default=0, ge=0, le=256)       # 0 = inherit global default
+    max_ram_gb: int = Field(default=0, ge=0, le=1024)  # 0 = inherit global default
+    max_disk_gb: int = Field(default=0, ge=0, le=16384)  # 0 = inherit global default
 
 
 @router.post("/connections")
@@ -3443,9 +3525,20 @@ def _last_admin_guard(session: Session, target: User):
             raise HTTPException(409, "cannot remove the last active admin")
 
 
+_active_admin_mutation_lock = threading.Lock()
+
+
 @router.put("/users/{uid}")
 def edit_user(uid: int, body: UserEditBody, user: User = Depends(require_admin),
               session: Session = Depends(get_session)):
+    # GoblinDock's supported deployment runs one API process. Serialize the complete
+    # guard-and-commit transaction so two concurrent demotions cannot both observe
+    # the same two-admin snapshot and leave the instance without an administrator.
+    with _active_admin_mutation_lock:
+        return _edit_user_transaction(uid, body, user, session)
+
+
+def _edit_user_transaction(uid: int, body: UserEditBody, user: User, session: Session):
     u = session.get(User, uid)
     if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")
@@ -3495,6 +3588,11 @@ def reset_user_password(uid: int, body: PasswordResetBody, request: Request,
 @router.delete("/users/{uid}")
 def delete_user(uid: int, user: User = Depends(require_admin),
                 session: Session = Depends(get_session)):
+    with _active_admin_mutation_lock:
+        return _delete_user_transaction(uid, user, session)
+
+
+def _delete_user_transaction(uid: int, user: User, session: Session):
     u = session.get(User, uid)
     if not u or u.deleted_at is not None:
         raise HTTPException(404, "not found")

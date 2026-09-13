@@ -99,7 +99,9 @@ window.API = (function () {
     retryCleanup: (id) => req('POST', `/api/deployments/${id}/retry-cleanup`),
     vmDestroy: (id) => req('DELETE', `/api/deployments/${id}`),
     // removes only GoblinDock's record — never sends a delete to Proxmox
-    vmCleanupLocal: (id) => req('POST', `/api/deployments/${id}/cleanup_local`),
+    vmCleanupLocal: (id, acknowledgeUnverified) => req(
+      'POST', `/api/deployments/${id}/cleanup_local`,
+      { acknowledgeUnverified: !!acknowledgeUnverified }),
     // day-2 resize: direct Proxmox config writes, no job (CPU/RAM need a stopped VM)
     vmResize: (id, p) => req('POST', `/api/deployments/${id}/resize`, p),
     vmDiskResize: (id, disk, p) => req('POST', `/api/deployments/${id}/disks/${disk}/resize`, p),

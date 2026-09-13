@@ -63,11 +63,11 @@ def _expect_http(code, fn):
     raise AssertionError(f"expected HTTPException {code}")
 
 
-def _fixture(*, disabled=False, vmid=8600):
+def _fixture(*, disabled=False, vmid=8600, role="admin"):
     suffix = os.urandom(4).hex()
     with session_scope() as s:
         admin = User(email=f"wave50-admin-{suffix}@example.com", name="admin",
-                     password_hash="unused", role="admin")
+                     password_hash="unused", role=role)
         s.add(admin)
         s.flush()
         conn = Connection(name=f"wave50-conn-{suffix}", host="pve.example",
@@ -193,7 +193,7 @@ def test_cleanup_local_refuses_while_vm_demonstrably_present():
 
 
 def test_cleanup_local_confirmed_absent_removes_record_and_ip():
-    fx = _fixture(disabled=False)
+    fx = _fixture(disabled=False, role="user")
     with session_scope() as s:
         net = Network(connection_id=fx["conn"], name=f"wave50-net-{fx['suffix']}")
         s.add(net)
@@ -222,8 +222,9 @@ def test_cleanup_local_confirmed_absent_removes_record_and_ip():
         assert "absence confirmed" in audit.detail
 
 
-def test_cleanup_local_on_disabled_source_is_unverified_and_contact_free():
-    fx = _fixture(disabled=True)
+def test_cleanup_local_unknown_presence_requires_admin_acknowledgement():
+    owner_fx = _fixture(disabled=True, role="user")
+    admin_fx = _fixture(disabled=True, role="admin")
     original = api.probe_vm_presence
 
     def _must_not_probe(px, vmid, node):
@@ -232,18 +233,34 @@ def test_cleanup_local_on_disabled_source_is_unverified_and_contact_free():
     api.probe_vm_presence = _must_not_probe
     try:
         with session_scope() as s:
-            out = api._vm_cleanup_local_transaction(
-                fx["dep"], s.get(User, fx["admin"]), s)
+            _expect_http(409, lambda: api._vm_cleanup_local_transaction(
+                owner_fx["dep"], s.get(User, owner_fx["admin"]), s))
+        with session_scope() as s:
+            _expect_http(409, lambda: api._vm_cleanup_local_transaction(
+                admin_fx["dep"], s.get(User, admin_fx["admin"]), s))
     finally:
         api.probe_vm_presence = original
+    with session_scope() as s:
+        assert s.get(Deployment, owner_fx["dep"]) is not None
+        assert s.get(Deployment, admin_fx["dep"]) is not None
+
+
+def test_admin_can_explicitly_acknowledge_unverified_cleanup():
+    fx = _fixture(disabled=True, role="admin")
+    with session_scope() as s:
+        try:
+            out = api._vm_cleanup_local_transaction(
+                fx["dep"], s.get(User, fx["admin"]), s,
+                acknowledge_unverified=True,
+            )
+        except TypeError as exc:
+            raise AssertionError("cleanup has no explicit admin acknowledgement") from exc
     assert out == {"ok": True, "verified": False}
     with session_scope() as s:
-        # a freed SQLite rowid can be reused by the next fixture's deployment, so
-        # always read the NEWEST cleanup audit for this id
         audit = s.exec(select(Audit).where(
             Audit.action == "vm.cleanup_local",
             Audit.target_id == str(fx["dep"])).order_by(Audit.id.desc())).first()
-        assert audit is not None and "unverified" in audit.detail
+        assert audit is not None and "admin override" in audit.detail
 
 
 def test_cleanup_local_blocked_while_lifecycle_job_active():
@@ -265,6 +282,7 @@ if __name__ == "__main__":
     test_queued_job_fails_instead_of_contacting_disabled_source()
     test_cleanup_local_refuses_while_vm_demonstrably_present()
     test_cleanup_local_confirmed_absent_removes_record_and_ip()
-    test_cleanup_local_on_disabled_source_is_unverified_and_contact_free()
+    test_cleanup_local_unknown_presence_requires_admin_acknowledgement()
+    test_admin_can_explicitly_acknowledge_unverified_cleanup()
     test_cleanup_local_blocked_while_lifecycle_job_active()
     print("\nALL WAVE 50 UNIT TESTS PASSED")

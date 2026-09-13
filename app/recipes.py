@@ -29,6 +29,34 @@ _PLACEHOLDER_RE = re.compile(r"(?P<indent>[^\S\n]*)\{(?P<key>[A-Za-z0-9_]+)\}")
 # Ansible task (control-node RCE). See _ansible_flat's sink hardening.
 _CTRL_CHAR_RE = re.compile(r"[\x00-\x1f\x7f]")
 
+# Runtime playbooks are parsed by Ansible, whose ``!unsafe`` YAML tag means "this
+# scalar is data, never a Jinja template".  The small wrapper/dumper below lets us
+# apply that tag only to values proven to originate in tenant inputs.  Registering a
+# matching SafeLoader constructor keeps the generated runtime YAML inspectable by the
+# existing preview/tests without weakening Ansible's own loader semantics.
+_UNSAFE_MARKER_PREFIX = "__GOBLINDOCK_UNSAFE_INPUT_"
+
+
+class _AnsibleUnsafeText(str):
+    pass
+
+
+class _AnsibleSafeDumper(yaml.SafeDumper):
+    pass
+
+
+def _represent_ansible_unsafe(dumper: yaml.SafeDumper, value: _AnsibleUnsafeText):
+    style = "|" if "\n" in value else None
+    return dumper.represent_scalar("!unsafe", str(value), style=style)
+
+
+def _construct_ansible_unsafe(loader: yaml.SafeLoader, node: yaml.nodes.ScalarNode):
+    return loader.construct_scalar(node)
+
+
+_AnsibleSafeDumper.add_representer(_AnsibleUnsafeText, _represent_ansible_unsafe)
+yaml.SafeLoader.add_constructor("!unsafe", _construct_ansible_unsafe)
+
 
 def _substitute(template: str, flat: dict) -> str:
     """Indentation-aware placeholder fill: when a placeholder is filled with a
@@ -90,8 +118,9 @@ def render_shell(template: str, inputs: dict, types: dict,
     return _substitute(template, flat)
 
 
-def _ansible_flat(inputs: dict, types: dict,
-                  secret_lookup: Optional[Callable[[str, str], str]]) -> dict:
+def _ansible_flats(inputs: dict, types: dict,
+                   secret_lookup: Optional[Callable[[str, str], str]],
+                   marker_factory: Callable[[], str]) -> tuple[dict, dict]:
     """Substitution dict for an ansible task template. Like render_shell (the cloud-init
     path), every value is secret-resolved (when a lookup is given) and exposed in forms
     that let a template place DATA safely instead of splicing raw text:
@@ -119,25 +148,101 @@ def _ansible_flat(inputs: dict, types: dict,
         return s if t == "code" else _CTRL_CHAR_RE.sub(" ", s)
 
     flat: dict = {}
+    marked: dict = {}
     for k, v in (inputs or {}).items():
         t = types.get(k, "text")
         if isinstance(v, list):
             items = [_res(x) for x in v]
             raw_items = [_raw(x, t) for x in items]
+            markers = [marker_factory() for _item in items]
             flat[k] = " ".join(raw_items)
-            flat[f"{k}_yaml"] = "[" + ", ".join(raw_items) + "]"
+            # JSON is valid YAML and, unlike raw flow-list text, cannot reinterpret an
+            # item containing ':' / braces as YAML structure before it is tagged.
+            flat[f"{k}_yaml"] = json.dumps(items)
             flat[f"{k}_yamlq"] = "[" + ", ".join(json.dumps(x) for x in items) + "]"
             flat[f"{k}_q"] = " ".join(shlex.quote(x) for x in items)
+            marked[k] = " ".join(markers)
+            marked[f"{k}_yaml"] = json.dumps(markers)
+            marked[f"{k}_yamlq"] = json.dumps(markers)
+            marked[f"{k}_q"] = " ".join(markers)
         elif isinstance(v, bool):
             flat[k] = flat[f"{k}_q"] = flat[f"{k}_yamlq"] = "true" if v else "false"
             flat[f"{k}_set"] = "true" if v else "false"
+            marked[k] = marked[f"{k}_q"] = marked[f"{k}_yamlq"] = flat[k]
+            marked[f"{k}_set"] = flat[f"{k}_set"]
         else:
             sval = _res(v)
+            marker = marker_factory()
             flat[k] = _raw(sval, t)
             flat[f"{k}_q"] = sval if t == "code" else shlex.quote(sval)
             flat[f"{k}_yamlq"] = json.dumps(sval)
             flat[f"{k}_set"] = "true" if sval else "false"
-    return flat
+            # `_merged_inputs` has already reduced this special field to a small
+            # Linux-username alphabet. It cannot contain a Jinja delimiter, so retain
+            # the long-standing human-readable runtime YAML for owner/group/path uses.
+            safe_username = k == "user" and re.fullmatch(r"[A-Za-z0-9_-]{0,32}", sval)
+            marked[k] = flat[k] if safe_username else marker
+            marked[f"{k}_q"] = flat[f"{k}_q"] if safe_username else marker
+            marked[f"{k}_yamlq"] = (flat[f"{k}_yamlq"] if safe_username
+                                      else json.dumps(marker))
+            # Presence is a derived boolean, not tenant-controlled template text.
+            marked[f"{k}_set"] = flat[f"{k}_set"]
+    return flat, marked
+
+
+def _ansible_flat(inputs: dict, types: dict,
+                  secret_lookup: Optional[Callable[[str, str], str]]) -> dict:
+    """Backward-compatible public helper used by tests and block linting."""
+    counter = 0
+
+    def marker() -> str:
+        nonlocal counter
+        counter += 1
+        return f"{_UNSAFE_MARKER_PREFIX}{counter:08d}__"
+
+    return _ansible_flats(inputs, types, secret_lookup, marker)[0]
+
+
+def _tag_input_values(actual, marked):
+    """Copy ``actual`` while tagging scalar positions carrying marker provenance."""
+    if isinstance(marked, str):
+        if _UNSAFE_MARKER_PREFIX in marked and isinstance(actual, str):
+            return _AnsibleUnsafeText(actual)
+        return actual
+    if isinstance(marked, list) and isinstance(actual, list):
+        if len(marked) != len(actual):
+            raise ValueError("runtime Ansible input changed YAML list structure")
+        return [_tag_input_values(value, marker) for value, marker in zip(actual, marked)]
+    if isinstance(marked, dict) and isinstance(actual, dict):
+        if list(marked) != list(actual):
+            raise ValueError("runtime Ansible input changed YAML mapping structure")
+        return {
+            key: _tag_input_values(actual[key], marked[key])
+            for key in actual
+        }
+    return actual
+
+
+def _dump_runtime_playbook(source: str, marked_source: str, name: str) -> str:
+    """Apply Ansible ``!unsafe`` tags using a parallel marker-rendered document."""
+    try:
+        actual = yaml.safe_load(source)
+    except yaml.YAMLError:
+        # Legacy non-code values were historically flattened into inert one-line text
+        # that can still make the surrounding YAML invalid. Preserve that fail-closed
+        # output contract: Ansible rejects it before it can template or execute a task.
+        return source
+    marked = yaml.safe_load(marked_source)
+    protected = _tag_input_values(actual, marked)
+    body = yaml.dump(
+        protected,
+        Dumper=_AnsibleSafeDumper,
+        sort_keys=False,
+        default_flow_style=False,
+        allow_unicode=True,
+        width=4096,
+    )
+    return f"---\n# generated by GoblinDock · template: {name}\n{body}"
 
 
 def mask_secrets(text: str) -> str:
@@ -487,24 +592,56 @@ def _ansible_playbook(recipe: list[dict], blocks_by_key: dict[str, Block],
         "  gather_facts: false",
         "  tasks:",
     ]
+    marked_lines = list(lines) if secret_lookup else None
+    marker_count = 0
+    direct_markers: dict[tuple[str, str], str] = {}
+
+    def marker() -> str:
+        nonlocal marker_count
+        marker_count += 1
+        return f"{_UNSAFE_MARKER_PREFIX}{marker_count:08d}__"
+
+    def marker_lookup(namespace: str, ref_name: str) -> str:
+        key = (namespace, ref_name)
+        if key not in direct_markers:
+            direct_markers[key] = marker()
+        return direct_markers[key]
+
     any_task = False
     for placed in _placed_blocks(recipe):
         block = blocks_by_key.get(placed.get("ref", ""))
         if not block or block.phase != "ansible" or not block.ansible_template:
             continue
-        flat = _ansible_flat(_merged_inputs(block, placed), _schema_types(block), secret_lookup)
+        flat, marked_flat = _ansible_flats(
+            _merged_inputs(block, placed), _schema_types(block), secret_lookup, marker,
+        )
         rendered = _substitute(block.ansible_template, flat)
         # belt-and-braces: resolve/mask any secret ref written directly in a template
         rendered = (resolve_secrets(rendered, secret_lookup) if secret_lookup
                     else mask_secrets(rendered))
+        if marked_lines is not None:
+            marked_rendered = _substitute(block.ansible_template, marked_flat)
+            marked_rendered = resolve_secrets(marked_rendered, marker_lookup)
         for ln in rendered.splitlines():
             lines.append("    " + ln if ln.strip() else ln)
+        if marked_lines is not None:
+            for ln in marked_rendered.splitlines():
+                marked_lines.append("    " + ln if ln.strip() else ln)
         lines.append("")
+        if marked_lines is not None:
+            marked_lines.append("")
         any_task = True
     if not any_task:
         lines.append("    - name: nothing to do (no post-boot blocks)")
         lines.append("      ansible.builtin.debug: { msg: 'ok' }")
-    return "\n".join(lines).rstrip() + "\n"
+        if marked_lines is not None:
+            marked_lines.append("    - name: nothing to do (no post-boot blocks)")
+            marked_lines.append("      ansible.builtin.debug: { msg: 'ok' }")
+    source = "\n".join(lines).rstrip() + "\n"
+    if marked_lines is None:
+        return source
+    marked_source = "\n".join(marked_lines).rstrip() + "\n"
+    return _dump_runtime_playbook(source, marked_source, name)
 
 
 def compile_ansible(recipe: list[dict], blocks_by_key: dict[str, Block],
